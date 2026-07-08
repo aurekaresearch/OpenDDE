@@ -1393,6 +1393,13 @@ class OpenDDE(nn.Module):
                 log_dicts.append(log_dict)
                 time_trackers.append(time_tracker)
 
+            if self._foldcp_is_non_output_rank():
+                return (
+                    pred_dicts[-1],
+                    simple_merge_dict_list(log_dicts),
+                    simple_merge_dict_list(time_trackers),
+                )
+
             # Combine outputs of multiple models
             def _cat(dict_list, key):
                 return torch.cat([x[key] for x in dict_list], dim=0)

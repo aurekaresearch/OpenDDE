@@ -306,6 +306,7 @@ class ConfidenceHead(nn.Module):
         pde_preds = [] if compute_pde else None
         resolved_preds = [] if compute_resolved else None
         single_sample = N_sample == 1
+        foldcp_non_output_rank = self._foldcp_is_non_output_rank()
         for i in range(N_sample):
             if use_foldcp_confidence:
                 assert foldcp_mesh is not None
@@ -347,11 +348,11 @@ class ConfidenceHead(nn.Module):
                         compute_resolved=compute_resolved,
                     )
                 )
-            if self._foldcp_is_non_output_rank() and all(
+            if foldcp_non_output_rank and all(
                 pred is None
                 for pred in (plddt_pred, pae_pred, pde_pred, resolved_pred)
             ):
-                return None, None, None, None
+                continue
             if plddt_preds is not None:
                 plddt_preds.append(plddt_pred)
             if pae_preds is not None:
@@ -360,6 +361,8 @@ class ConfidenceHead(nn.Module):
                 pde_preds.append(pde_pred)
             if resolved_preds is not None:
                 resolved_preds.append(resolved_pred)
+        if foldcp_non_output_rank:
+            return None, None, None, None
         plddt_preds = (
             torch.stack(plddt_preds, dim=-3) if plddt_preds is not None else None
         )  # [..., N_sample, N_atom, plddt_bins]

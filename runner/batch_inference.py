@@ -279,6 +279,8 @@ def get_default_runner(
     use_rna_msa: bool = False,
     need_atom_confidence: bool = False,
     kalign_binary_path: Optional[str] = None,
+    prot_template_mmcif_dir: Optional[str] = None,
+    prot_template_cache_dir: Optional[str] = None,
     use_tfg_guidance: bool = False,
     foldcp_mode: Literal["single", "distributed"] = "single",
     foldcp_size_dp: int = 1,
@@ -392,6 +394,11 @@ def get_default_runner(
                     "After installation, make sure the binary is accessible in PATH or provide kalign_binary_path."
                 )
 
+    if prot_template_mmcif_dir is not None:
+        configs.data.template.prot_template_mmcif_dir = prot_template_mmcif_dir
+    if prot_template_cache_dir is not None:
+        configs.data.template.prot_template_cache_dir = prot_template_cache_dir
+
     configs = update_gpu_compatible_configs(configs)
     logger.info(
         f"Inference by OpenDDE: model_name: {model_name}, dtype: {configs.dtype}"
@@ -439,6 +446,8 @@ def inference_jsons(
     msa_server_mode: Optional[str] = None,
     need_atom_confidence: bool = False,
     kalign_binary_path: Optional[str] = None,
+    prot_template_mmcif_dir: Optional[str] = None,
+    prot_template_cache_dir: Optional[str] = None,
     use_tfg_guidance: bool = False,
     hmmsearch_binary_path: Optional[str] = None,
     hmmbuild_binary_path: Optional[str] = None,
@@ -480,6 +489,10 @@ def inference_jsons(
         use_rna_msa (bool): Whether to use RNA MSA.
         msa_server_mode (Optional[str]): Deprecated compatibility argument; ignored.
         kalign_binary_path (Optional[str]): Path to kalign binary.
+        prot_template_mmcif_dir (Optional[str]): Override for the protein template
+            mmCIF directory; use a writable path when the data root is read-only.
+        prot_template_cache_dir (Optional[str]): Override for the parsed template
+            cache directory; use a writable path when the data root is read-only.
         use_tfg_guidance (bool): Use TFG guidance.
         hmmsearch_binary_path (Optional[str]): Path to hmmsearch binary.
         hmmbuild_binary_path (Optional[str]): Path to hmmbuild binary.
@@ -534,6 +547,8 @@ def inference_jsons(
         use_rna_msa=use_rna_msa,
         need_atom_confidence=need_atom_confidence,
         kalign_binary_path=kalign_binary_path,
+        prot_template_mmcif_dir=prot_template_mmcif_dir,
+        prot_template_cache_dir=prot_template_cache_dir,
         use_tfg_guidance=use_tfg_guidance,
         foldcp_mode=foldcp_mode,
         foldcp_size_dp=foldcp_size_dp,
@@ -756,6 +771,22 @@ def doctor() -> None:
     help="Path to kalign (searches in PATH if not provided).",
 )
 @click.option(
+    "--prot_template_mmcif_dir",
+    type=str,
+    default=None,
+    help="Directory for protein template mmCIF files. Overrides the default "
+    "$OPENDDE_ROOT_DIR/search_database/mmcif; use a writable path when the data "
+    "root is read-only and templates are fetched on demand.",
+)
+@click.option(
+    "--prot_template_cache_dir",
+    type=str,
+    default=None,
+    help="Directory for cached parsed protein templates. Overrides the default "
+    "$OPENDDE_ROOT_DIR/search_database/template_cache; use a writable path when "
+    "the data root is read-only.",
+)
+@click.option(
     "--use_tfg_guidance",
     type=bool,
     default=False,
@@ -844,6 +875,8 @@ def predict(
     msa_server_mode: Optional[str],
     need_atom_confidence: bool,
     kalign_binary_path: Optional[str] = None,
+    prot_template_mmcif_dir: Optional[str] = None,
+    prot_template_cache_dir: Optional[str] = None,
     use_tfg_guidance: bool = False,
     hmmsearch_binary_path: Optional[str] = None,
     hmmbuild_binary_path: Optional[str] = None,
@@ -888,6 +921,10 @@ def predict(
         msa_server_mode (Optional[str]): Deprecated compatibility option; ignored.
         need_atom_confidence (bool): Compute atom-level confidence scores.
         kalign_binary_path (Optional[str]): Path to kalign binary.
+        prot_template_mmcif_dir (Optional[str]): Override for the protein template
+            mmCIF directory; use a writable path when the data root is read-only.
+        prot_template_cache_dir (Optional[str]): Override for the parsed template
+            cache directory; use a writable path when the data root is read-only.
         use_tfg_guidance (bool): Use TFG guidance.
         hmmsearch_binary_path (Optional[str]): Path to hmmsearch binary.
         hmmbuild_binary_path (Optional[str]): Path to hmmbuild binary.
@@ -986,6 +1023,8 @@ def predict(
         msa_server_mode=msa_server_mode,
         need_atom_confidence=need_atom_confidence,
         kalign_binary_path=kalign_binary_path,
+        prot_template_mmcif_dir=prot_template_mmcif_dir,
+        prot_template_cache_dir=prot_template_cache_dir,
         use_tfg_guidance=use_tfg_guidance,
         hmmsearch_binary_path=hmmsearch_binary_path,
         hmmbuild_binary_path=hmmbuild_binary_path,

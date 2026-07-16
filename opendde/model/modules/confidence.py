@@ -24,6 +24,7 @@ from opendde.model.modules.pairformer import PairformerStack
 from opendde.model.modules.primitives import LinearNoBias
 from opendde.model.triangular.layers import LayerNorm
 from opendde.model.utils import broadcast_token_to_atom, one_hot
+from opendde.utils.torch_utils import cdist, cleanup_device_memory
 
 
 class ConfidenceHead(nn.Module):
@@ -196,8 +197,7 @@ class ConfidenceHead(nn.Module):
         valid_rows = valid_row_end - row_start
         valid_cols = valid_col_end - col_start
         z_init_local[:valid_rows, :valid_cols, :] = (
-            s2[row_start:valid_row_end, None, :]
-            + s1[None, col_start:valid_col_end, :]
+            s2[row_start:valid_row_end, None, :] + s1[None, col_start:valid_col_end, :]
         )
         return z_init_local.contiguous()
 
@@ -291,7 +291,7 @@ class ConfidenceHead(nn.Module):
             )
             z_trunk = z_trunk_local + z_init_local
             del z_trunk_local, z_init_local
-            torch.cuda.empty_cache()
+            cleanup_device_memory(z_trunk.device, collect_garbage=False)
         else:
             z_init = (
                 self.linear_no_bias_s1(s_inputs)[..., None, :, :]
@@ -299,7 +299,7 @@ class ConfidenceHead(nn.Module):
             )
             z_trunk = z_init + z_trunk
             del z_init
-            torch.cuda.empty_cache()
+            cleanup_device_memory(z_trunk.device, collect_garbage=False)
 
         plddt_preds = [] if compute_plddt else None
         pae_preds = [] if compute_pae else None
@@ -349,8 +349,7 @@ class ConfidenceHead(nn.Module):
                     )
                 )
             if foldcp_non_output_rank and all(
-                pred is None
-                for pred in (plddt_pred, pae_pred, pde_pred, resolved_pred)
+                pred is None for pred in (plddt_pred, pae_pred, pde_pred, resolved_pred)
             ):
                 continue
             if plddt_preds is not None:
@@ -431,13 +430,11 @@ class ConfidenceHead(nn.Module):
         )
         if compute_pae or compute_pde:
             z_pair_local = z_pair_local.to(torch.float32)
-            torch.cuda.empty_cache()
+            cleanup_device_memory(z_pair_local.device, collect_garbage=False)
         if compute_plddt or compute_resolved:
             s_single = s_single.to(torch.float32)
 
-        atom_to_token_idx = cast(
-            torch.Tensor, input_feature_dict["atom_to_token_idx"]
-        )
+        atom_to_token_idx = cast(torch.Tensor, input_feature_dict["atom_to_token_idx"])
         atom_to_tokatom_idx = cast(
             torch.Tensor, input_feature_dict["atom_to_tokatom_idx"]
         )
@@ -483,8 +480,9 @@ class ConfidenceHead(nn.Module):
             else:
                 plddt_pred = None
                 resolved_pred = None
+        device = z_pair_local.device
         del z_pair_local
-        torch.cuda.empty_cache()
+        cleanup_device_memory(device, collect_garbage=False)
         return plddt_pred, pae_pred, pde_pred, resolved_pred
 
     def memory_efficient_forward(
@@ -527,7 +525,7 @@ class ConfidenceHead(nn.Module):
                 pair_dims=(-3, -2),
             )
             del z_pair
-            torch.cuda.empty_cache()
+            cleanup_device_memory(z_pair_local.device, collect_garbage=False)
             return self.memory_efficient_forward_foldcp_local(
                 input_feature_dict=input_feature_dict,
                 s_trunk=s_trunk,
@@ -545,7 +543,7 @@ class ConfidenceHead(nn.Module):
         # Embed pair distances of representative atoms:
         with torch.amp.autocast("cuda", enabled=False):
             x_pred_rep_coords = x_pred_rep_coords.to(torch.float32)
-            distance_pred = torch.cdist(
+            distance_pred = cdist(
                 x_pred_rep_coords, x_pred_rep_coords
             )  # [..., N_tokens, N_tokens]
         if inplace_safe:
@@ -635,5 +633,5 @@ class ConfidenceHead(nn.Module):
                 plddt_pred = None
                 resolved_pred = None
         if z_pair.shape[-2] > 2000:
-            torch.cuda.empty_cache()
+            cleanup_device_memory(z_pair.device, collect_garbage=False)
         return plddt_pred, pae_pred, pde_pred, resolved_pred

@@ -1,11 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Aureka AI Research
 import dataclasses
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Self, Sequence, TypeAlias
 
 import numpy as np
 from biotite.structure import AtomArray
-from typing_extensions import Self, TypeAlias
 
 from opendde.data.constants import (
     DNA_CHAIN,

@@ -8,6 +8,7 @@ import time
 import traceback
 from collections.abc import Mapping, Sized
 from contextlib import nullcontext
+from datetime import timedelta
 from os.path import exists as opexists
 from os.path import join as opjoin
 from typing import Any, cast
@@ -17,12 +18,16 @@ import torch.distributed as dist
 
 from opendde.config.config import parse_sys_args
 from opendde.config.inference import (
+    apply_runtime_compatibility,
     build_inference_config,
-    update_gpu_compatible_configs,
 )
 from opendde.config.schema import OpenDDEConfig
 from opendde.data.inference.infer_dataloader import get_inference_dataloader
-from opendde.distributed.foldcp.config import FoldCPConfig
+from opendde.distributed.foldcp.config import (
+    FOLDCP_ENVIRONMENT_KEYS,
+    FoldCPConfig,
+    apply_foldcp_config,
+)
 from opendde.distributed.foldcp.metrics import (
     FoldCPBenchmarkRecorder,
     infer_n_token,
@@ -34,16 +39,57 @@ from opendde.utils.download import (
     download_inference_cache,
     resolve_checkpoint_path,
 )
+from opendde.utils.environment import select_torch_device
 from opendde.utils.logging_config import init_logging
 from opendde.utils.seed import seed_everything
 from opendde.utils.torch_utils import (
-    cleanup_cuda_memory,
+    cleanup_device_memory,
     disable_cudnn_benchmark,
     to_device,
 )
 from runner.dumper import DataDumper
 
 logger = logging.getLogger(__name__)
+
+_DISTRIBUTED_STARTUP_TIMEOUT = timedelta(hours=2)
+
+
+def _download_inference_assets(configs: OpenDDEConfig) -> None:
+    """Prepare shared inference assets once and synchronize all ranks."""
+    if DIST_WRAPPER.world_size <= 1:
+        download_inference_cache(configs)
+        return
+
+    if not dist.is_available() or not dist.is_initialized():
+        raise RuntimeError(
+            "Distributed inference asset preparation requires an initialized "
+            "process group."
+        )
+
+    download_error: Exception | None = None
+    download_status: list[tuple[bool, str] | None] = [None]
+    if dist.get_rank() == 0:
+        try:
+            download_inference_cache(configs)
+        except Exception as exc:
+            download_error = exc
+            download_status[0] = (False, f"{type(exc).__name__}: {exc}")
+        else:
+            download_status[0] = (True, "")
+
+    dist.broadcast_object_list(download_status, src=0)
+    result = download_status[0]
+    if result is None:
+        raise RuntimeError("Rank 0 broadcast an invalid inference asset status.")
+
+    succeeded, error_message = result
+    if not succeeded:
+        error = RuntimeError(
+            f"Inference asset preparation failed on rank 0: {error_message}"
+        )
+        if download_error is not None:
+            raise error from download_error
+        raise error
 
 
 class InferenceRunner(object):
@@ -52,24 +98,47 @@ class InferenceRunner(object):
     Handles environment setup, model initialization, and running predictions.
 
     Args:
-        configs (Any): Configuration object for inference.
+        configs (OpenDDEConfig): Configuration object for inference.
+        foldcp_config (FoldCPConfig | None): Pre-validated Fold-CP settings.
     """
 
-    def __init__(self, configs: Any) -> None:
-        self.configs = configs
-        self.foldcp_config = FoldCPConfig.from_config(configs)
-        self.foldcp_recorder = FoldCPBenchmarkRecorder(
-            self.foldcp_config.metrics_jsonl,
-            rank=DIST_WRAPPER.rank,
-        )
-        self.init_env()
-        self.init_basics()
-        self.init_model()
-        self.load_checkpoint()
-        self.init_dumper(
-            need_atom_confidence=configs.need_atom_confidence,
-            sorted_by_ranking_score=configs.sorted_by_ranking_score,
-        )
+    def __init__(
+        self,
+        configs: OpenDDEConfig,
+        *,
+        foldcp_config: FoldCPConfig | None = None,
+    ) -> None:
+        self._owns_process_group = False
+        self._foldcp_environment_before_publish: dict[str, str | None] | None = None
+        try:
+            self.foldcp_config = (
+                foldcp_config
+                if foldcp_config is not None
+                else FoldCPConfig.from_config(configs)
+            )
+            self.configs = configs
+            self.foldcp_recorder = FoldCPBenchmarkRecorder(
+                self.foldcp_config.metrics_jsonl,
+                rank=DIST_WRAPPER.rank,
+            )
+            self.init_env()
+            _download_inference_assets(self.configs)
+            self.init_basics()
+            self.init_model()
+            self.load_checkpoint()
+            self.init_dumper(
+                need_atom_confidence=self.configs.need_atom_confidence,
+                sorted_by_ranking_score=self.configs.sorted_by_ranking_score,
+            )
+            # Fold-CP is process-global today; publish it only after initialization
+            # succeeds and retain the previous state for close().
+            self._foldcp_environment_before_publish = {
+                key: os.environ.get(key) for key in FOLDCP_ENVIRONMENT_KEYS
+            }
+            self.configs = apply_foldcp_config(self.configs, self.foldcp_config)
+        except BaseException:
+            self.close()
+            raise
 
     def init_env(self) -> None:
         """
@@ -79,9 +148,22 @@ class InferenceRunner(object):
             f"Distributed environment: world size: {DIST_WRAPPER.world_size}, "
             f"global rank: {DIST_WRAPPER.rank}, local rank: {DIST_WRAPPER.local_rank}"
         )
-        self.use_cuda = torch.cuda.device_count() > 0
+        if self.foldcp_config.enabled:
+            expected_world_size = (
+                self.foldcp_config.size_dp * self.foldcp_config.size_cp
+            )
+            if DIST_WRAPPER.world_size != expected_world_size:
+                raise RuntimeError(
+                    "Distributed Fold-CP must be launched with torchrun using "
+                    f"{expected_world_size} processes. Example: "
+                    f"{self.foldcp_config.launch_hint()}"
+                )
+
+        self.device = select_torch_device(
+            self.configs.device, local_rank=DIST_WRAPPER.local_rank
+        )
+        self.use_cuda = self.device.type == "cuda"
         if self.use_cuda:
-            self.device = torch.device(f"cuda:{DIST_WRAPPER.local_rank}")
             os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
             all_gpu_ids = ",".join(str(x) for x in range(torch.cuda.device_count()))
             devices = os.getenv("CUDA_VISIBLE_DEVICES", all_gpu_ids)
@@ -89,11 +171,31 @@ class InferenceRunner(object):
                 f"LOCAL_RANK: {DIST_WRAPPER.local_rank} - CUDA_VISIBLE_DEVICES: [{devices}]"
             )
             torch.cuda.set_device(self.device)
-        else:
-            self.device = torch.device("cpu")
+
+        self.configs = apply_runtime_compatibility(self.configs, self.device)
 
         if DIST_WRAPPER.world_size > 1:
-            dist.init_process_group(backend="nccl")
+            if not self.use_cuda:
+                raise RuntimeError(
+                    "Distributed Fold-CP inference requires NVIDIA CUDA; CPU "
+                    "supports single-process inference only."
+                )
+            if not dist.is_nccl_available():
+                raise RuntimeError(
+                    "Distributed Fold-CP inference requires the NCCL backend, "
+                    "which is unavailable in this PyTorch build. Windows "
+                    "distributed inference is not currently supported."
+                )
+            if dist.is_initialized():
+                if dist.get_backend() != "nccl":
+                    raise RuntimeError(
+                        "Distributed Fold-CP requires an NCCL process group."
+                    )
+            else:
+                dist.init_process_group(
+                    backend="nccl", timeout=_DISTRIBUTED_STARTUP_TIMEOUT
+                )
+                self._owns_process_group = True
 
         use_fastlayernorm = os.getenv("LAYERNORM_TYPE", "torch")
         if use_fastlayernorm == "fast_layernorm":
@@ -101,7 +203,32 @@ class InferenceRunner(object):
                 "Kernels will be compiled when fast_layernorm is first called."
             )
 
+        logging.info("Selected inference device: %s", self.device)
         logging.info("Finished environment initialization.")
+
+    def close(self) -> None:
+        """Restore process-global state and release Runner-owned resources."""
+        previous_environment = self._foldcp_environment_before_publish
+        self._foldcp_environment_before_publish = None
+        if previous_environment is not None:
+            for key, value in previous_environment.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+        if not self._owns_process_group:
+            return
+        if not dist.is_available() or not dist.is_initialized():
+            self._owns_process_group = False
+            return
+
+        try:
+            dist.destroy_process_group()
+        except Exception:
+            logger.exception("Failed to destroy the Runner-owned process group.")
+        else:
+            self._owns_process_group = False
 
     def init_basics(self) -> None:
         """
@@ -188,12 +315,11 @@ class InferenceRunner(object):
         eval_precision = {
             "fp32": torch.float32,
             "bf16": torch.bfloat16,
-            "fp16": torch.float16,
         }[self.configs.dtype]
 
         enable_amp = (
             torch.autocast(device_type="cuda", dtype=eval_precision)
-            if torch.cuda.is_available()
+            if self.use_cuda and eval_precision != torch.float32
             else nullcontext()
         )
 
@@ -203,13 +329,17 @@ class InferenceRunner(object):
         n_token = infer_n_token(data)
 
         data = to_device(data, self.device)
-        with enable_amp, measure_foldcp_stage(
-            task_id="task0",
-            stage_name="model_forward",
-            foldcp_config=self.foldcp_config,
-            recorder=self.foldcp_recorder,
-            sample_name=sample_name,
-            n_token=n_token,
+        with (
+            enable_amp,
+            measure_foldcp_stage(
+                task_id="task0",
+                stage_name="model_forward",
+                foldcp_config=self.foldcp_config,
+                recorder=self.foldcp_recorder,
+                sample_name=sample_name,
+                n_token=n_token,
+                device=self.device,
+            ),
         ):
             prediction, _, _ = self.model(
                 input_feature_dict=data["input_feature_dict"],
@@ -316,10 +446,10 @@ def infer_predict(runner: InferenceRunner, configs: Any) -> None:
 
     num_data = len(cast(Sized, dataloader.dataset))
     t0_start = time.time()
-    with disable_cudnn_benchmark():
+    with disable_cudnn_benchmark(runner.device):
         for seed in seeds:
             seed_everything(seed=seed, deterministic=configs.deterministic)
-            cleanup_cuda_memory()
+            cleanup_device_memory(runner.device)
             t1_start = time.time()
             for batch in dataloader:
                 sample_name = "unknown"
@@ -391,8 +521,8 @@ def infer_predict(runner: InferenceRunner, configs: Any) -> None:
                         f.write(error_message)
                 finally:
                     del data, atom_array, prediction
-                    cleanup_cuda_memory(collect_garbage=False)
-            cleanup_cuda_memory()
+                    cleanup_device_memory(runner.device, collect_garbage=False)
+            cleanup_device_memory(runner.device)
             t1_end = time.time()
             logger.info(
                 f"[Rank {DIST_WRAPPER.rank}] Seed {seed} completed in {t1_end - t1_start:.2f}s."
@@ -411,15 +541,18 @@ def infer_predict(runner: InferenceRunner, configs: Any) -> None:
     )
 
 
-def main(configs: Any) -> None:
+def main(configs: OpenDDEConfig) -> None:
     """
     Inference entry point.
 
     Args:
-        configs (Any): Inference configurations.
+        configs (OpenDDEConfig): Inference configurations.
     """
     runner = InferenceRunner(configs)
-    infer_predict(runner, configs)
+    try:
+        infer_predict(runner, runner.configs)
+    finally:
+        runner.close()
 
 
 def run() -> None:
@@ -444,16 +577,10 @@ def run() -> None:
     logger.info(
         f"Inference by OpenDDE: model_name: {model_name}, dtype: {configs.dtype}"
     )
-    configs = update_gpu_compatible_configs(configs)
-    logger.info(
-        f"Triangle kernels: multiplicative={configs.triangle_multiplicative}, "
-        f"attention={configs.triangle_attention}"
-    )
     logger.info(
         f"Optimization: shared_vars_cache={configs.enable_diffusion_shared_vars_cache}, "
         f"efficient_fusion={configs.enable_efficient_fusion}, tf32={configs.enable_tf32}"
     )
-    download_inference_cache(configs)
     main(configs)
 
 

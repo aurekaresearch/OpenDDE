@@ -19,12 +19,12 @@ from opendde.model.utils import (
     permute_final_dims,
 )
 
-fastln_is_installed = os.getenv("LAYERNORM_TYPE", "torch") == "fast_layernorm"
-if fastln_is_installed:
+_use_fast_layer_norm = os.getenv("LAYERNORM_TYPE", "torch") == "fast_layernorm"
+if _use_fast_layer_norm:
     try:
         from opendde.model.layer_norm.layer_norm import FusedLayerNorm
     except (ImportError, OSError, RuntimeError):
-        fastln_is_installed = False
+        _use_fast_layer_norm = False
 
 
 def _prod(nums: Union[List[int], Tuple[int, ...], torch.Size]) -> int:
@@ -243,7 +243,7 @@ def LayerNorm(
     create_offset: bool = True,
     eps: float = 1e-5,
 ) -> nn.Module:
-    if fastln_is_installed:
+    if _use_fast_layer_norm:
         return FusedLayerNorm(
             c_in, create_scale=create_scale, create_offset=create_offset, eps=eps
         )
@@ -412,19 +412,20 @@ class Attention(nn.Module):
         Returns
             [*, Q, C_q] attention update
         """
-        assert triangle_attention in ["torch", "cuequivariance"], (
-            "Invalid triangle_attention. Options: 'cuequivariance', 'torch'."
-        )
+        if triangle_attention not in {"torch", "cuequivariance"}:
+            raise ValueError(
+                "Invalid triangle_attention. Options: 'cuequivariance', 'torch'."
+            )
 
         if biases is None:
             biases = []
 
         use_cuequivariance = (
-            triangle_attention == "cuequivariance" and q_x.shape[-2] > 16
+            triangle_attention == "cuequivariance"
+            and q_x.is_cuda
+            and q_x.shape[-2] > 16
         )
-        q, k, v = self._prep_qkv(
-            q_x, kv_x, apply_scale=not use_cuequivariance
-        )
+        q, k, v = self._prep_qkv(q_x, kv_x, apply_scale=not use_cuequivariance)
 
         if use_cuequivariance:
             # Notes:
@@ -434,10 +435,6 @@ class Attention(nn.Module):
             #     (3) Triangle attention kernel supports: all hidden_dim<=32 and divisible by 4 for tf32/fp32,
             #         and for all hidden_dim<=128 and divisible by 8 for bf16/fp16. In the rare instance that
             #         the kernel does not support an input config, fallback to torch is enabled instead of erroring out.
-            #     (4) Blackwell-optimized kernels (for compute capabilities 10.0 and 10.3) provide superior performance
-            #         especially for long sequences and higher head dimensions. These kernels require the sequence length
-            #         N to be a multiple of 8 for the forward pass; pad the sequence if necessary.
-            #         Currently, this feature is supported only for cu13 builds.
             scale = 1.0 / math.sqrt(self.c_hidden)
             o = cuequivariance_triangular_attn(
                 q, k, v, biases[1].float(), (biases[0] == 0).bool(), scale

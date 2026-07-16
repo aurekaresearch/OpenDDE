@@ -715,8 +715,8 @@ def calculate_chain_based_plddt(
 
     def _calculate_lddt_with_token_mask(token_mask):
         atom_mask = token_mask[atom_to_token_idx]
-        sub_plddt = atom_plddt[:, atom_mask].mean(-1)
-        return sub_plddt
+        sub_plddt = atom_plddt[:, atom_mask]
+        return sub_plddt.to(torch.float64).mean(-1).to(atom_plddt.dtype)
 
     batch_shape = atom_plddt.shape[:-1]
     # Chain_plddt

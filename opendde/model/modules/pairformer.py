@@ -15,10 +15,11 @@ from opendde.distributed.foldcp.config import FoldCPConfig
 from opendde.distributed.foldcp.mesh import FoldCPProcessMesh
 from opendde.distributed.foldcp.launch import (
     foldcp_linear_with_source_launch_shape,
+    foldcp_module_with_source_launch_shape,
     foldcp_pair_row_slab_linear_with_source_launch_policy,
 )
 from opendde.distributed.foldcp.msa_pair_weighted import (
-    collect_msa_pair_row_slab,
+    distributed_msa_pair_weighted_average_with_full_value,
     gather_msa_rows_from_cp,
     serial_msa_pair_weighted_average,
 )
@@ -494,13 +495,51 @@ class MSAPairWeightedAveraging(nn.Module):
         *,
         original_n: int,
         row_start: int,
+        col_start: int = 0,
+        valid_rows: Optional[int] = None,
+        valid_cols: Optional[int] = None,
     ) -> torch.Tensor:
         return foldcp_pair_row_slab_linear_with_source_launch_policy(
             self.linear_no_bias_z,
             z,
             original_n=original_n,
             row_start=row_start,
+            col_start=col_start,
+            valid_rows=valid_rows,
+            valid_cols=valid_cols,
         )
+
+    def _deterministic_pair_weighted_average(
+        self,
+        pair_logits: torch.Tensor,
+        value: torch.Tensor,
+    ) -> torch.Tensor:
+        """Match the canonical CP4 row-slab softmax/einsum launch shape."""
+
+        if pair_logits.ndim != 3 or value.ndim != 4:
+            weights = self.softmax_w(pair_logits)
+            return torch.einsum("...ijh,...mjhc->...mihc", weights, value)
+
+        n_token = int(pair_logits.shape[0])
+        row_tile = (n_token + 1) // 2
+        row_outputs = []
+        value_batch = value.unsqueeze(0)
+        for row_coord in range(2):
+            row_start = row_coord * row_tile
+            valid_rows = max(0, min(row_tile, n_token - row_start))
+            logits_local = pair_logits.new_zeros(
+                (1, row_tile, n_token, pair_logits.shape[-1])
+            )
+            if valid_rows > 0:
+                logits_local[:, :valid_rows].copy_(
+                    pair_logits[row_start : row_start + valid_rows].unsqueeze(0)
+                )
+            local_output = serial_msa_pair_weighted_average(
+                logits_local,
+                value_batch,
+            ).squeeze(0)
+            row_outputs.append(local_output[:, :valid_rows])
+        return torch.cat(row_outputs, dim=1)
 
     def _maybe_forward_foldcp(
         self,
@@ -530,17 +569,31 @@ class MSAPairWeightedAveraging(nn.Module):
         g = torch.sigmoid(self.linear_no_bias_mg(m_norm))
         g = g.reshape(*g.shape[:-1], self.n_heads, self.c)
 
-        n_token = z_pair_spec.original_shape[z_pair_spec.pair_dims[0]]
-        z_row_slab = collect_msa_pair_row_slab(z_local, mesh, n_token)
-        pair_logits_row_slab = self._linear_no_bias_z_source_launch(
-            self.layernorm_z(z_row_slab),
-            original_n=n_token,
-            row_start=z_pair_spec.row_range[0],
-        )
+        row_dim, col_dim = z_pair_spec.pair_dims
+        n_token = z_pair_spec.original_shape[row_dim]
+        row_start, row_end = z_pair_spec.row_range
+        col_start, col_end = z_pair_spec.col_range
+        valid_rows = max(0, min(row_end, n_token) - row_start)
+        valid_cols = max(0, min(col_end, z_pair_spec.original_shape[col_dim]) - col_start)
 
-        local_wv = serial_msa_pair_weighted_average(
-            pair_logits_row_slab.unsqueeze(0),
+        z_norm_local = foldcp_module_with_source_launch_shape(
+            self.layernorm_z,
+            z_local,
+            source_rows=n_token * n_token,
+        )
+        pair_logits_local = self._linear_no_bias_z_source_launch(
+            z_norm_local,
+            original_n=n_token,
+            row_start=row_start,
+            col_start=col_start,
+            valid_rows=valid_rows,
+            valid_cols=valid_cols,
+        )
+        local_wv = distributed_msa_pair_weighted_average_with_full_value(
+            pair_logits_local.unsqueeze(0),
             v.unsqueeze(0),
+            mesh,
+            original_tokens=n_token,
         )
         wv = gather_msa_rows_from_cp(
             local_wv,
@@ -584,17 +637,23 @@ class MSAPairWeightedAveraging(nn.Module):
         b = self.linear_no_bias_z(
             self.layernorm_z(z)
         )  # [...,n_token, n_token, n_heads]
-        w = self.softmax_w(b)  # [...,n_token, n_token, n_heads]
-        wv = torch.einsum(
-            "...ijh,...mjhc->...mihc", w, v
-        )  # [...,n_msa_sampled,n_token,n_heads,c]
+        if (
+            not torch.is_grad_enabled()
+            and torch.are_deterministic_algorithms_enabled()
+        ):
+            wv = self._deterministic_pair_weighted_average(b, v)
+        else:
+            w = self.softmax_w(b)  # [...,n_token, n_token, n_heads]
+            wv = torch.einsum(
+                "...ijh,...mjhc->...mihc", w, v
+            )  # [...,n_msa_sampled,n_token,n_heads,c]
         o = g * wv
         o = o.reshape(
             *o.shape[:-2], self.n_heads * self.c
         )  # [...,n_msa_sampled, n_token, n_heads * c]
         m = self.linear_no_bias_out(o)  # [...,n_msa_sampled, n_token, c_m]
         if m.shape[-3] > 5120:
-            del v, b, g, w, wv, o
+            del v, b, g, wv, o
         return m
 
 
@@ -917,23 +976,30 @@ class MSABlock(nn.Module):
         )
         return FoldCPProcessMesh.create(foldcp)
 
-    def _foldcp_outer_product_mean_local_update(
+    def _outer_product_mean_tile_update(
         self,
         m: torch.Tensor,
-        mesh: FoldCPProcessMesh,
+        mesh_shape: tuple[int, int],
+        mesh_coord: tuple[int, int],
         chunk_size: Optional[int] = None,
     ) -> torch.Tensor:
+        """Compute one canonical OPM pair tile.
+
+        Deterministic single-rank inference and Fold-CP call this same helper so
+        CUDA sees the same output shape and MSA reduction shape in both modes.
+        """
+
         leading_shape = m.shape[:-3]
         m_work = m.float() if is_fp16_enabled() else m
         m_flat = m_work.reshape((-1,) + m_work.shape[-3:])
         opm = self.outer_product_mean_msa
 
         n_token = m_flat.shape[-2]
-        mesh_rows, mesh_cols = mesh.layout.shape
+        mesh_rows, mesh_cols = mesh_shape
         row_tile = (n_token + mesh_rows - 1) // mesh_rows
         col_tile = (n_token + mesh_cols - 1) // mesh_cols
-        row_start = mesh.coord[0] * row_tile
-        col_start = mesh.coord[1] * col_tile
+        row_start = mesh_coord[0] * row_tile
+        col_start = mesh_coord[1] * col_tile
         row_end = min(row_start + row_tile, n_token)
         col_end = min(col_start + col_tile, n_token)
 
@@ -978,6 +1044,57 @@ class MSABlock(nn.Module):
         else:
             local_update = local_update.squeeze(0)
         return local_update
+
+    def _foldcp_outer_product_mean_local_update(
+        self,
+        m: torch.Tensor,
+        mesh: FoldCPProcessMesh,
+        chunk_size: Optional[int] = None,
+    ) -> torch.Tensor:
+        return self._outer_product_mean_tile_update(
+            m,
+            mesh_shape=mesh.layout.shape,
+            mesh_coord=mesh.coord,
+            chunk_size=chunk_size,
+        )
+
+    def _deterministic_outer_product_mean_full_update(
+        self,
+        m: torch.Tensor,
+        chunk_size: Optional[int] = None,
+    ) -> torch.Tensor:
+        """Assemble the full OPM update using the canonical CP4 2x2 tiling."""
+
+        grid_shape = (2, 2)
+        n_token = m.shape[-2]
+        leading_shape = m.shape[:-3]
+        m_work = m.float() if is_fp16_enabled() else m
+        full_update = m_work.new_empty(
+            leading_shape + (n_token, n_token, self.outer_product_mean_msa.c_z)
+        )
+        row_tile = (n_token + grid_shape[0] - 1) // grid_shape[0]
+        col_tile = (n_token + grid_shape[1] - 1) // grid_shape[1]
+        for row_coord in range(grid_shape[0]):
+            row_start = row_coord * row_tile
+            row_end = min(row_start + row_tile, n_token)
+            for col_coord in range(grid_shape[1]):
+                col_start = col_coord * col_tile
+                col_end = min(col_start + col_tile, n_token)
+                tile = self._outer_product_mean_tile_update(
+                    m,
+                    mesh_shape=grid_shape,
+                    mesh_coord=(row_coord, col_coord),
+                    chunk_size=chunk_size,
+                )
+                full_update[
+                    ..., row_start:row_end, col_start:col_end, :
+                ] = tile[
+                    ...,
+                    : row_end - row_start,
+                    : col_end - col_start,
+                    :,
+                ]
+        return full_update
 
     def _maybe_add_foldcp_outer_product_mean(
         self,
@@ -1161,9 +1278,19 @@ class MSABlock(nn.Module):
             )
             foldcp_z = gather_pair_tensor(z_local, z_spec, mesh.group_2d)
         if foldcp_z is None:
-            z = z + self.outer_product_mean_msa(
-                m, inplace_safe=inplace_safe, chunk_size=chunk_size
-            )
+            if (
+                not torch.is_grad_enabled()
+                and torch.are_deterministic_algorithms_enabled()
+            ):
+                opm_update = self._deterministic_outer_product_mean_full_update(
+                    m,
+                    chunk_size=chunk_size,
+                )
+            else:
+                opm_update = self.outer_product_mean_msa(
+                    m, inplace_safe=inplace_safe, chunk_size=chunk_size
+                )
+            z = z + opm_update
             _, z = self.pair_stack(
                 s=None,
                 z=z,

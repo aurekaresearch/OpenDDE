@@ -2,7 +2,6 @@
 # Copyright (c) 2026 Aureka AI Research
 import gc
 from contextlib import contextmanager, nullcontext
-from typing import Sequence
 
 import numpy as np
 import torch
@@ -23,18 +22,24 @@ def to_device(obj, device, non_blocking: bool = False):
     return obj
 
 
-def cleanup_cuda_memory(collect_garbage: bool = True) -> None:
-    """Optionally collect Python garbage and return cached CUDA blocks to the allocator."""
+def cleanup_device_memory(
+    device: torch.device | str,
+    collect_garbage: bool = True,
+) -> None:
+    """Collect garbage and clear the cache for an available accelerator."""
+    selected_device = torch.device(device)
     if collect_garbage:
         gc.collect()
-    if torch.cuda.is_available():
+
+    if selected_device.type == "cuda" and torch.cuda.is_available():
         torch.cuda.empty_cache()
 
 
 @contextmanager
-def disable_cudnn_benchmark():
-    """Temporarily disable cuDNN benchmark to reduce eval-time workspace spikes."""
-    if not torch.cuda.is_available():
+def disable_cudnn_benchmark(device: torch.device | str | None = None):
+    """Temporarily disable cuDNN benchmark for the selected CUDA device."""
+    device_type = torch.device(device).type if device is not None else None
+    if device_type not in {None, "cuda"} or not torch.cuda.is_available():
         yield
         return
 
@@ -46,35 +51,9 @@ def disable_cudnn_benchmark():
         torch.backends.cudnn.benchmark = benchmark_enabled
 
 
-def cdist(a: torch.Tensor, b: torch.Tensor | None = None):
-    # for tensor shape [1, 512 * 14, 3], donot_use_mm_for_euclid_dist mode costs 0.0489s,
-    # while use_mm_for_euclid_dist_if_necessary costs 0.0419s on cpu. On GPU there two costs
-    # will be neglectible. So there is no need to sacrifice accuracy for speed here.
-    return torch.cdist(
-        a,
-        b if b is not None else a,
-        compute_mode="donot_use_mm_for_euclid_dist",
-    )
-
-
-def eye_mask(L, device=None, opposite=False):
-    if opposite:
-        return 1.0 - torch.eye(L, device=device)
-    else:
-        return torch.eye(L, device=device)
-
-
-def permute_last_dims(t: torch.Tensor, dims: Sequence[int]):
-    """Permute tensor on last dims, all other dims are kept unchanged.
-
-    Args:
-        t (torch.Tensor): Input tensor with at least len(dims) dimensions.
-        dims: The desired ordering of dimensions, here all values should be < 0, i.e. (-1, -2) means permute last two dims.
-    """
-    num_dims = len(t.shape)
-    prefix_dims = list(range(num_dims - len(dims)))
-    last_dims = [num_dims + d for d in dims]
-    return torch.permute(t, prefix_dims + last_dims)
+def cdist(a: torch.Tensor, b: torch.Tensor | None = None) -> torch.Tensor:
+    """Use PyTorch's default distance compute-mode selection."""
+    return torch.cdist(a, b if b is not None else a)
 
 
 def map_values_to_list(data, recursive=True):

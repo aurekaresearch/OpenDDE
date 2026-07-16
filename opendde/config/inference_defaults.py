@@ -16,6 +16,7 @@ inference_configs: dict[str, Any] = {
     "dump_dir": "./output",
     "need_atom_confidence": False,
     "sorted_by_ranking_score": True,
+    "device": "auto",
     "input_json_path": RequiredValue(str),
     "load_checkpoint_dir": os.path.join(OPENDDE_ROOT_DIR, "checkpoint"),
     "num_workers": 0,

@@ -8,6 +8,7 @@ import torch.nn as nn
 from opendde.data.constants import rdkit_vdws
 from opendde.utils.logger import get_logger
 
+
 logger = get_logger(__name__)
 
 RDKIT_VDWS = torch.tensor(rdkit_vdws)

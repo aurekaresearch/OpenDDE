@@ -2,23 +2,71 @@
 # Copyright (c) 2026 Aureka AI Research
 import os
 import posixpath
+from dataclasses import dataclass
 from urllib.parse import urlsplit, urlunsplit
 
 from opendde.config.model_registry import DEFAULT_MODEL_NAME
+from opendde.config.model_manifest import (
+    get_checkpoint_manifest,
+    get_model_manifest,
+    load_model_manifest,
+    source_root,
+)
 
-DEFAULT_CHECKPOINT_FILE = "opendde.pt"
-CHECKPOINT_FILES = {DEFAULT_MODEL_NAME: DEFAULT_CHECKPOINT_FILE}
+MODEL_MANIFEST = load_model_manifest()
+DEFAULT_MODEL_MANIFEST = get_model_manifest(DEFAULT_MODEL_NAME, MODEL_MANIFEST)
+DEFAULT_CHECKPOINT_FILE = DEFAULT_MODEL_MANIFEST["default_checkpoint"]
+DEFAULT_CHECKPOINT_MANIFEST = get_checkpoint_manifest(
+    DEFAULT_MODEL_MANIFEST, DEFAULT_CHECKPOINT_FILE
+)
+CHECKPOINT_FILES = {
+    model["name"]: model["default_checkpoint"] for model in MODEL_MANIFEST["models"]
+}
+DEFAULT_ASSET_REVISION = MODEL_MANIFEST["source"]["revision"]
+DEFAULT_DEPENDENCY_URL_ROOT = source_root(MODEL_MANIFEST)
+
+
+@dataclass(frozen=True)
+class ManagedAsset:
+    """Published runtime asset identity used for repair and download validation."""
+
+    size: int
+    sha256: str
+
+
+MANAGED_ASSETS = {
+    DEFAULT_MODEL_NAME: ManagedAsset(
+        size=DEFAULT_CHECKPOINT_MANIFEST["size_bytes"],
+        sha256=DEFAULT_CHECKPOINT_MANIFEST["sha256"],
+    ),
+    "ccd_components_file": ManagedAsset(
+        size=490_777_362,
+        sha256="bb31ae5cf6c8bc669924313077cb4231ee5ffefd3a20118cd14f3ec89f8bb6a5",
+    ),
+    "ccd_components_rdkit_mol_file": ManagedAsset(
+        size=142_498_117,
+        sha256="d1cfb71f5993a3ebea7c47877022d7f597bbfbaf86e28a4770e957da6c50cd35",
+    ),
+    "obsolete_pdbs_path": ManagedAsset(
+        size=86_882,
+        sha256="2bc08348d0efba438c109bb27be6fa25b611d371c60b8a8da3de387a4a0698ad",
+    ),
+    "release_dates_path": ManagedAsset(
+        size=12_754_898,
+        sha256="8b1ef12ddc01a0d5eb2d388c77ded91aa906eebce7440726c57b6f8d1a3ec142",
+    ),
+}
 
 DEPENDENCY_URL_ROOT = os.environ.get(
     "OPENDDE_DEPENDENCY_URL",
-    "https://huggingface.co/aurekaresearch/OpenDDE/resolve/main",
+    DEFAULT_DEPENDENCY_URL_ROOT,
 ).rstrip("/")
 
 COMMON_URL_ROOT = os.environ.get(
     "OPENDDE_COMMON_URL",
     os.environ.get(
         "OPENDDE_DEPENDENCY_URL",
-        "https://huggingface.co/aurekaresearch/OpenDDE/resolve/main/common",
+        f"{DEFAULT_DEPENDENCY_URL_ROOT}/common",
     ),
 ).rstrip("/")
 

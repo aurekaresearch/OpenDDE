@@ -15,6 +15,13 @@ from dataclasses import asdict, dataclass
 from typing import Any, Literal
 
 FoldCPMode = Literal["single", "distributed"]
+FOLDCP_ENVIRONMENT_KEYS = (
+    "OPENDDE_FOLDCP_MODE",
+    "OPENDDE_FOLDCP_SIZE_DP",
+    "OPENDDE_FOLDCP_SIZE_CP",
+    "OPENDDE_FOLDCP_DEVICES",
+    "OPENDDE_FOLDCP_METRICS_JSONL",
+)
 
 
 def _as_int(value: Any, default: int) -> int:
@@ -80,13 +87,6 @@ class FoldCPConfig:
                 raise ValueError(
                     "foldcp_mode='distributed' requires foldcp_size_cp > 1."
                 )
-        world_size = int(os.environ.get("WORLD_SIZE", "0") or "0")
-        if world_size and self.size_dp * self.size_cp != world_size:
-            raise ValueError(
-                "foldcp_size_dp * foldcp_size_cp must equal WORLD_SIZE "
-                f"when launched with torchrun; got {self.size_dp} * "
-                f"{self.size_cp} != {world_size}."
-            )
         return self
 
     @property
@@ -121,11 +121,15 @@ class FoldCPConfig:
 def apply_foldcp_config(configs: Any, foldcp: FoldCPConfig) -> Any:
     """Attach validated Fold-CP settings to the mutable OpenDDE config object."""
 
-    os.environ["OPENDDE_FOLDCP_MODE"] = foldcp.mode
-    os.environ["OPENDDE_FOLDCP_SIZE_DP"] = str(foldcp.size_dp)
-    os.environ["OPENDDE_FOLDCP_SIZE_CP"] = str(foldcp.size_cp)
-    os.environ["OPENDDE_FOLDCP_DEVICES"] = foldcp.devices
-    os.environ["OPENDDE_FOLDCP_METRICS_JSONL"] = foldcp.metrics_jsonl
+    values = (
+        foldcp.mode,
+        str(foldcp.size_dp),
+        str(foldcp.size_cp),
+        foldcp.devices,
+        foldcp.metrics_jsonl,
+    )
+    for key, value in zip(FOLDCP_ENVIRONMENT_KEYS, values, strict=True):
+        os.environ[key] = value
 
     configs.foldcp_mode = foldcp.mode
     configs.foldcp_size_dp = foldcp.size_dp

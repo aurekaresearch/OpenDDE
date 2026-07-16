@@ -1,15 +1,33 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Aureka AI Research
 import os
+import shutil
 import subprocess
 import time
-from contextlib import nullcontext
 from typing import Sequence
 
 from opendde.data.tools.common import parse_kalign_a3m, tmpdir_manager, to_a3m
 from opendde.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+
+def resolve_kalign_binary(binary_path: str | None) -> str:
+    """Resolve an explicit Kalign binary before falling back to PATH."""
+    found_path = shutil.which(binary_path) if binary_path else None
+    if found_path is None and binary_path != "kalign":
+        found_path = shutil.which("kalign")
+    if found_path is None:
+        raise RuntimeError(
+            f"Kalign binary not found. Neither the provided path "
+            f"({binary_path}) nor kalign in system PATH is executable.\n"
+            f"To install kalign, you can use one of the following methods:\n"
+            f"1. Using conda: conda install -c bioconda kalign\n"
+            f"2. Using apt (Ubuntu/Debian): apt-get install kalign\n"
+            f"3. Download from: https://github.com/TimoLassmann/kalign\n"
+            f"After installation, make sure the binary is accessible either in PATH or at the specified location."
+        )
+    return found_path
 
 
 class Kalign:
@@ -24,39 +42,8 @@ class Kalign:
       RuntimeError: If Kalign binary not found within the path.
     """
 
-    def __init__(self, *, binary_path: str):
-        # First check if kalign is available in the system PATH using 'which'
-        found_path = None
-        try:
-            result = subprocess.run(["which", "kalign"], capture_output=True, text=True)
-            if result.returncode == 0 and result.stdout.strip():
-                kalign_in_path = result.stdout.strip()
-                if os.path.exists(kalign_in_path) and os.access(
-                    kalign_in_path, os.X_OK
-                ):
-                    found_path = kalign_in_path
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            # 'which' command not found or failed, continue to check other options
-            pass
-
-        # If not found in PATH, check the passed binary_path
-        if found_path is None:
-            if os.path.exists(binary_path) and os.access(binary_path, os.X_OK):
-                found_path = binary_path
-            else:
-                # Generate error message with installation instructions
-                raise RuntimeError(
-                    f"Kalign binary not found. Neither kalign in system PATH "
-                    f"nor provided path ({binary_path}) exist and are executable.\n"
-                    f"To install kalign, you can use one of the following methods:\n"
-                    f"1. Using conda: conda install -c bioconda kalign\n"
-                    f"2. Using apt (Ubuntu/Debian): apt-get install kalign\n"
-                    f"3. Download from: https://github.com/TimoLassmann/kalign\n"
-                    f"After installation, make sure the binary is accessible either in PATH or at the specified location."
-                )
-
-        # Set the found path as the binary path to use
-        self.binary_path = found_path
+    def __init__(self, *, binary_path: str | None):
+        self.binary_path = resolve_kalign_binary(binary_path)
 
     def align(self, sequences: Sequence[str]) -> Sequence[str]:
         """Aligns the sequences and returns the alignment in A3M string.
@@ -108,25 +95,26 @@ class Kalign:
                 "fasta",
             ]
 
-            popen_st = time.perf_counter()
-            process = subprocess.Popen(
-                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+            run_st = time.perf_counter()
+            process = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                errors="replace",
+                check=False,
             )
+            run_seconds = time.perf_counter() - run_st
 
-            with nullcontext():
-                stdout, stderr = process.communicate()
-                retcode = process.wait()
-            popen_seconds = time.perf_counter() - popen_st
-
-            if retcode:
+            if process.returncode:
                 logger.debug(
                     "Kalign timings write=%.4fs run=%.4fs read=%.4fs",
                     write_seconds,
-                    popen_seconds,
+                    run_seconds,
                     0.0,
                 )
                 raise RuntimeError(
-                    f"Kalign failed\nstdout:\n{stdout.decode('utf-8')}\n\nstderr:\n{stderr.decode('utf-8')}\n"
+                    f"Kalign failed with exit code {process.returncode}\n"
+                    f"stdout:\n{process.stdout}\n\nstderr:\n{process.stderr}\n"
                 )
 
             read_st = time.perf_counter()
@@ -137,7 +125,7 @@ class Kalign:
             logger.debug(
                 "Kalign timings write=%.4fs run=%.4fs read=%.4fs",
                 write_seconds,
-                popen_seconds,
+                run_seconds,
                 read_seconds,
             )
             return parse_kalign_a3m(a3m)

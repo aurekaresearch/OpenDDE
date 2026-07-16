@@ -8,12 +8,22 @@ import pickle
 import random
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, Mapping, Optional, Sequence, Tuple, Union, cast
+from typing import (
+    Any,
+    Dict,
+    Final,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+    TypeAlias,
+    Union,
+    cast,
+)
 
 import numpy as np
 import requests
 from numpy.typing import DTypeLike
-from typing_extensions import Final, TypeAlias
 
 from opendde.data.constants import (
     ATOM37_NUM,

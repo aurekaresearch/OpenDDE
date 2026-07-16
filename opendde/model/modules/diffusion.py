@@ -11,6 +11,7 @@ from opendde.distributed.foldcp.config import FoldCPConfig
 from opendde.distributed.foldcp.mesh import FoldCPProcessMesh
 from opendde.distributed.foldcp.launch import (
     foldcp_linear_with_source_launch_shape,
+    foldcp_pair_row_slab_linear_with_source_launch_policy,
 )
 from opendde.distributed.foldcp.pair_sharding import (
     FoldCPPairShardSpec,
@@ -30,6 +31,98 @@ from opendde.model.modules.transformer import (
 )
 from opendde.model.triangular.layers import LayerNorm
 from opendde.model.utils import expand_at_dim, get_checkpoint_fn, permute_final_dims
+
+
+def _foldcp_diffusion_cache_trunk_row_chunk_size(valid_rows: int) -> int:
+    value = os.environ.get("OPENDDE_FOLDCP_DIFFUSION_CACHE_TRUNK_ROW_CHUNK")
+    row_chunk_size = int("128" if value is None else value)
+    if row_chunk_size <= 0:
+        return int(valid_rows)
+    return min(int(valid_rows), row_chunk_size)
+
+
+def _foldcp_diffusion_cache_relp_row_chunk_size(valid_rows: int) -> int:
+    value = os.environ.get("OPENDDE_FOLDCP_DIFFUSION_CACHE_RELP_ROW_CHUNK")
+    row_chunk_size = int("128" if value is None else value)
+    if row_chunk_size <= 0:
+        return int(valid_rows)
+    return min(int(valid_rows), row_chunk_size)
+
+
+def _foldcp_diffusion_cache_relp_slab_max_bytes() -> int:
+    value = os.environ.get("OPENDDE_FOLDCP_DIFFUSION_CACHE_RELP_SLAB_MAX_BYTES")
+    if value is None:
+        return 3 * 1024**3
+    return int(value)
+
+
+def _foldcp_diffusion_cache_relp_slab_fits(
+    *,
+    valid_rows: int,
+    n_token: int,
+    feature_dim: int,
+) -> bool:
+    max_bytes = _foldcp_diffusion_cache_relp_slab_max_bytes()
+    if max_bytes <= 0:
+        return False
+    # Lazy relative-position features are assembled from int64 one-hot blocks.
+    materialize_bytes = int(valid_rows) * int(n_token) * int(feature_dim) * 8
+    return materialize_bytes <= max_bytes
+
+
+def _foldcp_diffusion_cache_pair_z_row_chunk_size(valid_rows: int) -> int:
+    value = os.environ.get("OPENDDE_FOLDCP_DIFFUSION_CACHE_PAIR_Z_ROW_CHUNK")
+    row_chunk_size = int("256" if value is None else value)
+    if row_chunk_size <= 0:
+        return int(valid_rows)
+    return min(int(valid_rows), row_chunk_size)
+
+
+def _foldcp_diffusion_cache_pair_z_projection_max_bytes() -> int:
+    value = os.environ.get("OPENDDE_FOLDCP_DIFFUSION_CACHE_PAIR_Z_PROJECTION_MAX_BYTES")
+    if value is None:
+        return 8 * 1024**3
+    return int(value)
+
+
+def _foldcp_diffusion_cache_pair_z_projection_fits(
+    *,
+    valid_rows: int,
+    n_token: int,
+    feature_dim: int,
+) -> bool:
+    max_bytes = _foldcp_diffusion_cache_pair_z_projection_max_bytes()
+    if max_bytes <= 0:
+        return False
+    layernorm_workspace_bytes = int(valid_rows) * int(n_token) * int(feature_dim) * 4 * 3
+    return layernorm_workspace_bytes <= max_bytes
+
+
+def _foldcp_diffusion_cache_source_grid_launch_max_bytes() -> int:
+    value = os.environ.get("OPENDDE_FOLDCP_DIFFUSION_CACHE_SOURCE_GRID_MAX_BYTES")
+    if value is None:
+        return 24 * 1024**3
+    return int(value)
+
+
+def _foldcp_diffusion_cache_source_grid_launch_fits(
+    *,
+    source_rows: int,
+    in_features: int,
+    element_size: int,
+) -> bool:
+    max_bytes = _foldcp_diffusion_cache_source_grid_launch_max_bytes()
+    if max_bytes <= 0:
+        return False
+    launch_bytes = int(source_rows) * int(in_features) * int(element_size)
+    return launch_bytes <= max_bytes
+
+
+def _foldcp_diffusion_cache_source_grid_max_rows() -> int:
+    value = os.environ.get("OPENDDE_FOLDCP_DIFFUSION_SOURCE_GRID_MAX_ROWS")
+    if value is None:
+        return 2_250_000
+    return int(value)
 
 
 class DiffusionConditioning(nn.Module):
@@ -120,19 +213,32 @@ class DiffusionConditioning(nn.Module):
         if side == 1:
             return z_pair_local[..., :n_token, :].contiguous()
         ring = mesh.ring_comm()
-        row_tiles: list[torch.Tensor | None] = [None for _ in range(side)]
+        local_cols = z_pair_local.shape[-2]
+        out = z_pair_local.new_empty(
+            *z_pair_local.shape[:-2],
+            int(n_token),
+            z_pair_local.shape[-1],
+        )
+
+        def copy_source_tile(tile: torch.Tensor, source_col: int) -> None:
+            target_col_start = int(source_col) * local_cols
+            target_col_end = min(target_col_start + local_cols, int(n_token))
+            if target_col_start >= target_col_end:
+                return
+            source_width = target_col_end - target_col_start
+            out[..., target_col_start:target_col_end, :] = tile[
+                ...,
+                :source_width,
+                :,
+            ]
+
         ready = z_pair_local.contiguous()
-        row_tiles[mesh.coord[1]] = ready
+        copy_source_tile(ready, mesh.coord[1])
         for step in range(1, side):
             ready = ring.comm_row.exchange(ready.contiguous())
             source_col = (mesh.coord[1] + step) % side
-            row_tiles[source_col] = ready
-        if any(item is None for item in row_tiles):
-            raise RuntimeError("failed to collect Fold-CP diffusion row slab.")
-        return torch.cat(
-            [item for item in row_tiles if item is not None],
-            dim=-2,
-        )[..., :n_token, :].contiguous()
+            copy_source_tile(ready, source_col)
+        return out.contiguous()
 
     @staticmethod
     def _linear_pair_row_slab_source_grid_launch(
@@ -160,6 +266,37 @@ class DiffusionConditioning(nn.Module):
         projected = linear(launch).index_select(0, source_index)
         return projected.reshape(*x.shape[:-3], valid_rows, int(original_n), -1)
 
+    @staticmethod
+    def _project_pair_tile_bounded_source_launch(
+        linear: nn.Module,
+        x: torch.Tensor,
+        *,
+        source_rows: int,
+        original_n: int,
+        row_start: int,
+        valid_rows: int,
+        col_start: int = 0,
+        valid_cols: int | None = None,
+    ) -> torch.Tensor:
+        if valid_cols is None:
+            valid_cols = int(original_n)
+        max_source_grid_rows = _foldcp_diffusion_cache_source_grid_max_rows()
+        if max_source_grid_rows < 0 or int(source_rows) <= max_source_grid_rows:
+            return foldcp_pair_row_slab_linear_with_source_launch_policy(
+                linear,
+                x,
+                original_n=original_n,
+                row_start=row_start,
+                col_start=col_start,
+                valid_rows=valid_rows,
+                valid_cols=valid_cols,
+            )
+        return foldcp_linear_with_source_launch_shape(
+            linear,
+            x,
+            source_rows=source_rows,
+        )
+
     def _project_z_trunk_source_launch(
         self,
         z_trunk: torch.Tensor,
@@ -168,8 +305,21 @@ class DiffusionConditioning(nn.Module):
         original_n: int,
         row_start: int,
         valid_rows: int,
+        col_start: int = 0,
+        valid_cols: int | None = None,
     ) -> torch.Tensor:
         z_norm = self.layernorm_z_trunk(z_trunk)
+        if z_norm.ndim == 3:
+            return self._project_pair_tile_bounded_source_launch(
+                self.linear_no_bias_z_trunk,
+                z_norm,
+                source_rows=source_rows,
+                original_n=original_n,
+                row_start=row_start,
+                valid_rows=valid_rows,
+                col_start=col_start,
+                valid_cols=valid_cols,
+            )
         if original_n <= 2048 and valid_rows > 0:
             return self._linear_pair_row_slab_source_grid_launch(
                 self.linear_no_bias_z_trunk,
@@ -178,11 +328,72 @@ class DiffusionConditioning(nn.Module):
                 row_start=row_start,
                 valid_rows=valid_rows,
             )
-        return foldcp_linear_with_source_launch_shape(
+        return foldcp_pair_row_slab_linear_with_source_launch_policy(
             self.linear_no_bias_z_trunk,
             z_norm,
-            source_rows=source_rows,
+            original_n=original_n,
+            row_start=row_start,
+            valid_rows=valid_rows,
+            valid_cols=original_n,
         )
+
+    def _project_z_trunk_row_slab_from_local_chunks(
+        self,
+        z_trunk_local: torch.Tensor,
+        mesh: FoldCPProcessMesh,
+        *,
+        n_token: int,
+        row_start: int,
+        valid_rows: int,
+    ) -> torch.Tensor:
+        out = z_trunk_local.new_empty(
+            *z_trunk_local.shape[:-3],
+            int(valid_rows),
+            int(n_token),
+            self.c_z_pair_diffusion,
+        )
+        if valid_rows <= 0:
+            return out.contiguous()
+
+        row_chunk_size = _foldcp_diffusion_cache_trunk_row_chunk_size(valid_rows)
+        for chunk_row_start in range(0, valid_rows, row_chunk_size):
+            chunk_row_end = min(chunk_row_start + row_chunk_size, valid_rows)
+            chunk_row_slice = slice(chunk_row_start, chunk_row_end)
+            chunk_valid_rows = chunk_row_end - chunk_row_start
+            chunk_global_row_start = row_start + chunk_row_start
+            z_trunk_row_slab = self._collect_pair_row_slab(
+                z_trunk_local[..., chunk_row_slice, :, :],
+                mesh,
+                n_token,
+            )
+            z_norm = self.layernorm_z_trunk(z_trunk_row_slab)
+            z_norm = z_norm[..., :chunk_valid_rows, : int(n_token), :]
+            if _foldcp_diffusion_cache_source_grid_launch_fits(
+                source_rows=int(n_token) * int(n_token),
+                in_features=z_norm.shape[-1],
+                element_size=z_norm.element_size(),
+            ):
+                projected = self._linear_pair_row_slab_source_grid_launch(
+                    self.linear_no_bias_z_trunk,
+                    z_norm,
+                    original_n=n_token,
+                    row_start=chunk_global_row_start,
+                    valid_rows=chunk_valid_rows,
+                )
+            else:
+                projected = foldcp_linear_with_source_launch_shape(
+                    self.linear_no_bias_z_trunk,
+                    z_norm,
+                    source_rows=int(n_token) * int(n_token),
+                )
+            out[..., chunk_row_slice, :, :] = projected[
+                ...,
+                :chunk_valid_rows,
+                : int(n_token),
+                :,
+            ]
+            del z_trunk_row_slab, z_norm, projected
+        return out.contiguous()
 
     def _project_pair_z_source_launch(
         self,
@@ -192,8 +403,21 @@ class DiffusionConditioning(nn.Module):
         original_n: int,
         row_start: int,
         valid_rows: int,
+        col_start: int = 0,
+        valid_cols: int | None = None,
     ) -> torch.Tensor:
         pair_z = self.layernorm_z(pair_z)
+        if pair_z.ndim == 3:
+            return self._project_pair_tile_bounded_source_launch(
+                self.linear_no_bias_z,
+                pair_z,
+                source_rows=source_rows,
+                original_n=original_n,
+                row_start=row_start,
+                valid_rows=valid_rows,
+                col_start=col_start,
+                valid_cols=valid_cols,
+            )
         if original_n <= 2048 and valid_rows > 0:
             return self._linear_pair_row_slab_source_grid_launch(
                 self.linear_no_bias_z,
@@ -202,10 +426,111 @@ class DiffusionConditioning(nn.Module):
                 row_start=row_start,
                 valid_rows=valid_rows,
             )
-        return foldcp_linear_with_source_launch_shape(
+        return foldcp_pair_row_slab_linear_with_source_launch_policy(
             self.linear_no_bias_z,
             pair_z,
+            original_n=original_n,
+            row_start=row_start,
+            valid_rows=valid_rows,
+            valid_cols=original_n,
+        )
+
+    def _project_pair_z_row_slab_chunks(
+        self,
+        z_pair_trunk: torch.Tensor,
+        relp_pair_slab: torch.Tensor,
+        *,
+        source_rows: int,
+        original_n: int,
+        row_start: int,
+        valid_rows: int,
+    ) -> torch.Tensor:
+        out = z_pair_trunk.new_empty(
+            *z_pair_trunk.shape[:-1],
+            self.c_z_pair_diffusion,
+        )
+        if valid_rows <= 0:
+            return out.contiguous()
+
+        row_chunk_size = _foldcp_diffusion_cache_pair_z_row_chunk_size(valid_rows)
+        for chunk_row_start in range(0, valid_rows, row_chunk_size):
+            chunk_row_end = min(chunk_row_start + row_chunk_size, valid_rows)
+            chunk_row_slice = slice(chunk_row_start, chunk_row_end)
+            chunk_valid_rows = chunk_row_end - chunk_row_start
+            chunk_global_row_start = row_start + chunk_row_start
+            pair_z_chunk = torch.cat(
+                tensors=[
+                    z_pair_trunk[..., chunk_row_slice, :, :],
+                    relp_pair_slab[..., chunk_row_slice, :, :],
+                ],
+                dim=-1,
+            )
+            pair_z_norm = self.layernorm_z(pair_z_chunk)
+            pair_z_norm = pair_z_norm[..., :chunk_valid_rows, : int(original_n), :]
+            if _foldcp_diffusion_cache_source_grid_launch_fits(
+                source_rows=source_rows,
+                in_features=pair_z_norm.shape[-1],
+                element_size=pair_z_norm.element_size(),
+            ):
+                projected = self._linear_pair_row_slab_source_grid_launch(
+                    self.linear_no_bias_z,
+                    pair_z_norm,
+                    original_n=original_n,
+                    row_start=chunk_global_row_start,
+                    valid_rows=chunk_valid_rows,
+                )
+            else:
+                projected = foldcp_linear_with_source_launch_shape(
+                    self.linear_no_bias_z,
+                    pair_z_norm,
+                    source_rows=source_rows,
+                )
+            out[..., chunk_row_slice, :, :] = projected[
+                ...,
+                :chunk_valid_rows,
+                : int(original_n),
+                :,
+            ]
+            del pair_z_chunk, pair_z_norm, projected
+        return out.contiguous()
+
+    def _project_pair_z_from_component_row_slab(
+        self,
+        z_pair_trunk: torch.Tensor,
+        relp_pair_slab: torch.Tensor,
+        *,
+        source_rows: int,
+        original_n: int,
+        row_start: int,
+        valid_rows: int,
+    ) -> torch.Tensor:
+        pair_z_feature_dim = z_pair_trunk.shape[-1] + relp_pair_slab.shape[-1]
+        if _foldcp_diffusion_cache_pair_z_projection_fits(
+            valid_rows=valid_rows,
+            n_token=original_n,
+            feature_dim=pair_z_feature_dim,
+        ):
+            pair_z_row_slab = torch.cat(
+                tensors=[
+                    z_pair_trunk,
+                    relp_pair_slab,
+                ],
+                dim=-1,
+            )
+            return self._project_pair_z_source_launch(
+                pair_z_row_slab,
+                source_rows=source_rows,
+                original_n=original_n,
+                row_start=row_start,
+                valid_rows=valid_rows,
+            )
+        return self._project_pair_z_row_slab_chunks(
+            z_pair_trunk,
+            relp_pair_slab,
             source_rows=source_rows,
+            original_n=original_n,
+            row_start=row_start,
+            valid_rows=valid_rows,
         )
 
     @staticmethod
@@ -241,6 +566,111 @@ class DiffusionConditioning(nn.Module):
             ].to(device=reference.device, dtype=reference.dtype)
         local[..., :valid_rows, :, :] = relp_valid
         return local.contiguous()
+
+    def _project_relp_row_slab_source_launch(
+        self,
+        relp_row_slab: torch.Tensor,
+        *,
+        original_n: int,
+        row_start: int,
+        valid_rows: int,
+    ) -> torch.Tensor:
+        relp_row_slab = relp_row_slab[..., :valid_rows, : int(original_n), :]
+        if valid_rows <= 0:
+            return self.relpe.linear_no_bias(relp_row_slab)
+        if _foldcp_diffusion_cache_source_grid_launch_fits(
+            source_rows=int(original_n) * int(original_n),
+            in_features=relp_row_slab.shape[-1],
+            element_size=relp_row_slab.element_size(),
+        ):
+            return self._linear_pair_row_slab_source_grid_launch(
+                self.relpe.linear_no_bias,
+                relp_row_slab,
+                original_n=original_n,
+                row_start=row_start,
+                valid_rows=valid_rows,
+            )
+        return foldcp_linear_with_source_launch_shape(
+            self.relpe.linear_no_bias,
+            relp_row_slab,
+            source_rows=int(original_n) * int(original_n),
+        )
+
+    def _relpe_row_slab_from_spec_chunks(
+        self,
+        relp_feature: Union[torch.Tensor, LazyRelativePositionEncodingFeatures],
+        spec: FoldCPPairShardSpec,
+        reference: torch.Tensor,
+        *,
+        n_token: int,
+        valid_rows: int,
+    ) -> torch.Tensor:
+        row_start, row_end = spec.row_range
+        out = reference.new_empty(
+            *reference.shape[:-1],
+            self.c_z_pair_diffusion,
+        )
+        if valid_rows <= 0:
+            return out.contiguous()
+        row_chunk_size = _foldcp_diffusion_cache_relp_row_chunk_size(valid_rows)
+        for chunk_row_start in range(0, valid_rows, row_chunk_size):
+            chunk_row_end = min(chunk_row_start + row_chunk_size, valid_rows)
+            chunk_row_slice = slice(chunk_row_start, chunk_row_end)
+            chunk_global_row_start = row_start + chunk_row_start
+            chunk_global_row_end = min(row_start + chunk_row_end, row_end)
+            chunk_valid_rows = chunk_row_end - chunk_row_start
+            chunk_spec = FoldCPPairShardSpec(
+                original_shape=spec.original_shape,
+                padded_shape=spec.padded_shape,
+                pair_dims=spec.pair_dims,
+                row_range=(chunk_global_row_start, chunk_global_row_end),
+                col_range=spec.col_range,
+                mesh_shape=spec.mesh_shape,
+                mesh_coord=spec.mesh_coord,
+            )
+            relp_chunk = self._row_slab_relp_from_spec(
+                relp_feature=relp_feature,
+                spec=chunk_spec,
+                reference=reference[..., chunk_row_slice, :, :],
+                feature_dim=self.relpe.linear_no_bias.in_features,
+                n_token=n_token,
+            )
+            relp_projected = self._project_relp_row_slab_source_launch(
+                relp_chunk,
+                original_n=n_token,
+                row_start=chunk_global_row_start,
+                valid_rows=chunk_valid_rows,
+            )
+            out[..., chunk_row_slice, :, :] = relp_projected[
+                ...,
+                :chunk_valid_rows,
+                : int(n_token),
+                :,
+            ]
+            del relp_chunk, relp_projected
+        return out.contiguous()
+
+    def _project_relp_tile_source_launch(
+        self,
+        relp_tile: torch.Tensor,
+        *,
+        source_rows: int,
+        original_n: int,
+        row_start: int,
+        valid_rows: int,
+        col_start: int,
+        valid_cols: int,
+    ) -> torch.Tensor:
+        return self._project_pair_tile_bounded_source_launch(
+            self.relpe.linear_no_bias,
+            relp_tile,
+            source_rows=source_rows,
+            original_n=original_n,
+            row_start=row_start,
+            valid_rows=valid_rows,
+            col_start=col_start,
+            valid_cols=valid_cols,
+        )
 
     @staticmethod
     def _apply_transition_source_flat_chunks(
@@ -308,6 +738,92 @@ class DiffusionConditioning(nn.Module):
             pair_z_row_slab.shape[-1],
         )
         return pair_z_row_slab.contiguous()
+
+    @staticmethod
+    def _apply_transition_source_tile_chunks(
+        tile: torch.Tensor,
+        transition: Transition,
+        *,
+        row_start: int,
+        col_start: int,
+        valid_rows: int,
+        valid_cols: int,
+        original_n: int,
+        flat_chunk_size: int = 262144,
+    ) -> None:
+        if valid_rows <= 0 or valid_cols <= 0:
+            return
+        tile_cols = tile.shape[-2]
+        flat = tile.reshape(-1, tile.shape[-1])
+        source_rows = int(original_n) * int(original_n)
+        valid_row_end = int(row_start) + int(valid_rows)
+        col_offsets = torch.arange(int(valid_cols), device=tile.device)
+        local_col_offsets = torch.arange(int(valid_cols), device=tile.device)
+        for chunk_start in range(0, source_rows, flat_chunk_size):
+            chunk_end = min(chunk_start + flat_chunk_size, source_rows)
+            global_row_start = max(int(row_start), chunk_start // int(original_n))
+            global_row_end = min(
+                valid_row_end,
+                ((chunk_end - 1) // int(original_n)) + 1,
+            )
+            if global_row_start >= global_row_end:
+                continue
+            global_rows = torch.arange(
+                global_row_start,
+                global_row_end,
+                device=tile.device,
+            )
+            source_index = (
+                global_rows[:, None] * int(original_n)
+                + int(col_start)
+                + col_offsets[None, :]
+            )
+            mask = (source_index >= chunk_start) & (source_index < chunk_end)
+            if not bool(mask.any()):
+                continue
+            source_offsets = (source_index[mask] - chunk_start).to(torch.long)
+            local_rows = global_rows - int(row_start)
+            tile_index = (
+                local_rows[:, None] * int(tile_cols) + local_col_offsets[None, :]
+            )[mask].to(torch.long)
+            launch = flat.new_zeros(chunk_end - chunk_start, flat.shape[-1])
+            launch.index_copy_(0, source_offsets, flat.index_select(0, tile_index))
+            update = transition(launch).index_select(0, source_offsets)
+            flat.index_copy_(0, tile_index, flat.index_select(0, tile_index) + update)
+            del launch, update, source_offsets, tile_index
+
+    def _apply_pair_z_transitions_foldcp_tile(
+        self,
+        pair_z_local: torch.Tensor,
+        z_spec: FoldCPPairShardSpec,
+    ) -> torch.Tensor:
+        n_token = z_spec.original_shape[z_spec.pair_dims[0]]
+        row_start, row_end = z_spec.row_range
+        col_start, col_end = z_spec.col_range
+        valid_rows = max(0, min(row_end, n_token) - row_start)
+        valid_cols = max(0, min(col_end, n_token) - col_start)
+        if valid_rows == 0 or valid_cols == 0:
+            return pair_z_local.contiguous()
+        pair_z_local = pair_z_local.contiguous()
+        self._apply_transition_source_tile_chunks(
+            pair_z_local,
+            self.transition_z1,
+            row_start=row_start,
+            col_start=col_start,
+            valid_rows=valid_rows,
+            valid_cols=valid_cols,
+            original_n=n_token,
+        )
+        self._apply_transition_source_tile_chunks(
+            pair_z_local,
+            self.transition_z2,
+            row_start=row_start,
+            col_start=col_start,
+            valid_rows=valid_rows,
+            valid_cols=valid_cols,
+            original_n=n_token,
+        )
+        return pair_z_local.contiguous()
 
     def prepare_cache(
         self,
@@ -415,53 +931,89 @@ class DiffusionConditioning(nn.Module):
         if valid_rows == 0 or valid_cols == 0:
             return pair_z_local.contiguous(), pair_spec
 
+        del mesh
         source_rows = n_token * n_token
-        z_trunk_row_slab = self._collect_pair_row_slab(
-            z_trunk_local,
-            mesh,
-            n_token,
-        )
-        z_pair_trunk = z_trunk_row_slab
-        if self.compress_pair_z:
-            z_pair_trunk = self._project_z_trunk_source_launch(
-                z_trunk_row_slab,
+        row_chunk_size = _foldcp_diffusion_cache_trunk_row_chunk_size(valid_rows)
+        for local_row_start in range(0, valid_rows, row_chunk_size):
+            local_row_end = min(local_row_start + row_chunk_size, valid_rows)
+            chunk_rows = local_row_end - local_row_start
+            global_row_start = row_start + local_row_start
+            z_trunk_chunk = z_trunk_local[
+                ...,
+                local_row_start:local_row_end,
+                :,
+                :,
+            ]
+            z_pair_trunk = z_trunk_chunk
+            if self.compress_pair_z:
+                z_pair_trunk = self._project_z_trunk_source_launch(
+                    z_trunk_chunk,
+                    source_rows=source_rows,
+                    original_n=n_token,
+                    row_start=global_row_start,
+                    valid_rows=chunk_rows,
+                    col_start=col_start,
+                    valid_cols=valid_cols,
+                )
+            relp_local = self._local_relp_chunk_from_spec(
+                relp_feature=relp_feature,
+                spec=z_spec,
+                reference=z_pair_trunk,
+                feature_dim=self.relpe.linear_no_bias.in_features,
+                local_row_start=local_row_start,
+                local_row_end=local_row_end,
+            )
+            relp_tile = self._project_relp_tile_source_launch(
+                relp_local,
                 source_rows=source_rows,
                 original_n=n_token,
-                row_start=row_start,
-                valid_rows=valid_rows,
+                row_start=global_row_start,
+                valid_rows=chunk_rows,
+                col_start=col_start,
+                valid_cols=valid_cols,
             )
-        relp_row_slab = self._row_slab_relp_from_spec(
-            relp_feature=relp_feature,
-            spec=z_spec,
-            reference=z_pair_trunk,
-            feature_dim=self.relpe.linear_no_bias.in_features,
-            n_token=n_token,
-        )
-        pair_z_row_slab = torch.cat(
-            tensors=[
-                z_pair_trunk,
-                self.relpe(relp_row_slab),
-            ],
-            dim=-1,
-        )
-        pair_z_row_slab = self._project_pair_z_source_launch(
-            pair_z_row_slab,
-            source_rows=source_rows,
-            original_n=n_token,
-            row_start=row_start,
-            valid_rows=valid_rows,
-        )
-        del z_trunk_row_slab, z_pair_trunk, relp_row_slab
-        pair_z_row_slab = self._apply_pair_z_transitions_foldcp_row_slab(
-            pair_z_row_slab,
-            z_spec,
-        )
-        pair_z_local[..., :valid_rows, :valid_cols, :] = pair_z_row_slab[
-            ...,
-            :valid_rows,
-            col_start : col_start + valid_cols,
-            :,
-        ]
+            pair_z_tile = torch.cat(
+                tensors=[
+                    z_pair_trunk,
+                    relp_tile,
+                ],
+                dim=-1,
+            )
+            pair_z_tile = self._project_pair_z_source_launch(
+                pair_z_tile,
+                source_rows=source_rows,
+                original_n=n_token,
+                row_start=global_row_start,
+                valid_rows=chunk_rows,
+                col_start=col_start,
+                valid_cols=valid_cols,
+            )
+            del z_pair_trunk, relp_local, relp_tile
+            chunk_spec = FoldCPPairShardSpec(
+                original_shape=pair_spec.original_shape,
+                padded_shape=pair_spec.padded_shape,
+                pair_dims=pair_spec.pair_dims,
+                row_range=(global_row_start, global_row_start + chunk_rows),
+                col_range=pair_spec.col_range,
+                mesh_shape=pair_spec.mesh_shape,
+                mesh_coord=pair_spec.mesh_coord,
+            )
+            pair_z_tile = self._apply_pair_z_transitions_foldcp_tile(
+                pair_z_tile,
+                chunk_spec,
+            )
+            pair_z_local[
+                ...,
+                local_row_start:local_row_end,
+                :valid_cols,
+                :,
+            ] = pair_z_tile[
+                ...,
+                :chunk_rows,
+                :valid_cols,
+                :,
+            ]
+            del pair_z_tile, z_trunk_chunk
         return pair_z_local.contiguous(), pair_spec
 
     def _apply_pair_z_transitions(

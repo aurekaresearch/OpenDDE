@@ -61,7 +61,8 @@ class LMDBDict:
                 import lmdb
             except ImportError as e:
                 raise ImportError(
-                    "LMDB is required to use LMDBDict. Please install it via: pip install lmdb"
+                    "LMDB is required to use LMDBDict. Install it with: "
+                    "python -m pip install lmdb or uv pip install lmdb"
                 ) from e
 
             env = lmdb.open(

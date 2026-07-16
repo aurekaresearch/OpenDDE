@@ -1,10 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Aureka AI Research
-import difflib
 import json
 import logging
 import os
-import subprocess
 import tempfile
 import time
 import uuid
@@ -16,20 +14,22 @@ import tqdm
 from Bio import SeqIO
 from rdkit import Chem
 
-from opendde.config.inference import (
-    build_inference_config,
-    update_gpu_compatible_configs,
-)
+from opendde.config.inference import build_inference_config
 from opendde.config.model_registry import DEFAULT_MODEL_NAME, model_configs
+from opendde.config.schema import (
+    INFERENCE_DEVICE_CHOICES,
+    INFERENCE_DTYPE_CHOICES,
+    InferenceDevice,
+    InferenceDtype,
+)
 from opendde.data.inference.json_maker import cif_to_input_json
 from opendde.data.inference.json_parser import lig_file_to_atom_info
+from opendde.data.tools import kalign
 from opendde.data.utils import pdb_to_cif
-from opendde.distributed.foldcp.config import FoldCPConfig, apply_foldcp_config
-from opendde.utils.download import download_inference_cache
-from opendde.utils.environment import format_doctor_report
+from opendde.distributed.foldcp.config import FoldCPConfig
 from opendde.utils.logger import get_logger
 from opendde.utils.logging_config import init_logging
-from opendde.version import __version__
+from runner.cli import CONTEXT_SETTINGS, opendde_cli
 from runner.inference import (
     InferenceRunner,
     infer_predict,
@@ -265,7 +265,7 @@ def get_default_runner(
     n_cycle: int = 10,
     n_step: int = 200,
     n_sample: int = 5,
-    dtype: Literal["bf16", "fp32"] = "fp32",
+    dtype: InferenceDtype = "fp32",
     model_name: str = DEFAULT_MODEL_NAME,
     load_checkpoint_path: str = "",
     use_msa: bool = True,
@@ -285,6 +285,8 @@ def get_default_runner(
     foldcp_size_cp: int = 1,
     foldcp_devices: str = "",
     foldcp_metrics_jsonl: str = "",
+    *,
+    device: InferenceDevice = "auto",
 ) -> InferenceRunner:
     """
     Get a default InferenceRunner with the specified configurations.
@@ -296,6 +298,7 @@ def get_default_runner(
         n_step (int): Number of diffusion steps.
         n_sample (int): Number of samples.
         dtype (str): Inference data type. Defaults to 'fp32'.
+        device (str): Device selection: auto, cpu, or cuda.
         model_name (str): Name of the model checkpoint.
         load_checkpoint_path (str): Explicit checkpoint path. If unset, uses the released checkpoint filename for model_name.
         use_msa (bool): Whether to use MSA.
@@ -344,6 +347,7 @@ def get_default_runner(
     configs.sample_diffusion.N_sample = n_sample
     configs.sample_diffusion.N_step = n_step
     configs.dtype = dtype
+    configs.device = device
     configs.use_msa = use_msa
     configs.triangle_multiplicative = trimul_kernel
     configs.triangle_attention = triatt_kernel
@@ -355,44 +359,14 @@ def get_default_runner(
     configs.use_rna_msa = use_rna_msa
     configs.need_atom_confidence = need_atom_confidence
     configs.sample_diffusion.guidance["enable"] = use_tfg_guidance
-    configs = apply_foldcp_config(configs, foldcp_config)
 
-    if kalign_binary_path is not None:
-        # The path provided by the user is expected to exist by default
-        configs.data.template.kalign_binary_path = kalign_binary_path
-        assert os.path.exists(kalign_binary_path), (
-            f"kalign_binary_path {kalign_binary_path} does not exist"
+    if kalign_binary_path is not None or use_template:
+        configs.data.template.kalign_binary_path = kalign.resolve_kalign_binary(
+            kalign_binary_path
         )
-    else:
-        # If no path is provided and templates are used, try to find kalign in the system PATH
-        if use_template:
-            found_path = None
-            try:
-                result = subprocess.run(
-                    ["which", "kalign"], capture_output=True, text=True
-                )
-                if result.returncode == 0 and result.stdout.strip():
-                    kalign_in_path = result.stdout.strip()
-                    if os.path.exists(kalign_in_path) and os.access(
-                        kalign_in_path, os.X_OK
-                    ):
-                        found_path = kalign_in_path
-            except (subprocess.CalledProcessError, FileNotFoundError):
-                pass
 
-            if found_path is not None:
-                configs.data.template.kalign_binary_path = found_path
-            else:
-                raise RuntimeError(
-                    "Kalign binary not found in system PATH. "
-                    "To install kalign, you can use one of the following methods:\n"
-                    "1. Using conda: conda install -c bioconda kalign\n"
-                    "2. Using apt (Ubuntu/Debian): apt-get install kalign\n"
-                    "3. Download from: https://github.com/TimoLassmann/kalign\n"
-                    "After installation, make sure the binary is accessible in PATH or provide kalign_binary_path."
-                )
-
-    configs = update_gpu_compatible_configs(configs)
+    runner = InferenceRunner(configs, foldcp_config=foldcp_config)
+    configs = runner.configs
     logger.info(
         f"Inference by OpenDDE: model_name: {model_name}, dtype: {configs.dtype}"
     )
@@ -413,8 +387,7 @@ def get_default_runner(
         foldcp_config.cp_mesh_shape,
         foldcp_config.metrics_jsonl or "<disabled>",
     )
-    download_inference_cache(configs)
-    return InferenceRunner(configs)
+    return runner
 
 
 def inference_jsons(
@@ -425,7 +398,7 @@ def inference_jsons(
     n_cycle: int = 10,
     n_step: int = 200,
     n_sample: int = 5,
-    dtype: Literal["bf16", "fp32"] = "fp32",
+    dtype: InferenceDtype = "fp32",
     model_name: str = DEFAULT_MODEL_NAME,
     load_checkpoint_path: str = "",
     trimul_kernel: str = "auto",
@@ -455,6 +428,8 @@ def inference_jsons(
     foldcp_size_cp: int = 1,
     foldcp_devices: str = "",
     foldcp_metrics_jsonl: str = "",
+    *,
+    device: InferenceDevice = "auto",
 ) -> None:
     """
     Run inference on a single JSON file or a directory of JSON files.
@@ -468,6 +443,7 @@ def inference_jsons(
         n_step (int): Number of diffusion steps.
         n_sample (int): Number of samples.
         dtype (str): Data type.
+        device (str): Device selection: auto, cpu, or cuda.
         model_name (str): Model name.
         load_checkpoint_path (str): Explicit checkpoint path.
         trimul_kernel (str): Kernel for triangle multiplicative.
@@ -521,6 +497,7 @@ def inference_jsons(
         n_step=n_step,
         n_sample=n_sample,
         dtype=dtype,
+        device=device,
         model_name=model_name,
         load_checkpoint_path=load_checkpoint_path,
         use_msa=use_msa,
@@ -540,74 +517,36 @@ def inference_jsons(
         foldcp_size_cp=foldcp_size_cp,
         foldcp_devices=foldcp_devices,
         foldcp_metrics_jsonl=foldcp_metrics_jsonl,
-
     )
-    configs = runner.configs
-    for _, infer_json in enumerate(tqdm.tqdm(infer_jsons)):
-        try:
-            configs["input_json_path"] = preprocess_input(
-                infer_json,
-                out_dir=out_dir,
-                use_msa=use_msa,
-                use_template=use_template,
-                use_rna_msa=use_rna_msa,
-                msa_server_mode=msa_server_mode,
-                hmmsearch_binary_path=hmmsearch_binary_path,
-                hmmbuild_binary_path=hmmbuild_binary_path,
-                seqres_database_path=seqres_database_path,
-                nhmmer_binary_path=nhmmer_binary_path,
-                hmmalign_binary_path=hmmalign_binary_path,
-                hmmbuild_rna_binary_path=hmmbuild_rna_binary_path,
-                ntrna_database_path=ntrna_database_path,
-                rfam_database_path=rfam_database_path,
-                rna_central_database_path=rna_central_database_path,
-                nhmmer_n_cpu=nhmmer_n_cpu,
-            )
-            infer_predict(runner, configs)
-        except Exception as exc:
-            infer_errors[infer_json] = str(exc)
-    if len(infer_errors) > 0:
-        logger.warning(f"Run inference failed: {infer_errors}")
-
-
-CONTEXT_SETTINGS = dict(help_option_names=["-h", "--help"], show_default=True)
-
-
-class SuggestGroup(click.Group):
-    """A Click group that suggests similar commands on error."""
-
-    def resolve_command(self, ctx, args):
-        """Try to resolve the command, and suggest matches if it fails."""
-        try:
-            return super().resolve_command(ctx, args)
-        except click.UsageError as e:
-            if len(args) > 0:
-                cmd_name = args[0]
-                all_commands = self.list_commands(ctx)
-                matches = difflib.get_close_matches(cmd_name, all_commands)
-                if matches:
-                    e.message += (
-                        f"\n\nDid you mean one of these?\n    {', '.join(matches)}"
-                    )
-            raise e
-
-
-@click.group(name="opendde", cls=SuggestGroup, context_settings=CONTEXT_SETTINGS)
-@click.version_option(version=__version__)
-def opendde_cli() -> None:
-    """
-    OpenDDE: an AlphaFold 3-style structure prediction toolkit.
-
-    This CLI provides tools for structure prediction, data conversion,
-    and MSA/template searching.
-    """
-    pass
-
-
-@click.command(context_settings=CONTEXT_SETTINGS)
-def doctor() -> None:
-    """Print environment diagnostics and install recommendations."""
-    click.echo(format_doctor_report())
+    try:
+        configs = runner.configs
+        for _, infer_json in enumerate(tqdm.tqdm(infer_jsons)):
+            try:
+                configs["input_json_path"] = preprocess_input(
+                    infer_json,
+                    out_dir=out_dir,
+                    use_msa=use_msa,
+                    use_template=use_template,
+                    use_rna_msa=use_rna_msa,
+                    msa_server_mode=msa_server_mode,
+                    hmmsearch_binary_path=hmmsearch_binary_path,
+                    hmmbuild_binary_path=hmmbuild_binary_path,
+                    seqres_database_path=seqres_database_path,
+                    nhmmer_binary_path=nhmmer_binary_path,
+                    hmmalign_binary_path=hmmalign_binary_path,
+                    hmmbuild_rna_binary_path=hmmbuild_rna_binary_path,
+                    ntrna_database_path=ntrna_database_path,
+                    rfam_database_path=rfam_database_path,
+                    rna_central_database_path=rna_central_database_path,
+                    nhmmer_n_cpu=nhmmer_n_cpu,
+                )
+                infer_predict(runner, configs)
+            except Exception as exc:
+                infer_errors[infer_json] = str(exc)
+        if len(infer_errors) > 0:
+            logger.warning(f"Run inference failed: {infer_errors}")
+    finally:
+        runner.close()
 
 
 @click.command(context_settings=CONTEXT_SETTINGS)
@@ -629,9 +568,16 @@ def doctor() -> None:
 @click.option(
     "-d",
     "--dtype",
-    type=str,
+    type=click.Choice(INFERENCE_DTYPE_CHOICES, case_sensitive=False),
     default="fp32",
     help="Inference dtype. Defaults to fp32; pass bf16 to opt in.",
+)
+@click.option(
+    "--device",
+    type=click.Choice(INFERENCE_DEVICE_CHOICES, case_sensitive=False),
+    default="auto",
+    show_default=True,
+    help="Inference device. Auto uses CUDA when available, otherwise CPU.",
 )
 @click.option(
     "-n",
@@ -828,7 +774,8 @@ def predict(
     cycle: int,
     step: int,
     sample: int,
-    dtype: Literal["bf16", "fp32"],
+    dtype: InferenceDtype,
+    device: InferenceDevice,
     model_name: str,
     load_checkpoint_path: str,
     use_msa: bool,
@@ -873,6 +820,7 @@ def predict(
         step (int): Number of diffusion steps.
         sample (int): Number of samples.
         dtype (str): Data type.
+        device (str): Device selection: auto, cpu, or cuda.
         model_name (str): Model name.
         load_checkpoint_path (str): Explicit checkpoint path.
         use_msa (bool): Use MSA.
@@ -973,6 +921,7 @@ def predict(
         n_step=step,
         n_sample=sample,
         dtype=dtype,
+        device=device,
         model_name=model_name,
         load_checkpoint_path=load_checkpoint_path,
         trimul_kernel=trimul_kernel,
@@ -1404,12 +1353,8 @@ def inputprep(
     )
 
 
-opendde_cli.add_command(predict, name="pred")
-opendde_cli.add_command(doctor, name="doctor")
-opendde_cli.add_command(tojson, name="json")
-opendde_cli.add_command(msa, name="msa")
-opendde_cli.add_command(msatemplate, name="mt")
-opendde_cli.add_command(inputprep, name="prep")
-
 if __name__ == "__main__":
+    from runner.cli import register_runtime_commands
+
+    register_runtime_commands(globals())
     opendde_cli()

@@ -189,6 +189,17 @@ def foldcp_pair_tile_linear_with_source_chunk_launch(
 
 
 _PAIR_ROW_SLAB_SOURCE_GRID_MIN_LOCAL_ROWS = 1_048_576
+_PAIR_ROW_SLAB_SOURCE_GRID_BOUNDARY_MIN_ROWS = 1_048_576
+_PAIR_ROW_SLAB_SOURCE_GRID_BOUNDARY_MAX_ROWS = 1_054_729
+
+
+def _pair_row_slab_source_grid_boundary(source_rows: int) -> bool:
+    source_rows = int(source_rows)
+    return (
+        _PAIR_ROW_SLAB_SOURCE_GRID_BOUNDARY_MIN_ROWS
+        <= source_rows
+        <= _PAIR_ROW_SLAB_SOURCE_GRID_BOUNDARY_MAX_ROWS
+    )
 
 
 def foldcp_pair_row_slab_linear_with_source_launch_policy(
@@ -225,8 +236,12 @@ def foldcp_pair_row_slab_linear_with_source_launch_policy(
     else:
         valid_cols = max(0, min(int(valid_cols), tile_cols, original_n))
 
+    source_rows = original_n * original_n
     local_valid_rows = valid_rows * valid_cols
-    if local_valid_rows >= _PAIR_ROW_SLAB_SOURCE_GRID_MIN_LOCAL_ROWS:
+    if (
+        local_valid_rows >= _PAIR_ROW_SLAB_SOURCE_GRID_MIN_LOCAL_ROWS
+        or _pair_row_slab_source_grid_boundary(source_rows)
+    ):
         return foldcp_pair_row_slab_linear_with_source_grid_launch(
             linear,
             x,
@@ -239,7 +254,7 @@ def foldcp_pair_row_slab_linear_with_source_launch_policy(
     return foldcp_linear_with_source_launch_shape(
         linear,
         x,
-        source_rows=original_n * original_n,
+        source_rows=source_rows,
     )
 
 

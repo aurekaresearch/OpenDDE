@@ -118,6 +118,55 @@ def collect_msa_pair_row_slab(
     return row_slab[..., :original_tokens, :].contiguous()
 
 
+
+
+def distributed_msa_pair_weighted_average_with_full_value(
+    pair_logits_local: torch.Tensor,
+    value: torch.Tensor,
+    mesh: FoldCPProcessMesh,
+    original_tokens: int | None = None,
+) -> torch.Tensor:
+    """Distributed MSA weighted average when every rank already owns full value.
+
+    Production MSAStack computes value projections from full MSA on every rank.
+    In deterministic mode, preserve exact serial softmax order by gathering only
+    the much smaller pair-logit source shards, then multiplying by the existing
+    full value tensor. Non-deterministic mode reuses the generic sharded-value
+    reduction core.
+    """
+
+    if value.ndim != 5:
+        raise ValueError("value must be [B, S, N, H, C].")
+    if pair_logits_local.ndim != 4:
+        raise ValueError("pair_logits_local must be [B, I_local, J_local, H].")
+    if pair_logits_local.shape[0] != value.shape[0]:
+        raise ValueError("batch dimensions must match.")
+    if pair_logits_local.shape[3] != value.shape[3]:
+        raise ValueError("head dimensions must match.")
+
+    if torch.are_deterministic_algorithms_enabled():
+        logits_parts = [
+            torch.empty_like(pair_logits_local) for _ in range(mesh.layout.shape[1])
+        ]
+        dist.all_gather(
+            logits_parts,
+            pair_logits_local.contiguous(),
+            group=mesh.group_row,
+        )
+        pair_logits = torch.cat(logits_parts, dim=2)
+        if original_tokens is not None:
+            pair_logits = pair_logits[:, :, :original_tokens, :]
+            value = value[:, :, :original_tokens, :, :]
+        return serial_msa_pair_weighted_average(pair_logits, value).contiguous()
+
+    value_local = shard_msa_value_by_token(value, mesh)
+    return distributed_msa_pair_weighted_average(
+        pair_logits_local,
+        value_local,
+        mesh,
+        original_tokens=original_tokens,
+    )
+
 def distributed_msa_pair_weighted_average(
     pair_logits_local: torch.Tensor,
     value_local: torch.Tensor,
@@ -167,6 +216,14 @@ def distributed_msa_pair_weighted_average(
             pair_logits = pair_logits[:, :, :original_tokens, :]
             value = value[:, :, :original_tokens, :, :]
         return serial_msa_pair_weighted_average(pair_logits, value).contiguous()
+
+    if original_tokens is not None:
+        source_tile = pair_logits_local.shape[2]
+        source_start = mesh.coord[1] * source_tile
+        valid_sources = max(0, min(source_tile, int(original_tokens) - source_start))
+        if valid_sources < source_tile:
+            pair_logits_local = pair_logits_local.clone()
+            pair_logits_local[:, :, valid_sources:, :] = -torch.inf
 
     local_amax = pair_logits_local.amax(dim=2)
     global_amax = local_amax.clone()

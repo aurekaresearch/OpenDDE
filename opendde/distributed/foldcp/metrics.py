@@ -24,19 +24,23 @@ def bytes_to_mib(value: int | float | None) -> Optional[float]:
     return float(value) / _MIB
 
 
-def _cuda_available() -> bool:
+def _cuda_available(device: Optional[torch.device] = None) -> bool:
+    if device is not None and device.type != "cuda":
+        return False
     return torch.cuda.is_available() and torch.cuda.device_count() > 0
 
 
-def _sync_cuda() -> None:
-    if _cuda_available():
-        torch.cuda.synchronize()
+def _sync_device(device: Optional[torch.device] = None) -> None:
+    if _cuda_available(device):
+        torch.cuda.synchronize(device=device)
 
 
-def _cuda_mem_info_mib() -> tuple[Optional[float], Optional[float]]:
-    if not _cuda_available():
+def _cuda_mem_info_mib(
+    device: Optional[torch.device] = None,
+) -> tuple[Optional[float], Optional[float]]:
+    if not _cuda_available(device):
         return None, None
-    free_bytes, total_bytes = torch.cuda.mem_get_info()
+    free_bytes, total_bytes = torch.cuda.mem_get_info(device=device)
     return bytes_to_mib(free_bytes), bytes_to_mib(total_bytes)
 
 
@@ -56,7 +60,11 @@ def infer_n_token(data: Any) -> Optional[int]:
     if "N_token" in data:
         return _scalar_int(data["N_token"])
     input_feature_dict = data.get("input_feature_dict", {})
-    token_index = input_feature_dict.get("token_index") if isinstance(input_feature_dict, dict) else None
+    token_index = (
+        input_feature_dict.get("token_index")
+        if isinstance(input_feature_dict, dict)
+        else None
+    )
     if token_index is not None and hasattr(token_index, "shape"):
         return int(token_index.shape[-1])
     return None
@@ -136,22 +144,27 @@ def measure_foldcp_stage(
     n_token: Optional[int] = None,
     reset_peak: bool = True,
     record_start: bool = False,
+    device: Optional[torch.device] = None,
 ) -> Iterator[None]:
     """Measure wall time and CUDA peak memory for one Fold-CP task stage."""
 
-    if reset_peak and _cuda_available():
-        torch.cuda.reset_peak_memory_stats()
-    _sync_cuda()
+    if reset_peak and _cuda_available(device):
+        torch.cuda.reset_peak_memory_stats(device=device)
+    _sync_device(device)
     rank = recorder.rank
-    device_index = torch.cuda.current_device() if _cuda_available() else None
+    device_index = (
+        device.index if device is not None and device.type == "cuda" else None
+    )
+    if device_index is None and _cuda_available(device):
+        device_index = torch.cuda.current_device()
     if record_start:
-        if _cuda_available():
-            start_peak = bytes_to_mib(torch.cuda.max_memory_allocated())
-            start_allocated = bytes_to_mib(torch.cuda.memory_allocated())
+        if _cuda_available(device):
+            start_peak = bytes_to_mib(torch.cuda.max_memory_allocated(device=device))
+            start_allocated = bytes_to_mib(torch.cuda.memory_allocated(device=device))
         else:
             start_peak = None
             start_allocated = None
-        start_free, start_total = _cuda_mem_info_mib()
+        start_free, start_total = _cuda_mem_info_mib(device)
         recorder.record(
             FoldCPStageMetric(
                 task_id=task_id,
@@ -187,15 +200,15 @@ def measure_foldcp_stage(
         error = str(exc).splitlines()[0]
         raise
     finally:
-        _sync_cuda()
+        _sync_device(device)
         elapsed_ms = (time.perf_counter() - start) * 1000.0
-        if _cuda_available():
-            peak = bytes_to_mib(torch.cuda.max_memory_allocated())
-            allocated_after = bytes_to_mib(torch.cuda.memory_allocated())
+        if _cuda_available(device):
+            peak = bytes_to_mib(torch.cuda.max_memory_allocated(device=device))
+            allocated_after = bytes_to_mib(torch.cuda.memory_allocated(device=device))
         else:
             peak = None
             allocated_after = None
-        cuda_free, cuda_total = _cuda_mem_info_mib()
+        cuda_free, cuda_total = _cuda_mem_info_mib(device)
         recorder.record(
             FoldCPStageMetric(
                 task_id=task_id,

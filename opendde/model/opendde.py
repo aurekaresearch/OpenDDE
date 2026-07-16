@@ -1595,6 +1595,10 @@ class OpenDDE(nn.Module):
                 inplace_safe=inplace_safe,
             )
 
+        del cache
+        if foldcp_mesh is not None and s_inputs.is_cuda:
+            torch.cuda.empty_cache()
+
         step_diffusion = time.time()
         time_tracker.update({"diffusion": step_diffusion - step_trunk})
         # Distogram contact probabilities are the only public output needed here.

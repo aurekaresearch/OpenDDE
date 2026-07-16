@@ -1,0 +1,147 @@
+name: Release version tag
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Validate and build once
+    if: github.repository == 'aurekaresearch/OpenDDE'
+    runs-on: ubuntu-24.04
+    env:
+      LAYERNORM_TYPE: torch
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Require a release commit from main
+        run: |
+          git fetch origin main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+      - name: Configure test data root
+        run: |
+          mkdir -p "${RUNNER_TEMP}/opendde_data"
+          echo "OPENDDE_ROOT_DIR=${RUNNER_TEMP}/opendde_data" >> "${GITHUB_ENV}"
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.3.2
+        with:
+          cache-dependency-glob: pyproject.toml
+      - name: Install CPU runtime and release tools
+        run: |
+          uv venv --python 3.11
+          uv pip install --python .venv/bin/python --torch-backend cpu -e .
+          uv pip install --python .venv/bin/python --group dev --group release
+      - name: Validate tag and release metadata
+        run: .venv/bin/python scripts/check_release.py --tag "$GITHUB_REF_NAME"
+      - name: Test release source
+        run: |
+          .venv/bin/ruff check .
+          .venv/bin/python -m pytest tests -q -m "not network"
+      - name: Build release artifacts
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p release/packages
+          uv build --out-dir release/packages --no-create-gitignore
+          .venv/bin/twine check release/packages/*
+          .venv/bin/python scripts/render_release_notes.py \
+            --version "${version}" \
+            --output release/RELEASE_NOTES.md
+          (cd release/packages && sha256sum *) > release/SHA256SUMS
+      - name: Verify built distributions in clean CPU environments
+        shell: bash
+        run: |
+          shopt -s nullglob
+          wheels=(release/packages/*.whl)
+          sdists=(release/packages/*.tar.gz)
+          if (( ${#wheels[@]} != 1 || ${#sdists[@]} != 1 )); then
+            echo "Expected exactly one wheel and one source archive" >&2
+            exit 1
+          fi
+          sdist_listing="$(tar -tzf "${sdists[0]}")"
+          if ! grep -Eq '^[^/]+/CHANGELOG\.md$' <<<"${sdist_listing}"; then
+            echo "Source archive does not contain CHANGELOG.md" >&2
+            exit 1
+          fi
+          if grep -Eq '^[^/]+/docs/releases(/|$)' <<<"${sdist_listing}"; then
+            echo "Source archive unexpectedly contains long-form release notes" >&2
+            exit 1
+          fi
+          if grep -Eq '^[^/]+/tests(/|$)' <<<"${sdist_listing}"; then
+            echo "Source archive unexpectedly contains the repository test suite" >&2
+            exit 1
+          fi
+
+          expected_version="${GITHUB_REF_NAME#v}"
+          for kind in wheel sdist; do
+            if [[ "${kind}" == "wheel" ]]; then
+              artifact="${wheels[0]}"
+            else
+              artifact="${sdists[0]}"
+            fi
+            env_dir="${RUNNER_TEMP}/opendde-${kind}-venv"
+            uv venv --python 3.11 "${env_dir}"
+            uv pip install --python "${env_dir}/bin/python" \
+              --torch-backend cpu "${artifact}"
+            (
+              cd "${RUNNER_TEMP}"
+              "${env_dir}/bin/python" -I -c \
+                "from importlib.resources import files; import opendde; assert opendde.__version__ == '${expected_version}'; assert files('opendde.config').joinpath('model_manifest.json').is_file()"
+              "${env_dir}/bin/opendde" --version
+              "${env_dir}/bin/opendde" --help >/dev/null
+              "${env_dir}/bin/opendde" doctor >/dev/null
+            )
+          done
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ github.ref_name }}
+          path: release
+          if-no-files-found: error
+          retention-days: 14
+
+  publish-pypi:
+    name: Publish immutable PyPI files
+    needs: build
+    runs-on: ubuntu-24.04
+    environment:
+      name: pypi
+      url: https://pypi.org/p/opendde
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-${{ github.ref_name }}
+          path: release
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: release/packages
+
+  github-release:
+    name: Create GitHub Release from the same build
+    needs: [build, publish-pypi]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-${{ github.ref_name }}
+          path: release
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            release/packages/* \
+            release/SHA256SUMS \
+            --verify-tag \
+            --title "OpenDDE ${GITHUB_REF_NAME#v}" \
+            --notes-file release/RELEASE_NOTES.md

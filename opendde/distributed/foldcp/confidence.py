@@ -16,6 +16,7 @@ from opendde.distributed.foldcp.pair_sharding import (
     gather_pair_tensor_like,
 )
 from opendde.model.utils import one_hot
+from opendde.utils.torch_utils import cdist
 
 
 def _transpose_pair_tile_collective(
@@ -25,24 +26,7 @@ def _transpose_pair_tile_collective(
     """Collect the reciprocal pair tile without materializing every tile at once."""
 
     z_pair_t_send = z_pair_local.transpose(-2, -3).contiguous()
-    transposed_rank = mesh.layout.transpose_rank(mesh.coord)
-    z_pair_t_recv = torch.empty_like(z_pair_t_send)
-    for source_rank in range(mesh.layout.numel):
-        buffer = (
-            z_pair_t_send
-            if mesh.cp_rank == source_rank
-            else torch.empty_like(z_pair_t_send)
-        )
-        dist.broadcast(
-            buffer,
-            src=mesh.cp_global_ranks[source_rank],
-            group=mesh.group_2d,
-        )
-        if source_rank == transposed_rank:
-            z_pair_t_recv.copy_(buffer)
-        if mesh.cp_rank != source_rank:
-            del buffer
-    return z_pair_t_recv.contiguous()
+    return mesh.ring_comm().comm_2d_trans.exchange(z_pair_t_send).contiguous()
 
 
 def _collect_pair_row_slab(
@@ -83,13 +67,11 @@ def _linear_pair_row_slab_with_source_grid_launch(
     flat = x.contiguous().reshape(-1, x.shape[-1])
     source_rows = int(original_n) * int(original_n)
     launch = flat.new_zeros(source_rows, flat.shape[-1])
-    row_offsets = (
-        (torch.arange(valid_rows, device=x.device) + int(row_start))
-        * int(original_n)
+    row_offsets = (torch.arange(valid_rows, device=x.device) + int(row_start)) * int(
+        original_n
     )
     source_index = (
-        row_offsets[:, None]
-        + torch.arange(int(original_n), device=x.device)[None, :]
+        row_offsets[:, None] + torch.arange(int(original_n), device=x.device)[None, :]
     ).reshape(-1)
     launch.index_copy_(0, source_index, flat[: source_index.numel()])
     projected = linear(launch).index_select(0, source_index)
@@ -129,7 +111,9 @@ def add_confidence_distance_embedding_local(
     if row_start >= valid_row_end or col_start >= valid_col_end:
         return z_pair_local
 
-    row_chunk_size = int(os.environ.get("OPENDDE_FOLDCP_CONFIDENCE_DISTANCE_ROW_CHUNK", "0"))
+    row_chunk_size = int(
+        os.environ.get("OPENDDE_FOLDCP_CONFIDENCE_DISTANCE_ROW_CHUNK", "0")
+    )
     if row_chunk_size <= 0:
         row_chunk_size = valid_row_end - row_start
 
@@ -137,22 +121,14 @@ def add_confidence_distance_embedding_local(
     coords = x_pred_rep_coords.to(torch.float32)
     col_coords = coords[col_start:valid_col_end]
     local_col_count = valid_col_end - col_start
-    cdist_compute_mode = (
-        "use_mm_for_euclid_dist"
-        if n_token > 25
-        else "donot_use_mm_for_euclid_dist"
-    )
+
     for global_row_start in range(row_start, valid_row_end, row_chunk_size):
         global_row_end = min(global_row_start + row_chunk_size, valid_row_end)
         local_row_start = global_row_start - row_start
         local_row_end = global_row_end - row_start
         row_coords = coords[global_row_start:global_row_end]
         with torch.amp.autocast("cuda", enabled=False):
-            distance_pred = torch.cdist(
-                row_coords,
-                col_coords,
-                compute_mode=cdist_compute_mode,
-            )
+            distance_pred = cdist(row_coords, col_coords)
         local_target = out[local_row_start:local_row_end, :local_col_count, :]
         onehot_input = one_hot(
             x=distance_pred,
@@ -237,7 +213,9 @@ def _confidence_pair_logits_local_rowslab(
     tile_col = z_pair_local.shape[-2]
     col_start = mesh.coord[1] * tile_col
     col_end = col_start + tile_col
-    logits_local = logits_row_slab[: z_pair_local.shape[-3], col_start:col_end, :].contiguous()
+    logits_local = logits_row_slab[
+        : z_pair_local.shape[-3], col_start:col_end, :
+    ].contiguous()
     del logits_row_slab
     return logits_local
 
@@ -346,6 +324,7 @@ def _stream_pair_logits_to_rank0(
     if full_output is None:
         return None
     return full_output
+
 
 def distributed_confidence_pair_logits(
     *,

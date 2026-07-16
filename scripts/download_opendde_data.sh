@@ -1,12 +1,10 @@
 #!/usr/bin/env bash
 
 set -euo pipefail
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 DEFAULT_DATA_BASE_URL="https://aureka-s3-opendde.s3.us-west-2.amazonaws.com"
-DEFAULT_DEPENDENCY_URL="https://huggingface.co/aurekaresearch/OpenDDE/resolve/main"
-DEFAULT_COMMON_URL="${DEFAULT_DEPENDENCY_URL}/common"
 DEFAULT_SEARCH_DATABASE_URL="https://storage.googleapis.com/alphafold-databases/v3.0"
-DEFAULT_MODEL_NAME="opendde_v1"
-DEFAULT_MODEL_SOURCE_FILE="opendde.pt"
 
 COMMON_FILES=(
     "components.cif"
@@ -24,25 +22,44 @@ SEARCH_DATABASE_FILES=(
 
 OPENDDE_ROOT="${OPENDDE_ROOT_DIR:-}"
 DATA_BASE_URL="${OPENDDE_DATA_BASE_URL:-$DEFAULT_DATA_BASE_URL}"
-DEPENDENCY_URL="${OPENDDE_DEPENDENCY_URL:-$DEFAULT_DEPENDENCY_URL}"
-if [[ -n "${OPENDDE_COMMON_URL:-}" ]]; then
-    COMMON_URL="$OPENDDE_COMMON_URL"
+DEPENDENCY_URL="${OPENDDE_DEPENDENCY_URL:-}"
+COMMON_URL="${OPENDDE_COMMON_URL:-}"
+COMMON_URL_EXPLICIT=0
+if [[ -n "$COMMON_URL" ]]; then
+    COMMON_URL_EXPLICIT=1
 elif [[ -n "${OPENDDE_DEPENDENCY_URL:-}" ]]; then
     COMMON_URL="$OPENDDE_DEPENDENCY_URL"
-else
-    COMMON_URL="$DEFAULT_COMMON_URL"
 fi
 SEARCH_DATABASE_URL="${OPENDDE_SEARCH_DATABASE_URL:-$DEFAULT_SEARCH_DATABASE_URL}"
-MODEL_NAME="${OPENDDE_MODEL_NAME:-$DEFAULT_MODEL_NAME}"
+MODEL_NAME="${OPENDDE_MODEL_NAME:-}"
 MODEL_SOURCE="${OPENDDE_MODEL_SOURCE:-${OPENDDE_MODEL_URL:-}}"
+CHECKPOINT_NAME="${OPENDDE_CHECKPOINT:-}"
+MODEL_MANIFEST_PATH="${OPENDDE_MODEL_MANIFEST:-${REPO_ROOT}/opendde/config/model_manifest.json}"
+MODEL_MANIFEST_TOOL="${REPO_ROOT}/opendde/config/model_manifest.py"
+if [[ -n "${OPENDDE_PYTHON:-}" ]]; then
+    PYTHON_COMMAND="$OPENDDE_PYTHON"
+elif [[ -x "${REPO_ROOT}/.venv/bin/python" ]]; then
+    PYTHON_COMMAND="${REPO_ROOT}/.venv/bin/python"
+else
+    PYTHON_COMMAND="python3"
+fi
 DOWNLOAD_COMMON=1
 DOWNLOAD_SEARCH_DATABASE=1
 DOWNLOAD_MODEL=1
+VERIFY_RELEASED_MODEL=1
 FORCE=0
 
 info() { printf '\033[1;34m[INFO]\033[0m %s\n' "$1"; }
 warn() { printf '\033[1;33m[WARN]\033[0m %s\n' "$1"; }
 err() { printf '\033[1;31m[ERROR]\033[0m %s\n' "$1" >&2; exit 1; }
+
+TEMP_FILES=()
+cleanup_temp_files() {
+    if [[ "${#TEMP_FILES[@]}" -gt 0 ]]; then
+        rm -f -- "${TEMP_FILES[@]}"
+    fi
+}
+trap cleanup_temp_files EXIT
 
 usage() {
     cat <<EOF
@@ -61,19 +78,25 @@ Options:
                              fallback. Defaults to OPENDDE_DATA_BASE_URL or
                              ${DEFAULT_DATA_BASE_URL}.
   --dependency-url URL       Root for model checkpoint files. Defaults to
-                             OPENDDE_DEPENDENCY_URL or ${DEFAULT_DEPENDENCY_URL}.
+                             OPENDDE_DEPENDENCY_URL or the manifest source.
                              Also used for common files unless --common-url is set.
   --common-url URL           Root for common runtime files. Defaults to
                              OPENDDE_COMMON_URL, OPENDDE_DEPENDENCY_URL if set,
-                             otherwise ${DEFAULT_COMMON_URL}.
+                             otherwise <manifest-source>/common.
   --search-database-url URL  Root for hmmsearch/nhmmer search databases.
                              Defaults to OPENDDE_SEARCH_DATABASE_URL or
                              ${DEFAULT_SEARCH_DATABASE_URL}.
-  --model-name NAME          Checkpoint name. Defaults to ${DEFAULT_MODEL_NAME}.
+  --model-name NAME          Model name. Defaults to manifest.default_model; unknown
+                             names retain the legacy <dependency-url>/<name>.pt lookup.
+  --checkpoint FILE          Released checkpoint filename from the manifest.
+                             Overrides the selected model's default checkpoint.
   --model-source PATH_OR_URL Model source file/URL. Defaults to OPENDDE_MODEL_SOURCE,
-                             OPENDDE_MODEL_URL, otherwise <dependency-url>/${DEFAULT_MODEL_SOURCE_FILE}
-                             for ${DEFAULT_MODEL_NAME} or <dependency-url>/<model-name>.pt
-                             for custom model names.
+                             OPENDDE_MODEL_URL, otherwise the manifest checkpoint URL
+                             for a released model or <dependency-url>/<model-name>.pt.
+  --model-manifest PATH      Manifest used to verify released checkpoints. Defaults
+                             to OPENDDE_MODEL_MANIFEST or ${MODEL_MANIFEST_PATH}.
+  --skip-model-verification Allow a custom file named like an official checkpoint
+                             without checking its released size and SHA-256.
   --skip-common              Do not download common runtime files.
   --skip-search-database     Do not download search database files.
   --skip-model               Do not install the model checkpoint.
@@ -101,13 +124,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --dependency-url)
             DEPENDENCY_URL="${2:-}"
-            if [[ -z "${OPENDDE_COMMON_URL:-}" ]]; then
+            if [[ "$COMMON_URL_EXPLICIT" -eq 0 ]]; then
                 COMMON_URL="$DEPENDENCY_URL"
             fi
             shift 2
             ;;
         --common-url)
             COMMON_URL="${2:-}"
+            COMMON_URL_EXPLICIT=1
             shift 2
             ;;
         --search-database-url)
@@ -118,9 +142,21 @@ while [[ $# -gt 0 ]]; do
             MODEL_NAME="${2:-}"
             shift 2
             ;;
+        --checkpoint)
+            CHECKPOINT_NAME="${2:-}"
+            shift 2
+            ;;
         --model-source|--model-url)
             MODEL_SOURCE="${2:-}"
             shift 2
+            ;;
+        --model-manifest)
+            MODEL_MANIFEST_PATH="${2:-}"
+            shift 2
+            ;;
+        --skip-model-verification)
+            VERIFY_RELEASED_MODEL=0
+            shift
             ;;
         --skip-common)
             DOWNLOAD_COMMON=0
@@ -152,11 +188,51 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n "$OPENDDE_ROOT" ]] || err "OPENDDE_ROOT_DIR is not set. Use --root DIR or export OPENDDE_ROOT_DIR=/path/to/data_root."
-[[ -n "$DATA_BASE_URL" ]] || err "Data base URL must not be empty."
-[[ -n "$DEPENDENCY_URL" ]] || err "Dependency URL must not be empty."
-[[ -n "$COMMON_URL" ]] || err "Common URL must not be empty."
-[[ -n "$SEARCH_DATABASE_URL" ]] || err "Search database URL must not be empty."
-[[ -n "$MODEL_NAME" ]] || err "Model name must not be empty."
+if [[ "$DOWNLOAD_SEARCH_DATABASE" -eq 1 ]]; then
+    [[ -n "$DATA_BASE_URL" ]] || err "Data base URL must not be empty."
+    [[ -n "$SEARCH_DATABASE_URL" ]] || err "Search database URL must not be empty."
+fi
+
+NEEDS_MODEL_MANIFEST=0
+if [[ "$DOWNLOAD_MODEL" -eq 1 ]] \
+    || [[ "$DOWNLOAD_COMMON" -eq 1 \
+        && "$COMMON_URL_EXPLICIT" -eq 0 \
+        && -z "$COMMON_URL" ]]; then
+    NEEDS_MODEL_MANIFEST=1
+fi
+
+if [[ "$NEEDS_MODEL_MANIFEST" -eq 1 ]]; then
+    [[ -f "$MODEL_MANIFEST_PATH" ]] \
+        || err "Model manifest is not a regular file: $MODEL_MANIFEST_PATH"
+    [[ -f "$MODEL_MANIFEST_TOOL" ]] \
+        || err "Model manifest tool is not a regular file: $MODEL_MANIFEST_TOOL"
+    command -v "$PYTHON_COMMAND" >/dev/null 2>&1 \
+        || err "Python command is unavailable: $PYTHON_COMMAND"
+
+    if ! MANIFEST_DEFAULTS="$(
+        "$PYTHON_COMMAND" "$MODEL_MANIFEST_TOOL" resolve-model \
+            --manifest "$MODEL_MANIFEST_PATH"
+    )"; then
+        err "Unable to resolve defaults from model manifest: $MODEL_MANIFEST_PATH"
+    fi
+    IFS=$'\t' read -r \
+        MANIFEST_DEFAULT_MODEL \
+        _MANIFEST_DEFAULT_CHECKPOINT \
+        _MANIFEST_DEFAULT_CHECKPOINT_URL \
+        MANIFEST_SOURCE_ROOT <<< "$MANIFEST_DEFAULTS"
+
+    MODEL_NAME="${MODEL_NAME:-$MANIFEST_DEFAULT_MODEL}"
+    DEPENDENCY_URL="${DEPENDENCY_URL:-$MANIFEST_SOURCE_ROOT}"
+    COMMON_URL="${COMMON_URL:-${MANIFEST_SOURCE_ROOT}/common}"
+fi
+
+if [[ "$DOWNLOAD_MODEL" -eq 1 ]]; then
+    [[ -n "$MODEL_NAME" ]] || err "Model name must not be empty."
+    [[ -n "$DEPENDENCY_URL" ]] || err "Dependency URL must not be empty."
+fi
+if [[ "$DOWNLOAD_COMMON" -eq 1 ]]; then
+    [[ -n "$COMMON_URL" ]] || err "Common URL must not be empty."
+fi
 
 DATA_BASE_URL="${DATA_BASE_URL%/}"
 DEPENDENCY_URL="${DEPENDENCY_URL%/}"
@@ -175,15 +251,38 @@ checkpoint_filename_for_source() {
     basename "$clean_source"
 }
 
+released_checkpoint_url() {
+    "$PYTHON_COMMAND" "$MODEL_MANIFEST_TOOL" \
+        checkpoint-url "$1" --manifest "$MODEL_MANIFEST_PATH"
+}
+
+model_checkpoint_url() {
+    "$PYTHON_COMMAND" "$MODEL_MANIFEST_TOOL" \
+        checkpoint-url "$1" \
+        --model "$MODEL_NAME" \
+        --manifest "$MODEL_MANIFEST_PATH"
+}
+
+verify_released_checkpoint() {
+    local path="$1"
+    local checkpoint_filename="$2"
+
+    "$PYTHON_COMMAND" "$MODEL_MANIFEST_TOOL" \
+        verify-checkpoint \
+        "$path" \
+        --checkpoint "$checkpoint_filename" \
+        --manifest "$MODEL_MANIFEST_PATH"
+}
+
 download_url() {
     local url="$1"
     local dest="$2"
-    mkdir -p "$(dirname "$dest")"
+    mkdir -p "$(dirname "$dest")" || return 1
 
     if command -v curl >/dev/null 2>&1; then
         curl -L --fail --retry 3 --connect-timeout 30 -o "$dest" "$url"
     elif command -v wget >/dev/null 2>&1; then
-        wget -O "$dest" "$url"
+        wget --tries=3 --timeout=30 -O "$dest" "$url"
     else
         err "Neither curl nor wget is installed; cannot download $url"
     fi
@@ -206,27 +305,41 @@ decompress_zst() {
 try_copy_or_download() {
     local source="$1"
     local dest="$2"
-    local tmp_dest="${dest}.tmp"
-    local download_dest="$tmp_dest"
+    local expected_checkpoint="${3:-}"
+    local tmp_dest=""
+    local download_dest=""
     local should_decompress_zst=0
-
-    if [[ "$source" == *.zst && "$dest" != *.zst ]]; then
-        should_decompress_zst=1
-        download_dest="${tmp_dest}.zst"
-    fi
+    local verification_error=""
 
     if [[ -f "$dest" && "$FORCE" -eq 0 ]]; then
-        info "Already exists: $dest"
-        return
+        if [[ -z "$expected_checkpoint" ]]; then
+            info "Already exists: $dest"
+            return
+        fi
+        if verification_error="$(
+            verify_released_checkpoint "$dest" "$expected_checkpoint" 2>&1
+        )"; then
+            info "Already exists and is verified: $dest"
+            return
+        fi
+        warn "Existing checkpoint failed verification (${verification_error}); replacing it: $dest"
     fi
 
-    rm -f "$tmp_dest" "$download_dest"
-    mkdir -p "$(dirname "$dest")"
+    mkdir -p "$(dirname "$dest")" || return 1
+    tmp_dest="$(mktemp "${dest}.tmp.XXXXXX")" || return 1
+    TEMP_FILES+=("$tmp_dest")
+    download_dest="$tmp_dest"
+    if [[ "$source" == *.zst && "$dest" != *.zst ]]; then
+        should_decompress_zst=1
+        download_dest="$(mktemp "${dest}.download.XXXXXX")" || return 1
+        TEMP_FILES+=("$download_dest")
+    fi
+
     if is_url "$source"; then
         if [[ "$source" =~ ^file:// ]]; then
             local local_path="${source#file://}"
             [[ -f "$local_path" ]] || return 1
-            cp "$local_path" "$download_dest"
+            cp "$local_path" "$download_dest" || return 1
         else
             info "Downloading $source"
             if ! download_url "$source" "$download_dest"; then
@@ -237,7 +350,7 @@ try_copy_or_download() {
     else
         [[ -f "$source" ]] || return 1
         info "Copying $source"
-        cp "$source" "$download_dest"
+        cp "$source" "$download_dest" || return 1
     fi
 
     if [[ "$should_decompress_zst" -eq 1 ]]; then
@@ -245,17 +358,24 @@ try_copy_or_download() {
             rm -f "$tmp_dest" "$download_dest"
             return 1
         fi
-        rm -f "$download_dest"
+        rm -f "$download_dest" || return 1
     fi
 
-    mv "$tmp_dest" "$dest"
+    if [[ -n "$expected_checkpoint" ]] \
+        && ! verify_released_checkpoint "$tmp_dest" "$expected_checkpoint"; then
+        rm -f "$tmp_dest" "$download_dest"
+        return 1
+    fi
+
+    mv "$tmp_dest" "$dest" || return 1
 }
 
 copy_or_download() {
     local source="$1"
     local dest="$2"
+    local expected_checkpoint="${3:-}"
 
-    if ! try_copy_or_download "$source" "$dest"; then
+    if ! try_copy_or_download "$source" "$dest" "$expected_checkpoint"; then
         err "Failed to copy/download $source to $dest"
     fi
 }
@@ -273,7 +393,7 @@ try_download_and_extract_tarball() {
         rm -f "$dest"
         return 1
     fi
-    rm -f "$dest"
+    rm -f "$dest" || return 1
 }
 
 download_and_extract_tarball() {
@@ -291,7 +411,7 @@ download_files_from() {
     local file
     local dest_file
 
-    mkdir -p "${OPENDDE_ROOT}/${subdir}"
+    mkdir -p "${OPENDDE_ROOT}/${subdir}" || return 1
     for file in "$@"; do
         dest_file="$file"
         if [[ "$file" == *.zst ]]; then
@@ -301,13 +421,6 @@ download_files_from() {
             return 1
         fi
     done
-}
-
-require_file() {
-    local path="$1"
-    if [[ ! -f "$path" ]]; then
-        err "Missing expected file: $path"
-    fi
 }
 
 common_ready() {
@@ -350,11 +463,31 @@ if [[ "$DOWNLOAD_SEARCH_DATABASE" -eq 1 ]]; then
 fi
 
 if [[ "$DOWNLOAD_MODEL" -eq 1 ]]; then
-    MODEL_TARGET_FILE=""
-    if [[ -z "$MODEL_SOURCE" ]]; then
-        if [[ "$MODEL_NAME" == "$DEFAULT_MODEL_NAME" ]]; then
-            MODEL_SOURCE="${DEPENDENCY_URL}/${DEFAULT_MODEL_SOURCE_FILE}"
-            MODEL_TARGET_FILE="$DEFAULT_MODEL_SOURCE_FILE"
+    if [[ -n "$CHECKPOINT_NAME" ]]; then
+        if ! model_checkpoint_url "$CHECKPOINT_NAME" >/dev/null 2>&1; then
+            err "Checkpoint is not released for model ${MODEL_NAME}: $CHECKPOINT_NAME"
+        fi
+        MODEL_TARGET_FILE="$CHECKPOINT_NAME"
+        MODEL_SOURCE="${MODEL_SOURCE:-${DEPENDENCY_URL}/${CHECKPOINT_NAME}}"
+    elif [[ -z "$MODEL_SOURCE" ]]; then
+        MODEL_RESOLUTION=""
+        if [[ "$MODEL_NAME" == "$MANIFEST_DEFAULT_MODEL" ]]; then
+            MODEL_RESOLUTION="$MANIFEST_DEFAULTS"
+        else
+            MODEL_RESOLUTION="$(
+                "$PYTHON_COMMAND" "$MODEL_MANIFEST_TOOL" resolve-model \
+                    --model "$MODEL_NAME" \
+                    --manifest "$MODEL_MANIFEST_PATH" \
+                    2>/dev/null
+            )" || MODEL_RESOLUTION=""
+        fi
+        if [[ -n "$MODEL_RESOLUTION" ]]; then
+            IFS=$'\t' read -r \
+                _RESOLVED_MODEL \
+                MODEL_TARGET_FILE \
+                _RESOLVED_CHECKPOINT_URL \
+                _RESOLVED_SOURCE_ROOT <<< "$MODEL_RESOLUTION"
+            MODEL_SOURCE="${DEPENDENCY_URL}/${MODEL_TARGET_FILE}"
         else
             MODEL_SOURCE="${DEPENDENCY_URL}/${MODEL_NAME}.pt"
             MODEL_TARGET_FILE="${MODEL_NAME}.pt"
@@ -365,26 +498,23 @@ if [[ "$DOWNLOAD_MODEL" -eq 1 ]]; then
             MODEL_TARGET_FILE="${MODEL_NAME}.pt"
         fi
     fi
-    copy_or_download "$MODEL_SOURCE" "${OPENDDE_ROOT}/checkpoint/${MODEL_TARGET_FILE}"
-fi
-
-info "Verifying inference files"
-if [[ "$DOWNLOAD_COMMON" -eq 1 ]]; then
-    require_file "${OPENDDE_ROOT}/common/components.cif"
-    require_file "${OPENDDE_ROOT}/common/components.cif.rdkit_mol.pkl"
-    require_file "${OPENDDE_ROOT}/common/release_date_cache.json"
-    require_file "${OPENDDE_ROOT}/common/obsolete_to_successor.json"
-fi
-
-if [[ "$DOWNLOAD_SEARCH_DATABASE" -eq 1 ]]; then
-    require_file "${OPENDDE_ROOT}/search_database/pdb_seqres_2022_09_28.fasta"
-    require_file "${OPENDDE_ROOT}/search_database/nt_rna_2023_02_23_clust_seq_id_90_cov_80_rep_seq.fasta"
-    require_file "${OPENDDE_ROOT}/search_database/rfam_14_9_clust_seq_id_90_cov_80_rep_seq.fasta"
-    require_file "${OPENDDE_ROOT}/search_database/rnacentral_active_seq_id_90_cov_80_linclust.fasta"
+    MODEL_EXPECTED_CHECKPOINT=""
+    if [[ "$VERIFY_RELEASED_MODEL" -eq 1 ]]; then
+        if released_checkpoint_url "$MODEL_TARGET_FILE" >/dev/null 2>&1; then
+            MODEL_EXPECTED_CHECKPOINT="$MODEL_TARGET_FILE"
+            info "Released checkpoint verification is enabled for ${MODEL_EXPECTED_CHECKPOINT}"
+        fi
+    fi
+    copy_or_download \
+        "$MODEL_SOURCE" \
+        "${OPENDDE_ROOT}/checkpoint/${MODEL_TARGET_FILE}" \
+        "$MODEL_EXPECTED_CHECKPOINT"
 fi
 
 if [[ "$DOWNLOAD_MODEL" -eq 1 ]]; then
-    require_file "${OPENDDE_ROOT}/checkpoint/${MODEL_TARGET_FILE}"
+    CHECKPOINT_SUMMARY="checkpoint/${MODEL_TARGET_FILE}"
+else
+    CHECKPOINT_SUMMARY="checkpoint/ (not changed; model download skipped)"
 fi
 
 cat <<EOF
@@ -401,7 +531,7 @@ Required runtime layout:
   search_database/nt_rna_2023_02_23_clust_seq_id_90_cov_80_rep_seq.fasta
   search_database/rfam_14_9_clust_seq_id_90_cov_80_rep_seq.fasta
   search_database/rnacentral_active_seq_id_90_cov_80_linclust.fasta
-  checkpoint/${MODEL_TARGET_FILE:-$DEFAULT_MODEL_SOURCE_FILE}
+  ${CHECKPOINT_SUMMARY}
 
 Set this before inference:
   export OPENDDE_ROOT_DIR="${OPENDDE_ROOT}"

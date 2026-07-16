@@ -2,8 +2,14 @@ FROM nvidia/cuda:12.6.3-cudnn-devel-ubuntu24.04
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
+LABEL org.opencontainers.image.title="OpenDDE" \
+      org.opencontainers.image.description="Open-source all-atom biomolecular structure prediction" \
+      org.opencontainers.image.source="https://github.com/aurekaresearch/OpenDDE" \
+      org.opencontainers.image.url="https://github.com/aurekaresearch/OpenDDE" \
+      org.opencontainers.image.documentation="https://github.com/aurekaresearch/OpenDDE/tree/main/docs" \
+      org.opencontainers.image.licenses="Apache-2.0"
+
 ENV DEBIAN_FRONTEND=noninteractive \
-    TZ=Asia/Shanghai \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     UV_COMPILE_BYTECODE=1 \
@@ -38,7 +44,8 @@ ENV PATH="/root/.local/bin:${PATH}"
 WORKDIR /app
 
 COPY . .
-RUN uv pip install --system --break-system-packages --torch-backend cu126 -e '.[gpu]' && \
+RUN uv pip install --no-cache --system --break-system-packages \
+        --torch-backend cu126 ".[gpu]" && \
     opendde --help >/dev/null
 
 VOLUME ["/opendde_data"]

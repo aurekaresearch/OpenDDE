@@ -2,6 +2,7 @@
 # Copyright (c) 2026 Aureka AI Research
 import copy
 import logging
+import os
 from collections.abc import Mapping
 from typing import Any, Optional
 
@@ -14,9 +15,9 @@ from opendde.config.model_base import configs as configs_base
 from opendde.config.model_registry import model_configs
 from opendde.config.schema import OpenDDEConfig
 from opendde.utils.environment import (
-    cuda_acceleration_available,
-    has_cuequivariance_packages,
-    select_triangle_kernel,
+    CuEquivarianceRuntimeStatus,
+    get_cuequivariance_runtime_status,
+    select_torch_device,
 )
 
 TRIANGLE_KERNELS = ("auto", "cuequivariance", "torch")
@@ -100,61 +101,61 @@ def validate_config_triangle_kernels(configs: OpenDDEConfig) -> None:
     )
 
 
-def resolve_auto_triangle_kernels(configs: OpenDDEConfig) -> OpenDDEConfig:
+def resolve_auto_triangle_kernels(
+    configs: OpenDDEConfig,
+    runtime_status: CuEquivarianceRuntimeStatus,
+) -> OpenDDEConfig:
     requested_multiplicative = configs.triangle_multiplicative
     requested_attention = configs.triangle_attention
-    auto_kernel = select_triangle_kernel()
+    if "auto" not in {requested_multiplicative, requested_attention}:
+        return configs
 
+    auto_kernel = runtime_status.auto_triangle_kernel
     if requested_multiplicative == "auto":
         configs.triangle_multiplicative = auto_kernel
     if requested_attention == "auto":
         configs.triangle_attention = auto_kernel
 
-    if "auto" in {requested_multiplicative, requested_attention}:
-        logger.info(
-            "Resolved triangle kernels from auto to multiplicative=%s, attention=%s.",
-            configs.triangle_multiplicative,
-            configs.triangle_attention,
-        )
+    logger.info(
+        "Resolved triangle kernels from auto to multiplicative=%s, attention=%s.",
+        configs.triangle_multiplicative,
+        configs.triangle_attention,
+    )
     return configs
 
 
-def validate_triangle_kernel_runtime(configs: OpenDDEConfig) -> None:
+def validate_triangle_kernel_runtime(
+    configs: OpenDDEConfig,
+    runtime_status: CuEquivarianceRuntimeStatus,
+) -> None:
     if "cuequivariance" not in {
         configs.triangle_multiplicative,
         configs.triangle_attention,
     }:
         return
-    if cuda_acceleration_available():
-        return
-    if not torch.cuda.is_available():
-        raise RuntimeError(
-            "cuEquivariance kernels require an NVIDIA CUDA runtime. "
-            "Use CPU kernels with '--trimul_kernel torch --triatt_kernel torch' "
-            "or install/run in a CUDA environment."
-        )
-    if not has_cuequivariance_packages():
-        raise RuntimeError(
-            "cuEquivariance kernels were requested, but GPU optional packages "
-            "are missing. Install them with: pip install 'opendde[gpu]'."
-        )
+    if runtime_status.unavailable_reason is not None:
+        raise RuntimeError(runtime_status.unavailable_reason)
 
 
-def update_gpu_compatible_configs(configs: OpenDDEConfig) -> OpenDDEConfig:
-    """
-    Update configurations for GPU architectures that need torch fallbacks.
-    """
+def apply_runtime_compatibility(
+    configs: OpenDDEConfig,
+    device: torch.device,
+) -> OpenDDEConfig:
+    """Apply runtime policy using one already-resolved inference device."""
+    if not isinstance(device, torch.device):
+        raise TypeError("device must be an already-resolved torch.device")
+
     validate_config_triangle_kernels(configs)
-    configs = resolve_auto_triangle_kernels(configs)
+    requested_kernels = {
+        configs.triangle_multiplicative,
+        configs.triangle_attention,
+    }
+    runtime_status = get_cuequivariance_runtime_status(
+        device,
+        probe_packages=requested_kernels != {"torch"},
+    )
 
-    def is_gpu_capability_between_7_and_8() -> bool:
-        if not torch.cuda.is_available():
-            return False
-        major, minor = torch.cuda.get_device_capability()
-        cc = major + minor / 10.0
-        return 7.0 <= cc < 8.0
-
-    if is_gpu_capability_between_7_and_8():
+    if runtime_status.requires_cc7_fallback:
         configs.dtype = "fp32"
         configs.triangle_attention = "torch"
         configs.triangle_multiplicative = "torch"
@@ -162,5 +163,15 @@ def update_gpu_compatible_configs(configs: OpenDDEConfig) -> OpenDDEConfig:
             "Enforcing FP32 and torch kernels for compatibility with detected "
             "GPU (Compute Capability 7.x)."
         )
-    validate_triangle_kernel_runtime(configs)
+    else:
+        configs = resolve_auto_triangle_kernels(configs, runtime_status)
+
+    validate_triangle_kernel_runtime(configs, runtime_status)
     return configs
+
+
+def update_gpu_compatible_configs(configs: OpenDDEConfig) -> OpenDDEConfig:
+    """Compatibility wrapper that resolves a device once before applying policy."""
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    device = select_torch_device(configs.device, local_rank=local_rank)
+    return apply_runtime_compatibility(configs, device)

@@ -38,6 +38,19 @@ opendde pred \
   --trimul_kernel auto
 ```
 
+### Four-GPU Fold-CP limitation
+
+The current official cuEquivariance release does not support OpenDDE's
+four-GPU Fold-CP path. Four-GPU inference must therefore force the PyTorch
+triangle kernels:
+
+```bash
+--triatt_kernel torch --trimul_kernel torch
+```
+
+This limitation applies to four-GPU Fold-CP only. Single-GPU inference may
+continue to use `auto` or `cuequivariance`.
+
 ## Compatibility run
 
 ```bash

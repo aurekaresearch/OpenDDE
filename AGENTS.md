@@ -18,20 +18,20 @@ This file applies to the whole repository unless a deeper `AGENTS.md` overrides 
   - `data/`: parsers, CCD/RDKit/Biotite handling, tokenizer, features, MSA/template/RNA-MSA utilities.
   - `config/`: config parser, defaults, registries, dependency URLs.
   - `utils/`, `metrics/`: shared utilities and metrics.
-- `runner/`: Click CLI and inference runner (`opendde = runner.batch_inference:opendde_cli`).
+- `runner/`: Click CLI and inference runner (`opendde = runner.cli:opendde_cli`).
 - `tests/`: pytest/unittest suite; `tests/smoke/` is heavier and often GPU/environment dependent.
 - `docs/`: user docs. Prefer these for behavior details: inference, Docker, kernels, JSON input, supported models, MSA/template pipeline.
 - `examples/`: small example inputs and structures.
 
 ## Environment and commands
 
-- Python requirement: `>=3.11`; CI currently tests Python `3.11` and `3.12` on Ubuntu.
+- Python requirement: `>=3.11,<3.14`; CI tests Python `3.11`, `3.12`, and `3.13` on Ubuntu.
 - CPU/dev setup:
 
 ```bash
 uv venv --python 3.11
 source .venv/bin/activate
-uv pip install --torch-backend cpu -e '.[cpu]'
+uv pip install --torch-backend cpu -e .
 uv pip install --group dev
 ```
 
@@ -49,7 +49,7 @@ python -m pytest tests -q -m "not network"
 
 ## CLI, config, and inference
 
-- Public CLI commands are registered in `runner/batch_inference.py`: `pred`, `doctor`, `json`, `msa`, `mt`, `prep`.
+- Public CLI commands are registered across `runner/cli.py` (`doctor`) and `runner/batch_inference.py` (`pred`, `json`, `msa`, `mt`, `prep`).
 - Config parsing lives in `opendde/config/config.py`; dotted CLI keys look like `--model.N_cycle 4` and `--sample_diffusion.N_step 20`.
 - Put model defaults in `opendde/config/model_base.py`, model names/overrides in `model_registry.py`, data/cache roots in `data.py`, and inference defaults in `inference_defaults.py`.
 - `ListValue` CLI args are comma-separated, e.g. `--seeds 101,102`; docs/examples should use lowercase `true`/`false` for bools.

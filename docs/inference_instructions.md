@@ -1,45 +1,75 @@
 # Inference Instructions
 
-
 Concise reference for installing OpenDDE, preparing runtime data, and running
-`opendde` commands. For Docker, see
-[docker_installation.md](./docker_installation.md).
+`opendde` commands.
 
 ## Install
 
-OpenDDE requires Python `>=3.11`. Install `uv` if needed:
+OpenDDE supports CPython `3.11`, `3.12`, and `3.13`. We recommend
+[`uv`](https://docs.astral.sh/uv/getting-started/installation/) for Python
+installations. Choose one of the following methods.
 
-```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-source "$HOME/.local/bin/env"
-```
-
-GPU install:
+### Install from PyPI
 
 ```bash
 uv venv --python 3.11
-source .venv/bin/activate
-uv pip install --torch-backend cu126 'opendde[gpu]'
-opendde doctor
 ```
 
-CPU install:
+CPU:
 
 ```bash
-uv venv --python 3.11
-source .venv/bin/activate
-uv pip install --torch-backend cpu 'opendde[cpu]'
-opendde doctor
+uv pip install --python .venv --torch-backend cpu opendde
 ```
 
-Source install from a checkout:
+NVIDIA GPU (Linux x86_64, CUDA 12.6):
 
 ```bash
-uv venv --python 3.11
-source .venv/bin/activate
-uv pip install --torch-backend cu126 -e '.[gpu]'
-opendde doctor
+uv pip install --python .venv --torch-backend cu126 "opendde[gpu]"
 ```
+
+### Install from source
+
+```bash
+git clone https://github.com/aurekaresearch/OpenDDE.git
+cd OpenDDE
+uv venv --python 3.11
+```
+
+CPU:
+
+```bash
+uv pip install --python .venv --torch-backend cpu -e .
+```
+
+NVIDIA GPU (Linux x86_64, CUDA 12.6):
+
+```bash
+uv pip install --python .venv --torch-backend cu126 -e ".[gpu]"
+```
+
+After a PyPI or source installation, verify the environment with:
+
+```bash
+uv run --no-project --python .venv opendde doctor
+```
+
+### Use Docker
+
+The prebuilt image targets NVIDIA GPU inference:
+
+```bash
+docker pull aurekaresearch/opendde:v1
+```
+
+See the [Docker guide](./docker_installation.md) for GPU setup, runtime-data
+mounts, and a complete `docker run` example.
+
+> [!NOTE]
+> `--torch-backend` selects the PyTorch build, while `[gpu]` adds the optional
+> cuEquivariance kernels. Linux wheels require glibc 2.28 or newer. Apple
+> Silicon runs on CPU (MPS is not supported); Intel macOS is unsupported, and
+> Windows has not been validated. At runtime, `--device auto` uses CUDA when
+> available and otherwise falls back to CPU.
 
 ## Runtime data
 
@@ -51,6 +81,10 @@ $OPENDDE_ROOT_DIR/
 ├── common/
 └── search_database/        # needed for local template/RNA-MSA search
 ```
+
+The default checkpoint and managed common files come from a release-pinned
+asset revision and are verified against their published size and SHA-256.
+Checkpoints passed explicitly with `--load_checkpoint_path` are left untouched.
 
 Prepare data from a source checkout:
 
@@ -66,43 +100,37 @@ search databases are not needed:
 bash scripts/download_opendde_data.sh --skip-search-database
 ```
 
-If you already have a checkpoint:
+If you already have a custom checkpoint, keep a descriptive filename and pass
+it directly. Use `--skip-model` when preparing only the remaining runtime data:
 
 ```bash
 mkdir -p "$OPENDDE_ROOT_DIR/checkpoint"
-cp /path/to/opendde.pt "$OPENDDE_ROOT_DIR/checkpoint/opendde.pt"
+cp /path/to/my_checkpoint.pt \
+  "$OPENDDE_ROOT_DIR/checkpoint/my_checkpoint.pt"
+bash scripts/download_opendde_data.sh --skip-model
+opendde pred \
+  --load_checkpoint_path "$OPENDDE_ROOT_DIR/checkpoint/my_checkpoint.pt" \
+  -i examples/input.json \
+  -o ./output
 ```
 
-Alternatively, keep the checkpoint anywhere readable and pass it directly with
-`opendde pred --load_checkpoint_path /path/to/opendde_abag.pt`.
-
-Released checkpoints:
-
-| Checkpoint | Use case | Download |
-| --- | --- | --- |
-| `opendde.pt` | General-purpose OpenDDE checkpoint. | [opendde.pt](https://huggingface.co/aurekaresearch/OpenDDE/resolve/main/opendde.pt) |
-| `opendde_abag.pt` | ABAG-optimized checkpoint for antibody-antigen complexes. | [opendde_abag.pt](https://huggingface.co/aurekaresearch/OpenDDE/resolve/main/opendde_abag.pt) |
+The names `opendde.pt` and `opendde_abag.pt` are reserved for released assets.
+Their authoritative links, sizes, and digests are in
+[supported_models.md](./supported_models.md).
 
 Use `opendde.pt` with `-n opendde_v1` as the default general-purpose
 checkpoint. To use the ABAG-optimized checkpoint, keep it as
 `opendde_abag.pt` and pass it with `--load_checkpoint_path`, for example
 `opendde pred --load_checkpoint_path "$OPENDDE_ROOT_DIR/checkpoint/opendde_abag.pt"`.
 
-Concrete setup:
+Install and verify the ABAG checkpoint from the same manifest-backed helper:
 
 ```bash
 export OPENDDE_ROOT_DIR=/path/to/opendde_data
-mkdir -p "$OPENDDE_ROOT_DIR/checkpoint"
-
-# General-purpose checkpoint used by default with -n opendde_v1.
-curl -L \
-  -o "$OPENDDE_ROOT_DIR/checkpoint/opendde.pt" \
-  https://huggingface.co/aurekaresearch/OpenDDE/resolve/main/opendde.pt
-
-# ABAG-optimized checkpoint, selected with --load_checkpoint_path.
-curl -L \
-  -o "$OPENDDE_ROOT_DIR/checkpoint/opendde_abag.pt" \
-  https://huggingface.co/aurekaresearch/OpenDDE/resolve/main/opendde_abag.pt
+bash scripts/download_opendde_data.sh \
+  --checkpoint opendde_abag.pt \
+  --skip-common \
+  --skip-search-database
 ```
 
 Then run general-purpose inference without an explicit checkpoint path. For ABAG
@@ -208,18 +236,18 @@ opendde pred \
   --cycle 10
 ```
 
-Inference defaults to `fp32` and `auto` triangle kernels (PyTorch on CPU,
-cuEquivariance on a CUDA GPU), so neither needs to be set explicitly.
-
+Inference defaults to `--device auto`, `fp32`, and `auto` triangle kernels.
+Device auto-selection uses NVIDIA CUDA when available and otherwise CPU.
+cuEquivariance is selected only when its Linux CUDA packages import successfully;
+otherwise the model uses PyTorch triangle kernels.
 
 ## 4-GPU Fold-CP inference
 
-> Note: the current Fold-CP path is provided as a distributed-inference demo.
-> It verifies that OpenDDE can execute the four-GPU context-parallel path,
-> including MSA-enabled inputs, but memory capacity and runtime performance are
-> still being actively optimized. We plan to continue improving this path in
-> collaboration with NVIDIA, including integration and tuning for acceleration
-> libraries such as cuEquivariance where applicable.
+> [!IMPORTANT]
+> Fold-CP inference does not currently support cuEquivariance (`cueq`) triangle
+> kernels. Triangle attention and triangle multiplication therefore use the
+> native PyTorch Fold-CP implementations by default. cuEquivariance acceleration
+> will remain unavailable in Fold-CP mode until upstream support is added.
 
 Fold-CP distributes token-pair-heavy inference work over four GPUs. Launch it
 with `torchrun` and expose exactly the GPUs you want to use:
@@ -246,8 +274,10 @@ Runtime notes:
 - `--nproc_per_node 4` must match `--foldcp_size_dp 1` times
   `--foldcp_size_cp 4`.
 - `--foldcp_size_cp 4` creates a 2 x 2 context-parallel mesh.
-- The same input, model, dtype, cycle, step, sample, MSA, template, and kernel
-  settings should be used when comparing single-GPU and Fold-CP outputs.
+- Keep the input, model, dtype, cycle, step, sample, MSA, and template settings
+  identical when comparing single-GPU and Fold-CP outputs. Use
+  `--triatt_kernel torch --trimul_kernel torch` for the single-GPU baseline so
+  both paths use PyTorch triangle kernels.
 - Outputs are written under the requested `-o/--out_dir` just like normal
   inference.
 - Optional `--foldcp_metrics_jsonl path/to/metrics.jsonl` records Fold-CP timing
@@ -299,7 +329,8 @@ Outputs are written to:
 | `--foldcp_mode` | `single` or `distributed`; use `distributed` with `torchrun` for four-GPU Fold-CP inference. |
 | `--foldcp_size_cp` | Number of context-parallel ranks. Four-GPU Fold-CP uses `4`. |
 | `--foldcp_metrics_jsonl` | Optional JSONL path for Fold-CP timing and memory metrics. |
-| `--dtype` | `bf16`, `fp16`, or `fp32`. |
+| `--dtype` | `bf16` or `fp32`. |
+| `--device` | `auto`, `cpu`, or `cuda`; auto uses CUDA when available and otherwise CPU. |
 | `--trimul_kernel`, `--triatt_kernel` | `auto`, `cuequivariance`, or `torch`. |
 
 Run `opendde <command> --help` for the full option list.

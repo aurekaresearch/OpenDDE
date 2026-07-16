@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "package": {
+    "name": "opendde",
+    "version": "1.0.1"
+  },
+  "source": {
+    "repository": "https://huggingface.co/aurekaresearch/OpenDDE",
+    "revision": "eddd563ce96571f784012edd8f045181c8f8627d",
+    "verified_at": "2026-07-16"
+  },
+  "default_model": "opendde_v1",
+  "models": [
+    {
+      "name": "opendde_v1",
+      "status": "supported",
+      "parameter_count": 655791538,
+      "data_cutoff": "2021-09-30",
+      "compatible_package_versions": ">=1.0.0,<2.0.0",
+      "default_checkpoint": "opendde.pt",
+      "checkpoints": [
+        {
+          "filename": "opendde.pt",
+          "variant": "general-purpose",
+          "size_bytes": 2625249069,
+          "sha256": "7b826620390afad877ee2babc6a4d0df81b94d3a0be030959853d6a7da0807cc"
+        },
+        {
+          "filename": "opendde_abag.pt",
+          "variant": "antibody-antigen",
+          "size_bytes": 2625271509,
+          "sha256": "5cf37441ddef2a2f148b81dd4a218ad274f996fecaf17dec901ab6cf1351713d"
+        }
+      ]
+    }
+  ]
+}

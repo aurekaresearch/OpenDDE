@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Ruff
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.3.2
+        with:
+          cache-dependency-glob: pyproject.toml
+
+      - name: Install lint environment
+        run: |
+          uv venv --python 3.11
+          uv pip install --python .venv/bin/python --group dev
+
+      - name: Run lint
+        run: .venv/bin/ruff check .
+
+  tests:
+    name: Python ${{ matrix.python-version }} CPU tests
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+
+    env:
+      LAYERNORM_TYPE: torch
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Configure test data root
+        run: |
+          mkdir -p "${RUNNER_TEMP}/opendde_data"
+          echo "OPENDDE_ROOT_DIR=${RUNNER_TEMP}/opendde_data" >> "${GITHUB_ENV}"
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.3.2
+        with:
+          cache-dependency-glob: pyproject.toml
+
+      - name: Install OpenDDE CPU environment
+        run: |
+          uv venv --python "${{ matrix.python-version }}"
+          uv pip install --python .venv/bin/python --torch-backend cpu -e .
+          uv pip install --python .venv/bin/python --group dev
+
+      - name: Run tests
+        run: .venv/bin/python -m pytest tests -q -m "not network"

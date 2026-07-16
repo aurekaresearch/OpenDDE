@@ -1,6 +1,5 @@
 [build-system]
-
-requires = ["setuptools>=77", "wheel"]
+requires = ["setuptools>=77.0.3"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,11 +7,11 @@ name = "opendde"
 dynamic = ["version"]
 description = "Open-Source Drug Design Engine"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.14"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 authors = [
-  { name = "Aureka Biotechnologies", email = "ai@aureka.com" },
+  { name = "Aureka AI Research", email = "ai@aureka.com" },
 ]
 keywords = [
   "alphafold3",
@@ -29,65 +28,58 @@ classifiers = [
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
   "Topic :: Scientific/Engineering :: Bio-Informatics",
   "Operating System :: POSIX :: Linux",
+  "Operating System :: MacOS :: MacOS X",
 ]
 
 dependencies = [
   "torch==2.7.1",
-  "torchvision==0.22.1",
-  "torchaudio==2.7.1",
   "click>=8.1.0",
   "scipy>=1.9.0",
   "ml_collections==1.1.0",
   "tqdm==4.67.1",
   "pandas==2.3.1",
-  "PyYAML==6.0.2",
-  "matplotlib==3.10.5",
-  "ipywidgets==8.1.7",
-  "py3Dmol==2.5.2",
   "rdkit==2025.9.3",
   "biopython==1.85",
   "biotite==1.4.0",
-  "modelcif==1.4",
-  "gemmi==0.6.7",
-  "pdbeccdutils==1.0.0",
   "scikit-learn==1.7.1",
-  "scikit-learn-extra==0.3.0",
   "pydantic>=2.0.0",
   "optree==0.17.0",
-  "protobuf==6.31.1",
   "numpy==2.4.1",
   "networkx>=3.4.2",
+  "packaging>=23.2",
   "requests>=2.31.0",
 ]
 
 [project.optional-dependencies]
 cpu = []
 gpu = [
-  "cuequivariance-ops-torch-cu12==0.8.0; platform_system == 'Linux'",
-  "cuequivariance-torch==0.8.0; platform_system == 'Linux'",
-  "triton==3.3.1; platform_system == 'Linux'",
+  "cuequivariance==0.8.0; platform_system == 'Linux' and platform_machine == 'x86_64'",
+  "cuequivariance-ops-torch-cu12==0.8.0; platform_system == 'Linux' and platform_machine == 'x86_64'",
+  "cuequivariance-torch==0.8.0; platform_system == 'Linux' and platform_machine == 'x86_64'",
 ]
 
 [project.urls]
-Homepage = "https://github.com/aurainfra/opendde"
-Repository = "https://github.com/aurainfra/opendde"
-Documentation = "https://github.com/aurainfra/opendde/tree/main/docs"
-Issues = "https://github.com/aurainfra/opendde/issues"
-Changelog = "https://github.com/aurainfra/opendde/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/aurekaresearch/OpenDDE"
+Repository = "https://github.com/aurekaresearch/OpenDDE"
+Documentation = "https://github.com/aurekaresearch/OpenDDE/tree/main/docs"
+Issues = "https://github.com/aurekaresearch/OpenDDE/issues"
+Changelog = "https://github.com/aurekaresearch/OpenDDE/blob/main/CHANGELOG.md"
 
 [project.scripts]
-opendde = "runner.batch_inference:opendde_cli"
+opendde = "runner.cli:opendde_cli"
 
 [dependency-groups]
 dev = [
-  "icecream==2.1.7",
-  "ipdb==0.13.13",
   "pre-commit>=3.7",
   "pytest>=8",
   "ruff>=0.8.6",
+]
+release = [
+  "twine>=5.1",
 ]
 
 [tool.setuptools]
@@ -99,6 +91,7 @@ exclude = ["assets*", "benchmark*", "docs*", "examples*", "scripts*", "tests*"]
 
 [tool.setuptools.package-data]
 opendde = ["model/layer_norm/kernel/*"]
+"opendde.config" = ["model_manifest.json"]
 
 [tool.setuptools.dynamic]
 version = { attr = "opendde.version.__version__" }

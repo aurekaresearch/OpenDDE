@@ -23,55 +23,37 @@ Pull the prebuilt image:
 docker pull aurekaresearch/opendde:v1
 ```
 
+The Docker `v1` tag is maintained separately from the Python package version.
+
 Or build from the repository root:
 
 ```bash
-docker build -t aurekaresearch/opendde:v1 .
+bash scripts/build_docker_image.sh
 ```
+
+The helper performs one local build tagged `opendde:local`, targeting
+`linux/amd64` by default. It does not inspect Git state, attach repository
+release metadata, push an image, or run from CI. Use `--tag`, `--platform`,
+`--pull`, or `--no-cache` as needed; run it with `--help` for the complete
+interface. If you use the locally built image, replace
+`aurekaresearch/opendde:v1` with `opendde:local` in the examples below.
 
 ## 3. Prepare runtime data
 
-OpenDDE reads checkpoints and runtime data from `OPENDDE_ROOT_DIR`. If you have
-local checkpoints, place `opendde.pt` and/or `opendde_abag.pt` under
-`checkpoint/` in that directory:
+OpenDDE reads checkpoints and runtime data from `OPENDDE_ROOT_DIR`:
 
 ```bash
 export OPENDDE_ROOT_DIR="$PWD/opendde_data"
-
 mkdir -p "$OPENDDE_ROOT_DIR/checkpoint"
-cp /absolute/path/to/opendde.pt "$OPENDDE_ROOT_DIR/checkpoint/opendde.pt"
 ```
 
-Released checkpoints:
+Released checkpoints keep the public filenames `opendde.pt` and
+`opendde_abag.pt`. Their authoritative download links and digests are listed in
+[supported_models.md](./supported_models.md).
 
-| Checkpoint | Use case | Download |
-| --- | --- | --- |
-| `opendde.pt` | General-purpose OpenDDE checkpoint. | [opendde.pt](https://huggingface.co/aurekaresearch/OpenDDE/resolve/main/opendde.pt) |
-| `opendde_abag.pt` | ABAG-optimized checkpoint for antibody-antigen complexes. | [opendde_abag.pt](https://huggingface.co/aurekaresearch/OpenDDE/resolve/main/opendde_abag.pt) |
-
-For the default Docker command below, place the general-purpose checkpoint at
-`$OPENDDE_ROOT_DIR/checkpoint/opendde.pt`. When using the ABAG-optimized
-checkpoint, add this to the `opendde pred` command:
-
-```bash
---load_checkpoint_path /opendde_data/checkpoint/opendde_abag.pt
-```
-
-Download one checkpoint directly into the default host path:
-
-```bash
-# General-purpose checkpoint:
-curl -L \
-  -o "$OPENDDE_ROOT_DIR/checkpoint/opendde.pt" \
-  https://huggingface.co/aurekaresearch/OpenDDE/resolve/main/opendde.pt
-
-# ABAG-optimized checkpoint:
-curl -L \
-  -o "$OPENDDE_ROOT_DIR/checkpoint/opendde_abag.pt" \
-  https://huggingface.co/aurekaresearch/OpenDDE/resolve/main/opendde_abag.pt
-```
-
-Download or verify the remaining runtime files with Docker:
+Download or verify the released checkpoint and remaining runtime files with
+Docker. The helper validates official checkpoints against the bundled manifest
+before atomically installing them:
 
 ```bash
 docker run --rm \
@@ -79,6 +61,48 @@ docker run --rm \
   aurekaresearch/opendde:v1 \
   bash scripts/download_opendde_data.sh \
     --root /opendde_data
+```
+
+To download only the released ABAG checkpoint:
+
+```bash
+docker run --rm \
+  -v "$OPENDDE_ROOT_DIR":/opendde_data \
+  aurekaresearch/opendde:v1 \
+  bash scripts/download_opendde_data.sh \
+    --root /opendde_data \
+    --skip-common \
+    --skip-search-database \
+    --checkpoint opendde_abag.pt
+```
+
+Select that released checkpoint explicitly for an ABAG run:
+
+```bash
+--load_checkpoint_path /opendde_data/checkpoint/opendde_abag.pt
+```
+
+If you already have a custom checkpoint, keep its own descriptive filename and
+copy it into the mounted checkpoint directory. Prepare only the remaining
+runtime files with `--skip-model`, so the helper neither validates the custom
+file as a released asset nor installs the unrelated default checkpoint:
+
+```bash
+cp /absolute/path/to/my_checkpoint.pt \
+  "$OPENDDE_ROOT_DIR/checkpoint/my_checkpoint.pt"
+
+docker run --rm \
+  -v "$OPENDDE_ROOT_DIR":/opendde_data \
+  aurekaresearch/opendde:v1 \
+  bash scripts/download_opendde_data.sh \
+    --root /opendde_data \
+    --skip-model
+```
+
+Select the custom checkpoint explicitly during inference:
+
+```bash
+--load_checkpoint_path /opendde_data/checkpoint/my_checkpoint.pt
 ```
 
 For protein-only smoke tests that disable MSA/template/RNA-MSA preprocessing, you

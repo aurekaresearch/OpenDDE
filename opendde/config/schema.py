@@ -12,11 +12,18 @@ resolved tree: it gives static types to the ~170 consumption sites
 ``to_dict``) so those sites keep working unchanged.
 """
 
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict
-from typing_extensions import Literal
 
+InferenceDtype = Literal["bf16", "fp32"]
+INFERENCE_DTYPE_CHOICES: tuple[InferenceDtype, ...] = ("bf16", "fp32")
+InferenceDevice = Literal["auto", "cpu", "cuda"]
+INFERENCE_DEVICE_CHOICES: tuple[InferenceDevice, ...] = (
+    "auto",
+    "cpu",
+    "cuda",
+)
 TriangleKernel = Literal["auto", "cuequivariance", "torch"]
 
 
@@ -324,7 +331,8 @@ class OpenDDEConfig(BaseConfig):
     enable_diffusion_shared_vars_cache: bool
     enable_efficient_fusion: bool
     enable_tf32: bool
-    dtype: Literal["bf16", "fp32"]
+    dtype: InferenceDtype
+    device: InferenceDevice = "auto"
     skip_amp: SkipAmpConfig
     infer_setting: InferSettingConfig
     inference_noise_scheduler: NoiseSchedulerConfig

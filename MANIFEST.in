@@ -1,0 +1,5 @@
+include CHANGELOG.md
+include opendde/config/model_manifest.json
+prune docs/releases
+prune tests
+exclude MANIFEST.in

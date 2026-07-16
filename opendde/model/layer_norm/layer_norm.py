@@ -16,36 +16,96 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import importlib
+import logging
 import numbers
 import os
-import sys
+import threading
 from typing import Any, Optional, Union, cast
 
 import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
-sys.path.append(os.path.dirname(__file__))
+logger = logging.getLogger(__name__)
+
+_FAST_LAYER_NORM_REQUIRED_SYMBOLS = (
+    "forward_none_affine",
+    "forward_with_bias_affine",
+    "forward_with_weight_affine",
+    "forward_with_both_affine",
+    "backward_none_affine",
+    "backward_with_bias_affine",
+    "backward_with_weight_affine",
+    "backward_with_both_affine",
+)
 
 fast_layer_norm_cuda_v2 = None
-try:
-    fast_layer_norm_cuda_v2 = importlib.import_module("fast_layer_norm_cuda_v2")
-except ImportError:
-    try:
-        from opendde.model.layer_norm.torch_ext_compile import compile
+_fast_layer_norm_load_attempted = False
+_fast_layer_norm_load_lock = threading.Lock()
 
-        current_dir = os.path.dirname(__file__)
-        fast_layer_norm_cuda_v2 = compile(
-            name="fast_layer_norm_cuda_v2",
-            sources=[
-                os.path.join(f"{current_dir}/kernel", file)
-                for file in ["layer_norm_cuda.cpp", "layer_norm_cuda_kernel.cu"]
-            ],
-            extra_include_paths=[f"{current_dir}/kernel"],
-            build_directory=current_dir,
+
+def _validate_fast_layer_norm_extension(extension: Any) -> Any:
+    missing_symbols = [
+        symbol
+        for symbol in _FAST_LAYER_NORM_REQUIRED_SYMBOLS
+        if not callable(getattr(extension, symbol, None))
+    ]
+    if missing_symbols:
+        raise ImportError(
+            "Fast LayerNorm extension is missing required symbols: "
+            + ", ".join(missing_symbols)
         )
-    except (ImportError, OSError, RuntimeError):
-        fast_layer_norm_cuda_v2 = None
+    return extension
+
+
+def _load_fast_layer_norm_cuda_v2() -> Any:
+    """Load or compile the optional extension on its first CUDA use."""
+    global fast_layer_norm_cuda_v2
+    global _fast_layer_norm_load_attempted
+
+    if not torch.cuda.is_available():
+        return None
+    if _fast_layer_norm_load_attempted:
+        return fast_layer_norm_cuda_v2
+
+    with _fast_layer_norm_load_lock:
+        if _fast_layer_norm_load_attempted:
+            return fast_layer_norm_cuda_v2
+
+        try:
+            extension = importlib.import_module(
+                ".fast_layer_norm_cuda_v2",
+                package=__package__,
+            )
+            extension = _validate_fast_layer_norm_extension(extension)
+        except Exception:
+            try:
+                from opendde.model.layer_norm.torch_ext_compile import compile
+
+                current_dir = os.path.dirname(__file__)
+                extension = compile(
+                    name="fast_layer_norm_cuda_v2",
+                    sources=[
+                        os.path.join(current_dir, "kernel", file)
+                        for file in (
+                            "layer_norm_cuda.cpp",
+                            "layer_norm_cuda_kernel.cu",
+                        )
+                    ],
+                    extra_include_paths=[os.path.join(current_dir, "kernel")],
+                )
+                extension = _validate_fast_layer_norm_extension(extension)
+            except Exception as error:
+                logger.warning(
+                    "Fast LayerNorm CUDA extension is unavailable; using torch "
+                    "layer_norm instead: %s",
+                    error,
+                )
+                extension = None
+
+        fast_layer_norm_cuda_v2 = extension
+        _fast_layer_norm_load_attempted = True
+        return extension
 
 
 class FusedLayerNormAffineFunction(torch.autograd.Function):
@@ -167,7 +227,6 @@ class FusedLayerNormAffineFunction(torch.autograd.Function):
             None if bias_ is None else grad_bias,
             None,
             None,
-            None,
         )
 
 
@@ -216,7 +275,7 @@ class FusedLayerNorm(torch.nn.Module):
             torch.nn.init.zeros_(self.bias)
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        if fast_layer_norm_cuda_v2 is None:
+        if not input.is_cuda or _load_fast_layer_norm_cuda_v2() is None:
             return F.layer_norm(
                 input,
                 self.normalized_shape,

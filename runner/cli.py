@@ -97,7 +97,7 @@ def doctor() -> None:
 @click.group(name="opendde", cls=LazyOpenDDEGroup, context_settings=CONTEXT_SETTINGS)
 @click.version_option(version=__version__)
 def opendde_cli() -> None:
-    """OpenDDE: an AlphaFold 3-style structure prediction toolkit."""
+    """OpenDDE: An Open-source Drug Discovery Engine."""
 
 
 opendde_cli.add_command(doctor)

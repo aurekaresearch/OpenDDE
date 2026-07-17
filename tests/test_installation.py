@@ -88,11 +88,13 @@ class TestInstallation(unittest.TestCase):
             requirement.name: requirement for requirement in gpu_requirements
         }
         expected_gpu_packages = {
-            "cuequivariance",
-            "cuequivariance-ops-torch-cu12",
-            "cuequivariance-torch",
+            "triton": "==3.3.1",
+            "cuequivariance": "==0.10.0",
+            "cuequivariance-torch": "==0.10.0",
+            "cuequivariance-ops-cu12": "==0.10.0",
+            "cuequivariance-ops-torch-cu12": "==0.10.0",
         }
-        self.assertEqual(set(gpu_requirements_by_name), expected_gpu_packages)
+        self.assertEqual(set(gpu_requirements_by_name), set(expected_gpu_packages))
         self.assertEqual(len(gpu_requirements), len(expected_gpu_packages))
 
         platform_matrix = {
@@ -114,7 +116,9 @@ class TestInstallation(unittest.TestCase):
             ),
         }
         for requirement in gpu_requirements:
-            self.assertEqual(str(requirement.specifier), "==0.8.0")
+            self.assertEqual(
+                str(requirement.specifier), expected_gpu_packages[requirement.name]
+            )
             marker = requirement.marker
             assert marker is not None
             for platform_name, (environment, expected) in platform_matrix.items():

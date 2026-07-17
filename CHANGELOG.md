@@ -6,6 +6,14 @@ User-facing changes to OpenDDE are documented here.
 
 No changes yet.
 
+## [1.0.2] - 2026-07-17
+
+### Fixed
+
+- Updated the Linux x86_64 GPU dependencies to Triton 3.3.1 and
+  cuEquivariance 0.10.0, resolving the `PY_SSIZE_T_CLEAN` failure seen during
+  accelerated inference on larger protein systems.
+
 ## [1.0.1] - 2026-07-16
 
 ### Added
@@ -36,6 +44,7 @@ For installation and upgrade commands, see the
 
 - Initial PyPI bootstrap release of the `opendde` package name.
 
-[Unreleased]: https://github.com/aurekaresearch/OpenDDE/compare/v1.0.1...HEAD
+[Unreleased]: https://github.com/aurekaresearch/OpenDDE/compare/v1.0.2...HEAD
+[1.0.2]: https://github.com/aurekaresearch/OpenDDE/releases/tag/v1.0.2
 [1.0.1]: https://github.com/aurekaresearch/OpenDDE/releases/tag/v1.0.1
 [1.0.0]: https://pypi.org/project/opendde/1.0.0/

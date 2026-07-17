@@ -53,10 +53,9 @@ def test_current_changelog_renders_the_github_release_body():
     )
 
     assert result.returncode == 0, result.stderr
-    assert "### Added" in result.stdout
-    assert "### Compatibility" in result.stdout
+    assert "### Fixed" in result.stdout
     assert "**Full Changelog**:" not in result.stdout
-    assert "compare/v1.0.0" not in result.stdout
+    assert "compare/v1.0.1" not in result.stdout
     assert "## [Unreleased]" not in result.stdout
 
 

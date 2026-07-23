@@ -34,6 +34,7 @@ from opendde.distributed.foldcp.metrics import (
     measure_foldcp_stage,
 )
 from opendde.model.opendde import OpenDDE
+from opendde.model.triangular.layers import skip_random_init
 from opendde.utils.distributed import DIST_WRAPPER
 from opendde.utils.download import (
     download_inference_cache,
@@ -124,7 +125,8 @@ class InferenceRunner(object):
             self.init_env()
             _download_inference_assets(self.configs)
             self.init_basics()
-            self.init_model()
+            with skip_random_init() if self.configs.load_strict else nullcontext():
+                self.init_model()
             self.load_checkpoint()
             self.init_dumper(
                 need_atom_confidence=self.configs.need_atom_confidence,

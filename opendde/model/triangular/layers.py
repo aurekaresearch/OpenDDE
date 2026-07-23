@@ -2,8 +2,10 @@
 # Copyright (c) 2026 Aureka AI Research
 # Copyright 2021 AlQuraishi Laboratory
 
+import contextlib
 import math
 import os
+import sys
 from functools import partial
 from typing import Callable, List, Optional, Tuple, Union
 
@@ -91,6 +93,36 @@ def gating_init_(weights: torch.Tensor) -> None:
 
 def normal_init_(weights: torch.Tensor) -> None:
     torch.nn.init.kaiming_normal_(weights, nonlinearity="linear")
+
+
+@contextlib.contextmanager
+def skip_random_init():
+    """
+    Skips random weight initialization.
+
+    Skips the following initialization work:
+    * trunc_normal_init_ in opendde.model.triangular.layers
+    * trunc_normal_init_ in opendde.model.modules.primitives
+    * reset_parameters in torch.nn.Linear which includes kaiminig_uniform_
+    """
+    def _noop_init(*_args, **_kwargs):
+        pass
+
+    from opendde.model.modules import primitives
+
+    originals = [
+        (sys.modules[__name__], "trunc_normal_init_"),
+        (primitives, "trunc_normal_init_"),
+        (torch.nn.Linear, "reset_parameters"),
+    ]
+    saved = [(obj, attr, getattr(obj, attr)) for obj, attr in originals]
+    try:
+        for obj, attr in originals:
+            setattr(obj, attr, _noop_init)
+        yield
+    finally:
+        for obj, attr, value in saved:
+            setattr(obj, attr, value)
 
 
 class OpenfoldLinear(nn.Linear):

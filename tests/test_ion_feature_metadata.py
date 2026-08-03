@@ -10,57 +10,66 @@ from opendde.data.template.template_featurizer import InferenceTemplateFeaturize
 
 
 PROTEIN_SEQUENCE = "ACDEF"
+EntitySpec = tuple[str, int]
 
 
-def _make_input(entity_order: tuple[str, ...]) -> tuple[list[dict], AtomArray]:
+def _make_input(entity_specs: tuple[EntitySpec, ...]) -> tuple[list[dict], AtomArray]:
     bioassembly = []
     asym_ids = []
     res_ids = []
     chain_ids = []
+    curr_asym_id = 0
 
-    for asym_id, entity_type in enumerate(entity_order):
-        chain_id = chr(ord("A") + asym_id)
+    for entity_type, count in entity_specs:
         if entity_type == "protein":
             bioassembly.append(
                 {
                     "proteinChain": {
                         "sequence": PROTEIN_SEQUENCE,
-                        "count": 1,
+                        "count": count,
                     }
                 }
             )
             entity_size = len(PROTEIN_SEQUENCE)
-            entity_res_ids = range(1, entity_size + 1)
         elif entity_type == "ion":
-            bioassembly.append({"ion": {"ion": "ZN", "count": 1}})
+            bioassembly.append({"ion": {"ion": "ZN", "count": count}})
             entity_size = 1
-            entity_res_ids = [1]
+        elif entity_type == "ligand":
+            bioassembly.append({"ligand": {"ligand": "CCD_ATP", "count": count}})
+            entity_size = 2
         else:
             raise ValueError(f"Unsupported test entity type: {entity_type}")
 
-        asym_ids.extend([asym_id] * entity_size)
-        res_ids.extend(entity_res_ids)
-        chain_ids.extend([chain_id] * entity_size)
+        for _ in range(count):
+            chain_id = chr(ord("A") + curr_asym_id)
+            asym_ids.extend([curr_asym_id] * entity_size)
+            res_ids.extend(range(1, entity_size + 1))
+            chain_ids.extend([chain_id] * entity_size)
+            curr_asym_id += 1
 
     atom_array = AtomArray(len(asym_ids))
     atom_array.res_id[:] = res_ids
     atom_array.chain_id[:] = chain_ids
     atom_array.set_annotation("asym_id_int", np.asarray(asym_ids, dtype=np.int64))
-    atom_array.set_annotation(
-        "centre_atom_mask", np.ones(len(asym_ids), dtype=np.int8)
-    )
+    atom_array.set_annotation("centre_atom_mask", np.ones(len(asym_ids), dtype=np.int8))
     return bioassembly, atom_array
 
 
 @pytest.mark.parametrize(
-    "entity_order",
+    "entity_specs",
     [
-        ("protein", "ion"),
-        ("ion", "protein"),
+        (("protein", 1), ("ion", 1)),
+        (("ion", 1), ("protein", 1)),
+        (("protein", 1), ("ion", 2)),
+        (("protein", 1), ("ligand", 1), ("ion", 1)),
+        (("ion", 1), ("ion", 1), ("protein", 1)),
+        (("protein", 1), ("ion", 1), ("protein", 1)),
     ],
 )
-def test_msa_feature_metadata_includes_ion(entity_order: tuple[str, ...]) -> None:
-    bioassembly, atom_array = _make_input(entity_order)
+def test_msa_feature_metadata_includes_ion(
+    entity_specs: tuple[EntitySpec, ...],
+) -> None:
+    bioassembly, atom_array = _make_input(entity_specs)
 
     features = InferenceMSAFeaturizer.make_msa_feature(
         bioassembly=bioassembly,
@@ -74,16 +83,20 @@ def test_msa_feature_metadata_includes_ion(entity_order: tuple[str, ...]) -> Non
 
 
 @pytest.mark.parametrize(
-    "entity_order",
+    "entity_specs",
     [
-        ("protein", "ion"),
-        ("ion", "protein"),
+        (("protein", 1), ("ion", 1)),
+        (("ion", 1), ("protein", 1)),
+        (("protein", 1), ("ion", 2)),
+        (("protein", 1), ("ligand", 1), ("ion", 1)),
+        (("ion", 1), ("ion", 1), ("protein", 1)),
+        (("protein", 1), ("ion", 1), ("protein", 1)),
     ],
 )
 def test_template_feature_metadata_includes_ion(
-    entity_order: tuple[str, ...],
+    entity_specs: tuple[EntitySpec, ...],
 ) -> None:
-    bioassembly, atom_array = _make_input(entity_order)
+    bioassembly, atom_array = _make_input(entity_specs)
 
     features = InferenceTemplateFeaturizer.make_template_feature(
         bioassembly=bioassembly,

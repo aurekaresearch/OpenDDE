@@ -361,13 +361,14 @@ class InferenceMSAFeaturizer:
             elif "dnaSequence" in info:
                 c = info["dnaSequence"]
                 seq, count, ctype = c["sequence"], c["count"], DNA_CHAIN
-            elif "ligand" in info or "ion" in info:
-                entity_key = "ligand" if "ligand" in info else "ion"
+            elif "ligand" in info:
                 count, ctype, seq = (
-                    info[entity_key]["count"],
+                    info["ligand"]["count"],
                     LIGAND_CHAIN_TYPES,
                     "X" * (atom_array.asym_id_int == curr_aid).sum(),
                 )
+            elif "ion" in info:
+                count, ctype = info["ion"]["count"], LIGAND_CHAIN_TYPES
 
             p_a3m = ensure_ends_with_newline(p_a3m)
             u_a3m = ensure_ends_with_newline(u_a3m)
@@ -379,10 +380,16 @@ class InferenceMSAFeaturizer:
 
             for c_idx in range(count):
                 aid = curr_aid + c_idx
+                chain_seq = seq
+                if "ion" in info:
+                    chain_seq = "X" * np.count_nonzero(
+                        (atom_array.asym_id_int == aid)
+                        & atom_array.centre_atom_mask.astype(bool)
+                    )
                 meta[aid] = {
                     "entity_id": eid,
                     "chain_id": atom_array.chain_id[atom_array.asym_id_int == aid][0],
-                    "sequence": seq,
+                    "sequence": chain_seq,
                     "paired_msa": p_a3m or "",
                     "unpaired_msa": u_a3m or "",
                     "chain_entity_type": ctype,

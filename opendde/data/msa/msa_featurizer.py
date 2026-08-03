@@ -361,9 +361,10 @@ class InferenceMSAFeaturizer:
             elif "dnaSequence" in info:
                 c = info["dnaSequence"]
                 seq, count, ctype = c["sequence"], c["count"], DNA_CHAIN
-            elif "ligand" in info:
+            elif "ligand" in info or "ion" in info:
+                entity_key = "ligand" if "ligand" in info else "ion"
                 count, ctype, seq = (
-                    info["ligand"]["count"],
+                    info[entity_key]["count"],
                     LIGAND_CHAIN_TYPES,
                     "X" * (atom_array.asym_id_int == curr_aid).sum(),
                 )

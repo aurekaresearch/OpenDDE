@@ -283,8 +283,9 @@ class InferenceTemplateFeaturizer:
             elif "dnaSequence" in info:
                 c = info["dnaSequence"]
                 seq, count, ctype = c["sequence"], c["count"], DNA_CHAIN
-            elif "ligand" in info:
-                count, ctype = info["ligand"]["count"], LIGAND_CHAIN_TYPES
+            elif "ligand" in info or "ion" in info:
+                entity_key = "ligand" if "ligand" in info else "ion"
+                count, ctype = info[entity_key]["count"], LIGAND_CHAIN_TYPES
                 seq = "X" * (atom_array.asym_id_int == curr_asym_id).sum()
 
             templates = []

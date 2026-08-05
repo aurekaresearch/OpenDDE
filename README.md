@@ -209,23 +209,25 @@ For production runs, enable the preprocessing features you need, for example
 require network access, HMMER/Kalign binaries, and large local search databases;
 see the inference guide for details.
 
-## 4-GPU Fold-CP Inference
+## Multi-GPU Fold-CP Inference
 
 > [!IMPORTANT]
-> Four-GPU Fold-CP currently requires the PyTorch triangle kernels. The current
-> official cuEquivariance release does not support this four-GPU CP path, so use
-> `--trimul_kernel torch --triatt_kernel torch`; single-GPU cuEquivariance is not
-> affected. See the [Fold-CP E2E baseline](https://github.com/aurekaresearch/OpenDDE/blob/main/docs/foldcp_e2e_baseline.md) for the
-> full 12SN capacity, timing, memory, and bitwise-alignment matrix.
+> Multi-GPU Fold-CP does not support cuEquivariance triangle kernels, so use
+> `--trimul_kernel torch --triatt_kernel torch`. On CUDA BF16, the distributed
+> PyTorch triangle-attention path uses the Triton dependency from the GPU install
+> extra to fuse attention-bias addition. See the
+> [Fold-CP reproduction guide](https://github.com/aurekaresearch/OpenDDE/blob/main/docs/foldcp_e2e_baseline.md)
+> for controlled launch commands and validation guidance.
 
-OpenDDE supports a four-GPU Fold-CP inference mode for larger inputs. Launch it
-with `torchrun` so that one process runs on each GPU:
+OpenDDE supports a `1 x P` Fold-CP inference mode for larger inputs, where `P`
+can be any available GPU count greater than one. Launch it with `torchrun` so
+that one process runs on each GPU. For example, four GPUs use:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node 4 \
   -m runner.batch_inference pred \
   -i examples/protein_200.json \
-  -o ./output_cp4 \
+  -o ./output_foldcp \
   -n opendde_v1 \
   --use_msa false \
   --use_template false \
@@ -233,15 +235,17 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node 4 \
   --sample 1 \
   --step 200 \
   --cycle 10 \
+  --trimul_kernel torch \
+  --triatt_kernel torch \
   --foldcp_mode distributed \
   --foldcp_size_dp 1 \
   --foldcp_size_cp 4
 ```
 
-`--foldcp_size_cp 4` uses a `2 x 2` context-parallel mesh. For normal single-GPU
-or CPU inference, omit the Fold-CP flags or use `--foldcp_mode single`.
-
-
+`--nproc_per_node` must equal `--foldcp_size_dp * --foldcp_size_cp`. The example
+uses a `1 x 4` context-parallel mesh; replace both occurrences of `4` with the
+desired `P`. For normal single-GPU or CPU inference, omit the Fold-CP flags or
+use `--foldcp_mode single --foldcp_size_cp 1`.
 
 ## Input JSON
 
@@ -277,7 +281,7 @@ checkpoint files such as `opendde_abag.pt`.
 - [Input JSON format](https://github.com/aurekaresearch/OpenDDE/blob/main/docs/infer_json_format.md)
 - [MSA/template/RNA-MSA pipeline](https://github.com/aurekaresearch/OpenDDE/blob/main/docs/msa_template_pipeline.md)
 - [Kernel options](https://github.com/aurekaresearch/OpenDDE/blob/main/docs/kernels.md)
-- [Fold-CP E2E baseline](https://github.com/aurekaresearch/OpenDDE/blob/main/docs/foldcp_e2e_baseline.md)
+- [Fold-CP reproduction guide](https://github.com/aurekaresearch/OpenDDE/blob/main/docs/foldcp_e2e_baseline.md)
 - [Supported models](https://github.com/aurekaresearch/OpenDDE/blob/main/docs/supported_models.md)
 - [Tutorial](https://github.com/aurekaresearch/OpenDDE/blob/main/docs/tutorial.md)
 

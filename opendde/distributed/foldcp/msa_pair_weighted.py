@@ -27,7 +27,9 @@ def serial_msa_pair_weighted_average(
     return torch.einsum("bijh,bsjhc->bsihc", weights, value)
 
 
-def shard_msa_value_by_token(value: torch.Tensor, mesh: FoldCPProcessMesh) -> torch.Tensor:
+def shard_msa_value_by_token(
+    value: torch.Tensor, mesh: FoldCPProcessMesh
+) -> torch.Tensor:
     """Shard value tensor on the token/source axis using the CP column coordinate."""
 
     token_dim = 2
@@ -118,8 +120,6 @@ def collect_msa_pair_row_slab(
     return row_slab[..., :original_tokens, :].contiguous()
 
 
-
-
 def distributed_msa_pair_weighted_average_with_full_value(
     pair_logits_local: torch.Tensor,
     value: torch.Tensor,
@@ -157,6 +157,10 @@ def distributed_msa_pair_weighted_average_with_full_value(
         if original_tokens is not None:
             pair_logits = pair_logits[:, :, :original_tokens, :]
             value = value[:, :, :original_tokens, :, :]
+        # The serial MSA path uses one full-row torch.einsum/MM launch.  Keep
+        # the same launch geometry for every mesh shape; splitting 1xP into
+        # two row slabs selects a different BF16 GEMM at boundaries such as
+        # N=1200, even though the mathematical expression is unchanged.
         return serial_msa_pair_weighted_average(pair_logits, value).contiguous()
 
     value_local = shard_msa_value_by_token(value, mesh)
@@ -166,6 +170,7 @@ def distributed_msa_pair_weighted_average_with_full_value(
         mesh,
         original_tokens=original_tokens,
     )
+
 
 def distributed_msa_pair_weighted_average(
     pair_logits_local: torch.Tensor,

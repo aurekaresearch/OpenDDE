@@ -167,6 +167,11 @@ def gather_pair_embedding_in_dense_trunk_from_foldcp_local(
         os.environ.get("OPENDDE_FOLDCP_ATOM_WINDOW_PAIR_ROW_CHUNK", "16")
     )
     row_chunk_size = max(1, row_chunk_size)
+    recv_buffer = (
+        z_local.new_empty((row_chunk_size, tile_cols, z_local.shape[-1]))
+        if mesh.layout.numel > 1
+        else None
+    )
 
     for cp_rank in range(mesh.layout.numel):
         row_coord, col_coord = mesh.layout.to_coord(cp_rank)
@@ -187,7 +192,9 @@ def gather_pair_embedding_in_dense_trunk_from_foldcp_local(
             if group_rank == cp_rank:
                 shard = z_local[row_offset : row_offset + chunk_rows].contiguous()
             else:
-                shard = z_local.new_empty((chunk_rows, tile_cols, z_local.shape[-1]))
+                if recv_buffer is None:
+                    raise RuntimeError("missing Fold-CP atom-window receive buffer.")
+                shard = recv_buffer[:chunk_rows]
             dist.broadcast(shard, src=src_global_rank, group=mesh.group_2d)
 
             if local_needs_chunk:
@@ -208,9 +215,45 @@ def gather_pair_embedding_in_dense_trunk_from_foldcp_local(
                         :,
                     ]
             del shard
-            if z_local.is_cuda:
-                torch.cuda.empty_cache()
     return out.contiguous()
+
+
+def _gather_pair_rows_one_by_p(
+    z_local: torch.Tensor,
+    z_spec: FoldCPPairShardSpec,
+    idx_q: torch.Tensor,
+    idx_k: torch.Tensor,
+    mesh: FoldCPProcessMesh,
+) -> torch.Tensor:
+    """Gather shared query rows from a 1xP column-sharded pair tensor."""
+
+    side = int(mesh.layout.shape[1])
+    tile_cols = int(z_spec.local_shape[z_spec.pair_dims[1]])
+    n_token = int(z_spec.original_shape[z_spec.pair_dims[1]])
+    batch = int(idx_q.shape[0])
+    n_query = int(idx_q.shape[1])
+    channels = int(z_local.shape[-1])
+
+    local_rows = z_local.index_select(0, idx_q.reshape(-1)).contiguous()
+    gathered_rows = z_local.new_empty((side * batch * n_query, tile_cols, channels))
+    dist.all_gather_into_tensor(
+        gathered_rows,
+        local_rows,
+        group=mesh.group_2d,
+    )
+    dense_rows = (
+        gathered_rows.reshape(side, batch, n_query, tile_cols, channels)
+        .permute(1, 2, 0, 3, 4)
+        .contiguous()
+        .reshape(batch, n_query, side * tile_cols, channels)[..., :n_token, :]
+    )
+    gather_index = idx_k[:, None, :, None].expand(
+        batch,
+        n_query,
+        idx_k.shape[1],
+        channels,
+    )
+    return torch.gather(dense_rows, dim=2, index=gather_index).contiguous()
 
 
 def gather_window_blocks(
@@ -413,5 +456,5 @@ def gather_window_attention_output(
     out_blocks = gather_window_blocks(local_out, spec, group, block_dim=-3)
     out = out_blocks.reshape(*out_blocks.shape[:-3], -1, out_blocks.shape[-1])
     if spec.q_pad > 0:
-        out = out[..., :-spec.q_pad, :]
+        out = out[..., : -spec.q_pad, :]
     return out.contiguous()

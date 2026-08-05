@@ -62,8 +62,8 @@ def infer_pair_dims(tensor: torch.Tensor, n_token: int) -> Optional[tuple[int, i
     return None
 
 
-def _padded_pair_size(n_pair: int, mesh_side: int) -> int:
-    return int(math.ceil(n_pair / mesh_side) * mesh_side)
+def _padded_pair_size(n_pair: int, partitions: int) -> int:
+    return int(math.ceil(n_pair / partitions) * partitions)
 
 
 def _slice_for_pair(
@@ -147,20 +147,22 @@ def shard_pair_tensor(
     n_col = tensor.shape[col_dim]
     if n_row != n_col:
         raise ValueError(f"pair tensor must be square, got {n_row} x {n_col}.")
-    mesh_side = mesh.layout.shape[0]
-    padded_n = _padded_pair_size(n_row, mesh_side)
+    mesh_rows, mesh_cols = mesh.layout.shape
+    padded_rows = _padded_pair_size(n_row, mesh_rows)
+    padded_cols = _padded_pair_size(n_col, mesh_cols)
     padded_shape = list(tensor.shape)
-    padded_shape[row_dim] = padded_n
-    padded_shape[col_dim] = padded_n
+    padded_shape[row_dim] = padded_rows
+    padded_shape[col_dim] = padded_cols
 
-    tile = padded_n // mesh_side
-    row_start = mesh.coord[0] * tile
-    col_start = mesh.coord[1] * tile
-    row_range = (row_start, row_start + tile)
-    col_range = (col_start, col_start + tile)
+    row_tile = padded_rows // mesh_rows
+    col_tile = padded_cols // mesh_cols
+    row_start = mesh.coord[0] * row_tile
+    col_start = mesh.coord[1] * col_tile
+    row_range = (row_start, row_start + row_tile)
+    col_range = (col_start, col_start + col_tile)
     local_shape = list(tensor.shape)
-    local_shape[row_dim] = tile
-    local_shape[col_dim] = tile
+    local_shape[row_dim] = row_tile
+    local_shape[col_dim] = col_tile
     local = tensor.new_full(tuple(local_shape), pad_value)
 
     valid_row_end = min(row_range[1], n_row)
@@ -206,21 +208,23 @@ def make_pair_shard_spec(
     n_col = original_shape[col_dim]
     if n_row != n_col:
         raise ValueError(f"pair tensor must be square, got {n_row} x {n_col}.")
-    mesh_side = mesh.layout.shape[0]
-    padded_n = _padded_pair_size(n_row, mesh_side)
+    mesh_rows, mesh_cols = mesh.layout.shape
+    padded_rows = _padded_pair_size(n_row, mesh_rows)
+    padded_cols = _padded_pair_size(n_col, mesh_cols)
     padded_shape = list(original_shape)
-    padded_shape[row_dim] = padded_n
-    padded_shape[col_dim] = padded_n
+    padded_shape[row_dim] = padded_rows
+    padded_shape[col_dim] = padded_cols
 
-    tile = padded_n // mesh_side
-    row_start = mesh.coord[0] * tile
-    col_start = mesh.coord[1] * tile
+    row_tile = padded_rows // mesh_rows
+    col_tile = padded_cols // mesh_cols
+    row_start = mesh.coord[0] * row_tile
+    col_start = mesh.coord[1] * col_tile
     return FoldCPPairShardSpec(
         original_shape=tuple(original_shape),
         padded_shape=tuple(padded_shape),
         pair_dims=pair_dims,
-        row_range=(row_start, row_start + tile),
-        col_range=(col_start, col_start + tile),
+        row_range=(row_start, row_start + row_tile),
+        col_range=(col_start, col_start + col_tile),
         mesh_shape=mesh.layout.shape,
         mesh_coord=mesh.coord,
     )
@@ -331,7 +335,9 @@ def gather_pair_tensor_like_to_rank(
             shard = torch.empty_like(local_tensor)
             src_global_rank = dist.get_global_rank(group, cp_rank)
             dist.recv(shard, src=src_global_rank, group=group)
-            _copy_pair_shard_into_output(full, shard, spec.pair_dims, row_range, col_range)
+            _copy_pair_shard_into_output(
+                full, shard, spec.pair_dims, row_range, col_range
+            )
     return full
 
 

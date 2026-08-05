@@ -21,6 +21,7 @@ from opendde.distributed.foldcp.metrics import (
 from opendde.distributed.foldcp.pair_sharding import shard_pair_tensor
 from opendde.distributed.foldcp.real_pairformer import (
     distributed_pairformer_stack_single_bridge_update,
+    foldcp_triatt_canonical_batch_scope,
 )
 from opendde.distributed.foldcp.trunk_init import (
     apply_trunk_z_cycle_local,
@@ -85,14 +86,11 @@ def update_input_feature_dict(input_feature_dict: dict[str, Any]) -> dict[str, A
         )  # [..., n_blocks, n_queries, n_keys, 3]
         v_lm = (
             q_trunked_list[1][..., None].int() == k_trunked_list[1][..., None, :].int()
-        ).unsqueeze(
-            dim=-1
-        )  # [..., n_blocks, n_queries, n_keys, 1]
+        ).unsqueeze(dim=-1)  # [..., n_blocks, n_queries, n_keys, 1]
         input_feature_dict["d_lm"] = d_lm
         input_feature_dict["v_lm"] = v_lm
         input_feature_dict["pad_info"] = pad_info
         return input_feature_dict
-
 
 
 class OpenDDE(nn.Module):
@@ -128,7 +126,9 @@ class OpenDDE(nn.Module):
             msa_configs=configs.data["msa"],
         )
         self.pairformer_stack = PairformerStack(**configs.model.pairformer)
-        diffusion_module_configs = copy.deepcopy(configs.model.diffusion_module.to_dict())
+        diffusion_module_configs = copy.deepcopy(
+            configs.model.diffusion_module.to_dict()
+        )
 
         self.diffusion_module = DiffusionModule(**diffusion_module_configs)
         self.distogram_head = DistogramHead(**configs.model.distogram_head)
@@ -173,8 +173,7 @@ class OpenDDE(nn.Module):
             structural_token_expansion_configs.structural_refiner
         )
         self.enable_structural_token_refiner = (
-            self.enable_structural_token_expansion
-            and structural_refiner_configs.enable
+            self.enable_structural_token_expansion and structural_refiner_configs.enable
         )
         if self.enable_structural_token_expansion:
             required_n_roles = max(STRUCTURAL_TOKEN_ROLES.values()) + 1
@@ -312,8 +311,7 @@ class OpenDDE(nn.Module):
         if missing_features:
             raise KeyError(
                 "Structural token expansion is enabled, but input_feature_dict is "
-                "missing required structural feature(s): "
-                + ", ".join(missing_features)
+                "missing required structural feature(s): " + ", ".join(missing_features)
             )
 
         parent = input_feature_dict["parent_residue_idx"].long()
@@ -433,6 +431,8 @@ class OpenDDE(nn.Module):
             mesh=mesh,
             z_res_spec=input_feature_dict.get("_foldcp_pair_z_spec"),
         )
+        if z_local.is_cuda and not torch.is_grad_enabled():
+            torch.cuda.empty_cache()
 
         structural_feature_dict["token_index"] = input_feature_dict[
             "structural_token_index"
@@ -477,6 +477,7 @@ class OpenDDE(nn.Module):
                 extra_attn_bias_is_local=True,
                 return_local_pair=True,
                 z_spec=z_spec,
+                chunk_size=chunk_size,
             )
         structural_feature_dict["_foldcp_pair_z_spec"] = z_spec
         self.drop_residue_only_features_for_structural_branch(structural_feature_dict)
@@ -493,13 +494,16 @@ class OpenDDE(nn.Module):
         structural_s: torch.Tensor,
         structural_z: torch.Tensor,
     ) -> tuple[dict[str, Any], torch.Tensor, torch.Tensor, torch.Tensor]:
-        if self.enable_structural_token_expansion and self.pair_output_space == "residue":
+        if (
+            self.enable_structural_token_expansion
+            and self.pair_output_space == "residue"
+        ):
             return residue_feature_dict, residue_s_inputs, residue_s, residue_z
         return structural_feature_dict, structural_s_inputs, structural_s, structural_z
 
     @staticmethod
     def drop_residue_only_features_for_structural_branch(
-        input_feature_dict: dict[str, Any]
+        input_feature_dict: dict[str, Any],
     ) -> None:
         """
         Keep MSA/template strictly residue-level.
@@ -527,8 +531,10 @@ class OpenDDE(nn.Module):
     ) -> torch.Tensor:
         n_struct = parent.numel()
         pair_index = (
-            parent[:, None] * n_residue + parent[None, :]
-        ).reshape(-1).to(device=values.device)
+            (parent[:, None] * n_residue + parent[None, :])
+            .reshape(-1)
+            .to(device=values.device)
+        )
         flat_values = values.reshape(*values.shape[:-2], n_struct * n_struct)
         prefix_shape = flat_values.shape[:-1]
         out = values.new_zeros(*prefix_shape, n_residue * n_residue)
@@ -551,8 +557,10 @@ class OpenDDE(nn.Module):
     ) -> torch.Tensor:
         n_struct = parent.numel()
         pair_index = (
-            parent[:, None] * n_residue + parent[None, :]
-        ).reshape(-1).to(device=values.device)
+            (parent[:, None] * n_residue + parent[None, :])
+            .reshape(-1)
+            .to(device=values.device)
+        )
         flat_values = values.reshape(*values.shape[:-2], n_struct * n_struct)
         prefix_shape = flat_values.shape[:-1]
         out = values.new_full(
@@ -578,8 +586,10 @@ class OpenDDE(nn.Module):
         n_struct = parent.numel()
         n_bins = probs.shape[-1]
         pair_index = (
-            parent[:, None] * n_residue + parent[None, :]
-        ).reshape(-1).to(device=probs.device)
+            (parent[:, None] * n_residue + parent[None, :])
+            .reshape(-1)
+            .to(device=probs.device)
+        )
         flat_probs = probs.reshape(*probs.shape[:-3], n_struct * n_struct, n_bins)
         prefix_shape = flat_probs.shape[:-2]
         out = probs.new_zeros(*prefix_shape, n_residue * n_residue, n_bins)
@@ -593,9 +603,7 @@ class OpenDDE(nn.Module):
             index=pair_index,
             src=probs.new_ones(n_struct * n_struct),
         )
-        out = out / counts.clamp_min(1).reshape(
-            (1,) * len(prefix_shape) + (-1, 1)
-        )
+        out = out / counts.clamp_min(1).reshape((1,) * len(prefix_shape) + (-1, 1))
         return out.reshape(*prefix_shape, n_residue, n_residue, n_bins)
 
     @staticmethod
@@ -628,9 +636,7 @@ class OpenDDE(nn.Module):
                 "Could not find a structural representative token for every parent "
                 f"residue: {representative_idx}"
             )
-        return torch.tensor(
-            representative_idx, dtype=torch.long, device=parent.device
-        )
+        return torch.tensor(representative_idx, dtype=torch.long, device=parent.device)
 
     def get_residue_level_confidence_inputs(
         self,
@@ -667,9 +673,7 @@ class OpenDDE(nn.Module):
                 "pae_logits": pae_logits.to(device=target_device),
                 "pde_logits": pde_logits.to(device=target_device),
                 "contact_probs": contact_probs.to(device=target_device),
-                "token_asym_id": input_feature_dict["asym_id"].to(
-                    device=target_device
-                ),
+                "token_asym_id": input_feature_dict["asym_id"].to(device=target_device),
                 "token_has_frame": input_feature_dict["has_frame"].to(
                     device=target_device
                 ),
@@ -714,9 +718,7 @@ class OpenDDE(nn.Module):
             ),
             "atom_to_token_idx": input_feature_dict[
                 "residue_level_atom_to_token_idx"
-            ].to(
-                device=target_device
-            ),
+            ].to(device=target_device),
         }
 
     def _shape_comp_effective_weight(self, weight_name: str) -> float:
@@ -1048,7 +1050,6 @@ class OpenDDE(nn.Module):
             sample_diffusion
         )(**_configs, **kwargs)
 
-
     @staticmethod
     def _foldcp_is_non_output_rank() -> bool:
         return (
@@ -1350,9 +1351,7 @@ class OpenDDE(nn.Module):
             atom_is_polymer=1 - input_feature_dict["is_ligand"],
             N_recycle=N_cycle,
             interested_atom_mask=None,
-            return_full_data=bool(
-                getattr(self.configs, "need_atom_confidence", False)
-            ),
+            return_full_data=bool(getattr(self.configs, "need_atom_confidence", False)),
             mol_id=None,
             elements_one_hot=None,
         )
@@ -1501,14 +1500,15 @@ class OpenDDE(nn.Module):
                 input_feature_dict["parent_residue_idx"].shape[-1]
             )
         with self._foldcp_stage_context("opendde_structural_token_expansion", N_token):
-            input_feature_dict, s_inputs, s, z = self.expand_to_structural_tokens(
-                input_feature_dict=input_feature_dict,
-                s_inputs=s_inputs,
-                s=s,
-                z=z,
-                inplace_safe=inplace_safe,
-                chunk_size=structural_chunk_size,
-            )
+            with foldcp_triatt_canonical_batch_scope(False):
+                input_feature_dict, s_inputs, s, z = self.expand_to_structural_tokens(
+                    input_feature_dict=input_feature_dict,
+                    s_inputs=s_inputs,
+                    s=s,
+                    z=z,
+                    inplace_safe=inplace_safe,
+                    chunk_size=structural_chunk_size,
+                )
         with self._foldcp_stage_context("opendde_pair_output_branch", N_token):
             (
                 pair_input_feature_dict,

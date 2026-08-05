@@ -681,7 +681,10 @@ def inference_jsons(
     "--foldcp_size_cp",
     type=int,
     default=1,
-    help="Number of context-parallel ranks; distributed mode requires a square value such as 4.",
+    help=(
+        "Number of context-parallel ranks; distributed mode uses a 1 x P mesh "
+        "and requires a value greater than 1."
+    ),
 )
 @click.option(
     "--foldcp_devices",

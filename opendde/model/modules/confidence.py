@@ -324,6 +324,7 @@ class ConfidenceHead(nn.Module):
                         foldcp_mesh=foldcp_mesh,
                         pair_mask=pair_mask,
                         x_pred_rep_coords=x_pred_rep_coords[..., i, :, :],
+                        chunk_size=chunk_size,
                         compute_plddt=compute_plddt,
                         compute_pae=compute_pae,
                         compute_pde=compute_pde,
@@ -391,6 +392,7 @@ class ConfidenceHead(nn.Module):
         foldcp_mesh: FoldCPProcessMesh,
         pair_mask: Optional[torch.Tensor],
         x_pred_rep_coords: torch.Tensor,
+        chunk_size: Optional[int] = None,
         compute_plddt: bool = True,
         compute_pae: bool = True,
         compute_pde: bool = True,
@@ -426,6 +428,7 @@ class ConfidenceHead(nn.Module):
                 ),
                 return_local_pair=True,
                 z_spec=z_pair_spec,
+                chunk_size=chunk_size,
             )
         )
         if compute_pae or compute_pde:
@@ -534,6 +537,7 @@ class ConfidenceHead(nn.Module):
                 foldcp_mesh=foldcp_mesh,
                 pair_mask=pair_mask,
                 x_pred_rep_coords=x_pred_rep_coords,
+                chunk_size=chunk_size,
                 compute_plddt=compute_plddt,
                 compute_pae=compute_pae,
                 compute_pde=compute_pde,

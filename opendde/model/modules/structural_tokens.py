@@ -7,6 +7,7 @@ import torch.nn as nn
 
 from opendde.data.tokenizer import STRUCTURAL_TOKEN_ROLES
 from opendde.distributed.foldcp.atom_window import (
+    _gather_pair_rows_one_by_p,
     gather_pair_embedding_in_dense_trunk_from_foldcp_local,
 )
 from opendde.distributed.foldcp.mesh import FoldCPProcessMesh
@@ -57,9 +58,7 @@ class StructuralTokenExpander(nn.Module):
                 "StructuralTokenExpander pair_chunk_size must be positive or None; "
                 f"got {pair_chunk_size}"
             )
-        self.pair_chunk_size = (
-            None if pair_chunk_size is None else int(pair_chunk_size)
-        )
+        self.pair_chunk_size = None if pair_chunk_size is None else int(pair_chunk_size)
         if pair_projection_mode not in {"full", "factorized", "none"}:
             raise ValueError(
                 "StructuralTokenExpander pair_projection_mode must be one of "
@@ -234,6 +233,14 @@ class StructuralTokenExpander(nn.Module):
     ) -> torch.Tensor:
         row_parent = parent.index_select(dim=0, index=row_index)
         col_parent = parent.index_select(dim=0, index=col_index)
+        if mesh.layout.shape[0] == 1:
+            return _gather_pair_rows_one_by_p(
+                z_local=z,
+                z_spec=z_spec,
+                idx_q=row_parent.unsqueeze(0),
+                idx_k=col_parent.unsqueeze(0),
+                mesh=mesh,
+            ).squeeze(0)
         return gather_pair_embedding_in_dense_trunk_from_foldcp_local(
             z_local=z,
             z_spec=z_spec,
@@ -275,8 +282,7 @@ class StructuralTokenExpander(nn.Module):
                     # DDP static_graph does not see role-dependent unused params.
                     dummy_use = dummy_use + projection(dummy_input).sum() * 0.0
         return (
-            flat_delta.reshape(*batch_shape, n_struct, n_struct, self.c_z)
-            + dummy_use
+            flat_delta.reshape(*batch_shape, n_struct, n_struct, self.c_z) + dummy_use
         )
 
     def _pair_project_by_role_full_chunk(
@@ -308,8 +314,7 @@ class StructuralTokenExpander(nn.Module):
                 else:
                     dummy_use = dummy_use + projection(dummy_input).sum() * 0.0
         return (
-            flat_delta.reshape(*batch_shape, chunk_len, n_struct, self.c_z)
-            + dummy_use
+            flat_delta.reshape(*batch_shape, chunk_len, n_struct, self.c_z) + dummy_use
         )
 
     def _pair_project_by_role_full_tile(
@@ -574,7 +579,10 @@ class StructuralTokenExpander(nn.Module):
             row_polymer_type[:, None] > 0
         )
         same_residue_twin = same_parent_residue & (
-            (row_is_backbone[:, None] & (col_is_sidechain[None, :] | col_is_base[None, :]))
+            (
+                row_is_backbone[:, None]
+                & (col_is_sidechain[None, :] | col_is_base[None, :])
+            )
             | (
                 col_is_backbone[None, :]
                 & (row_is_sidechain[:, None] | row_is_base[:, None])
@@ -880,9 +888,7 @@ class StructuralTokenExpander(nn.Module):
 
         n_struct = role.shape[-1]
         residue_batch_shape = (
-            z_res.shape[:-3]
-            if z_res_spec is None
-            else z_res_spec.original_shape[:-3]
+            z_res.shape[:-3] if z_res_spec is None else z_res_spec.original_shape[:-3]
         )
         z_shape = (*residue_batch_shape, n_struct, n_struct, self.c_z)
         z_spec = make_pair_shard_spec(z_shape, mesh, pair_dims=(-3, -2))

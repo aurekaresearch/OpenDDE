@@ -36,6 +36,18 @@ from opendde.model.utils import (
 )
 
 
+def _attention_pair_bias_row_chunk_size(n_token: int) -> int:
+    """Return the P-independent row launch size used by distributed FoldCP."""
+
+    n_token = int(n_token)
+    if n_token <= 512:
+        return n_token
+    value = int(os.environ.get("OPENDDE_PAIR_BIAS_ROW_CHUNK", "112"))
+    if value <= 0:
+        return n_token
+    return min(n_token, value)
+
+
 class AttentionPairBias(nn.Module):
     """
     Implements Algorithm 24 in AF3
@@ -121,7 +133,12 @@ class AttentionPairBias(nn.Module):
     def _foldcp_diffusion_bias_row_chunk_size() -> int:
         """Return the row chunk size for Fold-CP diffusion pair-bias streaming."""
 
-        if os.environ.get("OPENDDE_FOLDCP_MODE") != "distributed":
+        if (
+            os.environ.get("OPENDDE_FOLDCP_MODE") != "distributed"
+            or not dist.is_available()
+            or not dist.is_initialized()
+            or dist.get_world_size() <= 1
+        ):
             return 0
         value = os.environ.get("OPENDDE_FOLDCP_DIFFUSION_BIAS_ROW_CHUNK", "128")
         return max(int(value or "0"), 0)
@@ -272,7 +289,9 @@ class AttentionPairBias(nn.Module):
 
         if any(item is None for item in gathered):
             raise RuntimeError("failed to collect Fold-CP diffusion attention rows.")
-        full_out = torch.cat([item for item in gathered if item is not None], dim=row_dim)
+        full_out = torch.cat(
+            [item for item in gathered if item is not None], dim=row_dim
+        )
         slices = [slice(None)] * full_out.dim()
         slices[row_dim] = slice(0, n_token)
         return full_out[tuple(slices)].contiguous()
@@ -366,33 +385,14 @@ class AttentionPairBias(nn.Module):
                 [item for item in gathered_bias if item is not None],
                 dim=-1,
             )[..., : q.shape[-2]].contiguous()
-            if q.shape[-2] >= 1024:
-                q_source = q_proj.new_zeros(q_proj.shape)
-                q_source[..., row_start:row_end, :] = q_proj_chunk
-                bias_source = row_bias.new_zeros(
-                    *row_bias.shape[:-2],
-                    q.shape[-2],
-                    q.shape[-2],
-                )
-                bias_source[..., row_start:row_end, :] = row_bias
-                raw_source = _attention(
-                    q=q_source.contiguous(),
-                    k=k_proj.contiguous(),
-                    v=v_proj.contiguous(),
-                    attn_bias=bias_source.contiguous(),
-                    use_efficient_implementation=self.attention.use_efficient_implementation,
-                    inplace_safe=inplace_safe,
-                )
-                raw_chunk = raw_source[..., row_start:row_end, :]
-            else:
-                raw_chunk = _attention(
-                    q=q_proj_chunk,
-                    k=k_proj,
-                    v=v_proj,
-                    attn_bias=row_bias,
-                    use_efficient_implementation=self.attention.use_efficient_implementation,
-                    inplace_safe=inplace_safe,
-                )
+            raw_chunk = _attention(
+                q=q_proj_chunk,
+                k=k_proj,
+                v=v_proj,
+                attn_bias=row_bias,
+                use_efficient_implementation=self.attention.use_efficient_implementation,
+                inplace_safe=inplace_safe,
+            )
             local_raw[..., :valid_rows, :, :] = raw_chunk.transpose(-2, -3)
 
         full_raw = self._foldcp_gather_rows_by_col_ring(
@@ -519,7 +519,9 @@ class AttentionPairBias(nn.Module):
             while mask.dim() < attn_bias.dim():
                 mask = mask.unsqueeze(dim=0)
             attn_bias = attn_bias.masked_fill(~mask, -1e10)
-            attn_bias = attn_bias + bias.to(dtype=attn_bias.dtype, device=attn_bias.device)
+            attn_bias = attn_bias + bias.to(
+                dtype=attn_bias.dtype, device=attn_bias.device
+            )
 
             out = _attention(
                 q=q_proj_local,
@@ -1407,7 +1409,9 @@ class AtomAttentionEncoder(nn.Module):
             p_chunk = (
                 p_chunk
                 + self.linear_no_bias_cl(F.relu(c_l_q[tuple(q_target)][..., None, :]))
-                + self.linear_no_bias_cm(F.relu(c_l_k[tuple(k_target)][..., None, :, :]))
+                + self.linear_no_bias_cm(
+                    F.relu(c_l_k[tuple(k_target)][..., None, :, :])
+                )
             )
             p_lm[tuple(p_target)] = p_chunk + self.small_mlp(p_chunk)
         return p_lm
@@ -1430,6 +1434,67 @@ class AtomAttentionEncoder(nn.Module):
             + self.linear_no_bias_cm(F.relu(c_l_k[..., None, :, :]))
         )
         return p_lm + self.small_mlp(p_lm)
+
+    def _add_atom_single_context_and_mlp_foldcp_local(
+        self,
+        p_lm: torch.Tensor,
+        c_l_q: torch.Tensor,
+        c_l_k: torch.Tensor,
+        *,
+        block_start: int,
+        n_windows: int,
+        inplace_safe: bool = False,
+    ) -> torch.Tensor:
+        """Preserve serial 64-window CUDA launch boundaries for a local shard."""
+
+        window_chunk_size = 64
+        local_windows = p_lm.shape[-4]
+        block_end = min(block_start + local_windows, n_windows)
+        output = torch.zeros_like(p_lm)
+        canonical_start = (block_start // window_chunk_size) * window_chunk_size
+
+        for chunk_start in range(canonical_start, block_end, window_chunk_size):
+            chunk_end = min(chunk_start + window_chunk_size, n_windows)
+            overlap_start = max(block_start, chunk_start)
+            overlap_end = min(block_end, chunk_end)
+            if overlap_start >= overlap_end:
+                continue
+
+            launch_windows = chunk_end - chunk_start
+            local_start = overlap_start - block_start
+            local_end = overlap_end - block_start
+            launch_start = overlap_start - chunk_start
+            launch_end = overlap_end - chunk_start
+
+            p_shape = list(p_lm.shape)
+            p_shape[-4] = launch_windows
+            q_shape = list(c_l_q.shape)
+            q_shape[-3] = launch_windows
+            k_shape = list(c_l_k.shape)
+            k_shape[-3] = launch_windows
+            p_launch = p_lm.new_zeros(p_shape)
+            q_launch = c_l_q.new_zeros(q_shape)
+            k_launch = c_l_k.new_zeros(k_shape)
+
+            p_launch[..., launch_start:launch_end, :, :, :] = p_lm[
+                ..., local_start:local_end, :, :, :
+            ]
+            q_launch[..., launch_start:launch_end, :, :] = c_l_q[
+                ..., local_start:local_end, :, :
+            ]
+            k_launch[..., launch_start:launch_end, :, :] = c_l_k[
+                ..., local_start:local_end, :, :
+            ]
+            updated = self._add_atom_single_context_and_mlp(
+                p_lm=p_launch,
+                c_l_q=q_launch,
+                c_l_k=k_launch,
+                inplace_safe=inplace_safe,
+            )
+            output[..., local_start:local_end, :, :, :] = updated[
+                ..., launch_start:launch_end, :, :, :
+            ]
+        return output
 
     def _project_pair_embedding_in_dense_trunk_from_foldcp_local(
         self,
@@ -1522,7 +1587,9 @@ class AtomAttentionEncoder(nn.Module):
             z_norm = self.layernorm_z(z_window)
             if source_rows is None:
                 return self.linear_no_bias_z(z_norm)
-            local_rows = int(z_norm.numel() // z_norm.shape[-1]) if z_norm.shape[-1] else 0
+            local_rows = (
+                int(z_norm.numel() // z_norm.shape[-1]) if z_norm.shape[-1] else 0
+            )
             if source_rows <= local_rows:
                 return self.linear_no_bias_z(z_norm)
             flat = z_norm.contiguous().reshape(local_rows, z_norm.shape[-1])
@@ -1624,9 +1691,7 @@ class AtomAttentionEncoder(nn.Module):
             if local_chunk_blocks > 0:
                 z_norm = self.layernorm_z(z_window_chunk)
                 local_rows = (
-                    int(z_norm.numel() // z_norm.shape[-1])
-                    if z_norm.shape[-1]
-                    else 0
+                    int(z_norm.numel() // z_norm.shape[-1]) if z_norm.shape[-1] else 0
                 )
                 source_chunk_rows = (
                     (source_end - source_start) * self.n_queries * self.n_keys
@@ -1637,9 +1702,9 @@ class AtomAttentionEncoder(nn.Module):
                     flat = z_norm.contiguous().reshape(local_rows, z_norm.shape[-1])
                     launch = flat.new_zeros(int(source_chunk_rows), flat.shape[-1])
                     launch[:local_rows].copy_(flat)
-                    projected_chunk = self.linear_no_bias_z(launch)[:local_rows].reshape(
-                        *z_norm.shape[:-1], -1
-                    )
+                    projected_chunk = self.linear_no_bias_z(launch)[
+                        :local_rows
+                    ].reshape(*z_norm.shape[:-1], -1)
                 projected[..., local_slice, :, :, :] = projected_chunk
             del z_window_chunk
         return projected
@@ -1803,16 +1868,18 @@ class AtomAttentionEncoder(nn.Module):
                 if valid_blocks > 0:
                     local_idx_q[:valid_blocks] = atom_to_token_idx_q[valid_slice]
                     local_idx_k[:valid_blocks] = atom_to_token_idx_k[valid_slice]
-                z_token_pair = self._project_pair_embedding_in_dense_trunk_from_foldcp_local(
-                    z_local=z,
-                    z_spec=z_spec,
-                    idx_q=local_idx_q,
-                    idx_k=local_idx_k,
-                    mesh=mesh,
-                    out=z_token_pair,
-                    block_start=block_start,
-                    n_windows=int(n_windows),
-                    window_chunk_size=64,
+                z_token_pair = (
+                    self._project_pair_embedding_in_dense_trunk_from_foldcp_local(
+                        z_local=z,
+                        z_spec=z_spec,
+                        idx_q=local_idx_q,
+                        idx_k=local_idx_k,
+                        mesh=mesh,
+                        out=z_token_pair,
+                        block_start=block_start,
+                        n_windows=int(n_windows),
+                        window_chunk_size=64,
+                    )
                 )
             elif valid_blocks > 0:
                 z_valid = gather_pair_embedding_in_dense_trunk(
@@ -2072,7 +2139,9 @@ class AtomAttentionEncoder(nn.Module):
         window_spec: Optional[FoldCPWindowShardSpec] = None,
         z_spec: Optional[FoldCPPairShardSpec] = None,
         inplace_safe: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, FoldCPWindowShardSpec]:
+    ) -> tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, FoldCPWindowShardSpec
+    ]:
         if self.has_coords:
             assert r_l is not None
             assert s is not None
@@ -2138,16 +2207,14 @@ class AtomAttentionEncoder(nn.Module):
         if block_start < valid_end:
             valid_blocks = valid_end - block_start
             valid_slice = slice(block_start, valid_end)
-            c_l_q_local[..., :valid_blocks, :, :] = c_l_q[
-                ..., valid_slice, :, :
-            ]
-            c_l_k_local[..., :valid_blocks, :, :] = c_l_k[
-                ..., valid_slice, :, :
-            ]
-        p_lm = self._add_atom_single_context_and_mlp_local(
+            c_l_q_local[..., :valid_blocks, :, :] = c_l_q[..., valid_slice, :, :]
+            c_l_k_local[..., :valid_blocks, :, :] = c_l_k[..., valid_slice, :, :]
+        p_lm = self._add_atom_single_context_and_mlp_foldcp_local(
             p_lm=p_lm,
             c_l_q=c_l_q_local,
             c_l_k=c_l_k_local,
+            block_start=block_start,
+            n_windows=window_spec.n_windows,
             inplace_safe=inplace_safe,
         )
 

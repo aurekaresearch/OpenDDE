@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 
 import torch.distributed as dist
@@ -41,8 +40,8 @@ class FoldCPProcessMesh:
                 f"got {world_size} vs {config.size_dp} * {config.size_cp}."
             )
 
-        side = math.isqrt(config.size_cp)
-        layout = FoldCP2DLayout((side, side))
+        layout = FoldCP2DLayout(config.cp_mesh_shape)
+        rows, cols = layout.shape
         world_rank = dist.get_rank()
         dp_index = world_rank // config.size_cp
         cp_offset = dp_index * config.size_cp
@@ -61,18 +60,16 @@ class FoldCPProcessMesh:
             group = dist.new_group(list(block_ranks))
             if dp == dp_index:
                 selected_group_2d = group
-            for row in range(side):
+            for row in range(rows):
                 row_ranks = [
-                    block_offset + layout.to_linear((row, col))
-                    for col in range(side)
+                    block_offset + layout.to_linear((row, col)) for col in range(cols)
                 ]
                 group = dist.new_group(row_ranks)
                 if dp == dp_index and row == coord[0]:
                     selected_row_group = group
-            for col in range(side):
+            for col in range(cols):
                 col_ranks = [
-                    block_offset + layout.to_linear((row, col))
-                    for row in range(side)
+                    block_offset + layout.to_linear((row, col)) for row in range(rows)
                 ]
                 group = dist.new_group(col_ranks)
                 if dp == dp_index and col == coord[1]:

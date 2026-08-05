@@ -55,7 +55,6 @@ from opendde.distributed.foldcp.real_pairformer import (
 )
 from opendde.distributed.foldcp.opm import (
     FoldCPMSAShardSpec,
-    distributed_outer_product_mean,
     serial_outer_product_mean,
     shard_msa_tensor_for_opm,
 )
@@ -106,7 +105,6 @@ __all__ = [
     "infer_pair_dims",
     "measure_foldcp_stage",
     "online_softmax_update",
-    "distributed_outer_product_mean",
     "distributed_pairformer_block_pair_update",
     "distributed_pairformer_stack_single_bridge_update",
     "distributed_pairformer_stack_pair_update",

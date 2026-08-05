@@ -1,15 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Aureka AI Research
-"""Runtime flags for the Fold-CP migration.
-
-The migration intentionally has one user-facing switch: keep the original
-single-card path, or run the four-card context-parallel path once each stage is
-ported. Other knobs such as dtype, MSA, templates, and chunk size stay orthogonal.
-"""
+"""Runtime flags for single-process or multi-GPU 1 x P Fold-CP inference."""
 
 from __future__ import annotations
 
-import math
 import os
 from dataclasses import asdict, dataclass
 from typing import Any, Literal
@@ -78,11 +72,6 @@ class FoldCPConfig:
         if self.mode == "single" and self.size_cp != 1:
             raise ValueError("foldcp_mode='single' requires foldcp_size_cp=1.")
         if self.mode == "distributed":
-            sqrt_cp = math.isqrt(self.size_cp)
-            if sqrt_cp * sqrt_cp != self.size_cp:
-                raise ValueError(
-                    "foldcp_size_cp must be a perfect square for the 2D CP mesh."
-                )
             if self.size_cp == 1:
                 raise ValueError(
                     "foldcp_mode='distributed' requires foldcp_size_cp > 1."
@@ -95,8 +84,9 @@ class FoldCPConfig:
 
     @property
     def cp_mesh_shape(self) -> tuple[int, int]:
-        side = math.isqrt(self.size_cp)
-        return (side, side)
+        if not self.enabled:
+            return (1, 1)
+        return (1, self.size_cp)
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)

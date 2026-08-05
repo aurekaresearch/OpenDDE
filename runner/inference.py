@@ -55,6 +55,12 @@ logger = logging.getLogger(__name__)
 _DISTRIBUTED_STARTUP_TIMEOUT = timedelta(hours=2)
 
 
+def _default_foldcp_cuda_memory_fraction(size_cp: int) -> float:
+    """Do not impose an artificial allocator limit by default."""
+
+    return 0.0
+
+
 def _download_inference_assets(configs: OpenDDEConfig) -> None:
     """Prepare shared inference assets once and synchronize all ranks."""
     if DIST_WRAPPER.world_size <= 1:
@@ -173,6 +179,7 @@ class InferenceRunner(object):
                 f"LOCAL_RANK: {DIST_WRAPPER.local_rank} - CUDA_VISIBLE_DEVICES: [{devices}]"
             )
             torch.cuda.set_device(self.device)
+            self._configure_foldcp_cuda_memory_fraction()
 
         self.configs = apply_runtime_compatibility(self.configs, self.device)
 
@@ -207,6 +214,33 @@ class InferenceRunner(object):
 
         logging.info("Selected inference device: %s", self.device)
         logging.info("Finished environment initialization.")
+
+    def _configure_foldcp_cuda_memory_fraction(self) -> None:
+        if not self.foldcp_config.enabled:
+            return
+        default_fraction = _default_foldcp_cuda_memory_fraction(
+            self.foldcp_config.size_cp
+        )
+        value = os.environ.get(
+            "OPENDDE_FOLDCP_CUDA_MEMORY_FRACTION",
+            str(default_fraction),
+        )
+        fraction = float(value)
+        if fraction <= 0:
+            return
+        if fraction > 1:
+            raise ValueError(
+                "OPENDDE_FOLDCP_CUDA_MEMORY_FRACTION must be in (0, 1] or "
+                f"non-positive to disable; got {fraction}"
+            )
+        torch.cuda.set_per_process_memory_fraction(
+            fraction,
+            device=DIST_WRAPPER.local_rank,
+        )
+        logging.info(
+            "Fold-CP CUDA allocator memory fraction: %.3f",
+            fraction,
+        )
 
     def close(self) -> None:
         """Restore process-global state and release Runner-owned resources."""

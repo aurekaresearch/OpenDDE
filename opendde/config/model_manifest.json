@@ -2,7 +2,7 @@
   "schema_version": 1,
   "package": {
     "name": "opendde",
-    "version": "1.0.2"
+    "version": "1.0.3"
   },
   "source": {
     "repository": "https://huggingface.co/aurekaresearch/OpenDDE",

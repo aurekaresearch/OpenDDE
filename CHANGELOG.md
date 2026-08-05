@@ -6,6 +6,35 @@ User-facing changes to OpenDDE are documented here.
 
 No changes yet.
 
+## [1.0.3] - 2026-08-05
+
+### Added
+
+- Extended multi-GPU Fold-CP inference to a `1 x P` context-parallel topology
+  for arbitrary launched world sizes `P > 1`, including non-square GPU counts.
+
+### Fixed
+
+- Preserved ion entities in MSA and template feature metadata, preventing
+  missing or shifted asymmetric-chain mappings for ion-containing inputs.
+  Thanks to [@MoritzErtelt](https://github.com/MoritzErtelt) for contributing
+  this fix in [#18](https://github.com/aurekaresearch/OpenDDE/pull/18).
+- Replaced square-mesh assumptions in Fold-CP pair, atom, confidence, distogram,
+  MSA, and trunk paths with the current `1 x P` layouts.
+- Removed the legacy `distributed_outer_product_mean` helper, whose local pair
+  layout was incompatible with `1 x P`; the runtime uses the integrated
+  Pairformer OPM path.
+- Aligned Fold-CP documentation with the CUDA BF16 execution path and replaced
+  unverifiable benchmark and capacity claims with a reproducible validation
+  procedure.
+
+### Compatibility
+
+- Multi-GPU Fold-CP requires
+  `--triatt_kernel torch --trimul_kernel torch`; cuEquivariance triangle
+  kernels remain unsupported in this mode. CUDA BF16 Fold-CP triangle attention
+  additionally uses Triton 3.3.1 for attention-bias fusion.
+
 ## [1.0.2] - 2026-07-17
 
 ### Fixed
@@ -44,7 +73,8 @@ For installation and upgrade commands, see the
 
 - Initial PyPI bootstrap release of the `opendde` package name.
 
-[Unreleased]: https://github.com/aurekaresearch/OpenDDE/compare/v1.0.2...HEAD
+[Unreleased]: https://github.com/aurekaresearch/OpenDDE/compare/v1.0.3...HEAD
+[1.0.3]: https://github.com/aurekaresearch/OpenDDE/releases/tag/v1.0.3
 [1.0.2]: https://github.com/aurekaresearch/OpenDDE/releases/tag/v1.0.2
 [1.0.1]: https://github.com/aurekaresearch/OpenDDE/releases/tag/v1.0.1
 [1.0.0]: https://pypi.org/project/opendde/1.0.0/

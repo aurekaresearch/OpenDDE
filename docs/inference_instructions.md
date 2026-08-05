@@ -241,22 +241,24 @@ Device auto-selection uses NVIDIA CUDA when available and otherwise CPU.
 cuEquivariance is selected only when its Linux CUDA packages import successfully;
 otherwise the model uses PyTorch triangle kernels.
 
-## 4-GPU Fold-CP inference
+## Multi-GPU Fold-CP inference
 
 > [!IMPORTANT]
 > Fold-CP inference does not currently support cuEquivariance (`cueq`) triangle
-> kernels. Triangle attention and triangle multiplication therefore use the
-> native PyTorch Fold-CP implementations by default. cuEquivariance acceleration
-> will remain unavailable in Fold-CP mode until upstream support is added.
+> kernels. Select the distributed PyTorch implementations with
+> `--triatt_kernel torch --trimul_kernel torch`. On CUDA BF16, Fold-CP triangle
+> attention also uses Triton 3.3.1 from the GPU install extra to fuse
+> attention-bias addition; this Triton helper is separate from cuEquivariance.
 
-Fold-CP distributes token-pair-heavy inference work over four GPUs. Launch it
-with `torchrun` and expose exactly the GPUs you want to use:
+Fold-CP distributes token-pair-heavy inference work over a `1 x P` mesh, where
+`P` can be any available GPU count greater than one. Launch it with `torchrun`
+and expose exactly the GPUs you want to use. For example, four GPUs use:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node 4 \
   -m runner.batch_inference pred \
   -i examples/protein_200.json \
-  -o ./output_cp4 \
+  -o ./output_foldcp \
   -n opendde_v1 \
   --use_msa false \
   --use_template false \
@@ -264,6 +266,8 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node 4 \
   --sample 1 \
   --step 200 \
   --cycle 10 \
+  --trimul_kernel torch \
+  --triatt_kernel torch \
   --foldcp_mode distributed \
   --foldcp_size_dp 1 \
   --foldcp_size_cp 4
@@ -271,13 +275,14 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node 4 \
 
 Runtime notes:
 
-- `--nproc_per_node 4` must match `--foldcp_size_dp 1` times
-  `--foldcp_size_cp 4`.
-- `--foldcp_size_cp 4` creates a 2 x 2 context-parallel mesh.
+- `--nproc_per_node P` must match `--foldcp_size_dp 1` times
+  `--foldcp_size_cp P`.
+- `--foldcp_size_cp P` creates a `1 x P` context-parallel mesh. The example
+  uses `P=4`; other GPU counts require changing both `4` values.
 - Keep the input, model, dtype, cycle, step, sample, MSA, and template settings
-  identical when comparing single-GPU and Fold-CP outputs. Use
-  `--triatt_kernel torch --trimul_kernel torch` for the single-GPU baseline so
-  both paths use PyTorch triangle kernels.
+  identical when comparing single-GPU and Fold-CP outputs. Select
+  `--triatt_kernel torch --trimul_kernel torch` for both runs; the distributed
+  CUDA BF16 path additionally uses Triton for attention-bias fusion.
 - Outputs are written under the requested `-o/--out_dir` just like normal
   inference.
 - Optional `--foldcp_metrics_jsonl path/to/metrics.jsonl` records Fold-CP timing
@@ -326,8 +331,10 @@ Outputs are written to:
 | `--use_template` | Use/generate template features. |
 | `--use_rna_msa` | Use/generate RNA MSA features. |
 | `--use_tfg_guidance` | Enable Training-Free Guidance. |
-| `--foldcp_mode` | `single` or `distributed`; use `distributed` with `torchrun` for four-GPU Fold-CP inference. |
-| `--foldcp_size_cp` | Number of context-parallel ranks. Four-GPU Fold-CP uses `4`. |
+| `--foldcp_mode` | `single` or `distributed`; use `distributed` with `torchrun` for multi-GPU Fold-CP inference. |
+| `--foldcp_size_dp` | Number of data-parallel ranks. Use `1` for the documented `1 x P` Fold-CP topology. |
+| `--foldcp_size_cp` | Number of context-parallel ranks in the `1 x P` mesh; must match the launched process count when `size_dp=1`. |
+| `--foldcp_devices` | Optional visible-device list recorded in Fold-CP metrics; actual GPU visibility is controlled by `CUDA_VISIBLE_DEVICES`. |
 | `--foldcp_metrics_jsonl` | Optional JSONL path for Fold-CP timing and memory metrics. |
 | `--dtype` | `bf16` or `fp32`. |
 | `--device` | `auto`, `cpu`, or `cuda`; auto uses CUDA when available and otherwise CPU. |

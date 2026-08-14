@@ -105,6 +105,7 @@ def skip_random_init():
     * trunc_normal_init_ in opendde.model.modules.primitives
     * reset_parameters in torch.nn.Linear which includes kaiminig_uniform_
     """
+
     def _noop_init(*_args, **_kwargs):
         pass
 

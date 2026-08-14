@@ -31,7 +31,9 @@ def serial_structural_pair_context(
 
     z_parent = z_res.index_select(1, parent).index_select(2, parent)
     role_pair_type = structural_role_pair_type(role, role_pair_embedding.shape[0])
-    return z_parent + role_pair_embedding.index_select(0, role_pair_type.reshape(-1)).reshape(
+    return z_parent + role_pair_embedding.index_select(
+        0, role_pair_type.reshape(-1)
+    ).reshape(
         role.shape[0],
         role.shape[0],
         z_res.shape[-1],
@@ -49,7 +51,9 @@ def distributed_structural_pair_context(
 
     n_struct = parent.shape[0]
     if n_struct % mesh.layout.shape[0] != 0:
-        raise ValueError("Task8 structural pair context expects n_struct divisible by mesh side.")
+        raise ValueError(
+            "Task8 structural pair context expects n_struct divisible by mesh side."
+        )
     tile = n_struct // mesh.layout.shape[0]
     row_start = mesh.coord[0] * tile
     col_start = mesh.coord[1] * tile

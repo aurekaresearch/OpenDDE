@@ -8,7 +8,9 @@ from opendde.data.core.featurizer import Featurizer
 from opendde.data.tokenizer import Token, TokenArray
 
 
-def _token(role: str, parent: int, has_frame: int, frame_atom_index: list[int]) -> Token:
+def _token(
+    role: str, parent: int, has_frame: int, frame_atom_index: list[int]
+) -> Token:
     token = Token(0)
     token.subtoken_role = role
     token.parent_residue_idx = parent

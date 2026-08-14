@@ -40,6 +40,9 @@ jobs:
       - name: Run lint
         run: .venv/bin/ruff check .
 
+      - name: Check formatting
+        run: .venv/bin/ruff format --check .
+
   tests:
     name: Python ${{ matrix.python-version }} CPU tests
     runs-on: ubuntu-24.04

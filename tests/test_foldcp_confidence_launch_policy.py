@@ -44,7 +44,9 @@ def test_foldcp_confidence_non_output_rank_processes_every_sample(monkeypatch):
         calls.append(tuple(kwargs["x_pred_rep_coords"].shape))
         return None, None, None, None
 
-    monkeypatch.setattr(head, "memory_efficient_forward_foldcp_local", fake_foldcp_local)
+    monkeypatch.setattr(
+        head, "memory_efficient_forward_foldcp_local", fake_foldcp_local
+    )
 
     result = head.forward(
         input_feature_dict={},

@@ -15,7 +15,9 @@ from opendde.distributed.foldcp.layout import FoldCP2DLayout
 
 def _require_dist(group: Optional[dist.ProcessGroup]) -> dist.ProcessGroup:
     if not dist.is_available() or not dist.is_initialized():
-        raise RuntimeError("torch.distributed must be initialized before Fold-CP comms.")
+        raise RuntimeError(
+            "torch.distributed must be initialized before Fold-CP comms."
+        )
     return dist.group.WORLD if group is None else group
 
 
@@ -44,10 +46,14 @@ class One2OneComm:
         if (rank_send_to == self.rank) != (rank_recv_from == self.rank):
             raise ValueError("asymmetric self send/recv is not supported.")
         self.global_send_to = (
-            rank_send_to if self.is_self_comm else dist.get_global_rank(self.group, rank_send_to)
+            rank_send_to
+            if self.is_self_comm
+            else dist.get_global_rank(self.group, rank_send_to)
         )
         self.global_recv_from = (
-            rank_recv_from if self.is_self_comm else dist.get_global_rank(self.group, rank_recv_from)
+            rank_recv_from
+            if self.is_self_comm
+            else dist.get_global_rank(self.group, rank_recv_from)
         )
         self.parity = bool(self.rank % 2) if parity is None else bool(parity)
         self._queue: list[dist.P2POp] = []
@@ -77,7 +83,9 @@ class One2OneComm:
 
         return self._prepare(to_send=to_send, to_recv=to_recv)
 
-    def exchange(self, to_send: torch.Tensor, to_recv: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def exchange(
+        self, to_send: torch.Tensor, to_recv: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         recv = self.enqueue_to_dispatch(to_send=to_send, to_recv=to_recv)
         self.wait_until_finished()
         return recv

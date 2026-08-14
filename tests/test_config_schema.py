@@ -89,7 +89,9 @@ def test_configdict_access_compatibility():
         "c_token": 384,
     }
     # `.to_dict()` parity with `.model_dump()`
-    assert cfg.model.diffusion_module.to_dict() == cfg.model.diffusion_module.model_dump()
+    assert (
+        cfg.model.diffusion_module.to_dict() == cfg.model.diffusion_module.model_dump()
+    )
 
 
 def test_runtime_mutation_is_preserved():

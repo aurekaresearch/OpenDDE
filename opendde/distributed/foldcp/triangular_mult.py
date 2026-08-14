@@ -225,9 +225,7 @@ def distributed_triangle_multiplication(
     if a_local.ndim != 4:
         raise ValueError("triangle multiplication expects [B, N_local, N_local, C].")
 
-    channel_chunk_size = int(
-        os.environ.get("OPENDDE_FOLDCP_TRIMUL_CHANNEL_CHUNK", "8")
-    )
+    channel_chunk_size = int(os.environ.get("OPENDDE_FOLDCP_TRIMUL_CHANNEL_CHUNK", "8"))
     if 0 < channel_chunk_size < a_local.shape[-1]:
         out = torch.empty_like(a_local)
         for channel_start in range(0, a_local.shape[-1], channel_chunk_size):

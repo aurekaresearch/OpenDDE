@@ -37,7 +37,9 @@ def distributed_ring_attention(
             v_ready,
             bias_ready,
         )
-        out, lse, amax = online_softmax_update(block_out, block_lse, block_amax, out, lse, amax)
+        out, lse, amax = online_softmax_update(
+            block_out, block_lse, block_amax, out, lse, amax
+        )
         if step < ring.layout.shape[1] - 1:
             k_ready = ring.comm_row.exchange(k_ready)
             v_ready = ring.comm_row.exchange(v_ready)

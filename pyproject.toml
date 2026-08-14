@@ -78,7 +78,7 @@ opendde = "runner.cli:opendde_cli"
 dev = [
   "pre-commit>=3.7",
   "pytest>=8",
-  "ruff>=0.8.6",
+  "ruff>=0.16.3",
 ]
 release = [
   "twine>=5.1",

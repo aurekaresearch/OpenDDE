@@ -139,9 +139,7 @@ class LazyRelativePositionEncodingFeatures:
         sym_col = self.sym_id[..., col_slice]
 
         b_same_chain = (asym_row[..., :, None] == asym_col[..., None, :]).long()
-        b_same_residue = (
-            residue_row[..., :, None] == residue_col[..., None, :]
-        ).long()
+        b_same_residue = (residue_row[..., :, None] == residue_col[..., None, :]).long()
         b_same_entity = (entity_row[..., :, None] == entity_col[..., None, :]).long()
 
         d_residue = torch.clip(
@@ -155,9 +153,9 @@ class LazyRelativePositionEncodingFeatures:
             input=token_row[..., :, None] - token_col[..., None, :] + self.r_max,
             min=0,
             max=2 * self.r_max,
-        ) * b_same_chain * b_same_residue + (
-            1 - b_same_chain * b_same_residue
-        ) * (2 * self.r_max + 1)
+        ) * b_same_chain * b_same_residue + (1 - b_same_chain * b_same_residue) * (
+            2 * self.r_max + 1
+        )
         a_rel_token = F.one_hot(d_token, 2 * (self.r_max + 1))
 
         d_chain = torch.clip(

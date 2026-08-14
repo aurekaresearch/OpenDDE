@@ -150,6 +150,7 @@ class DataDumper:
             seed=seed,
             sorted_indices=sorted_indices,
         )
+
     def _save_structure(
         self,
         pred_coordinates: torch.Tensor,

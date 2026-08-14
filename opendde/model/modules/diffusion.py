@@ -94,7 +94,9 @@ def _foldcp_diffusion_cache_pair_z_projection_fits(
     max_bytes = _foldcp_diffusion_cache_pair_z_projection_max_bytes()
     if max_bytes <= 0:
         return False
-    layernorm_workspace_bytes = int(valid_rows) * int(n_token) * int(feature_dim) * 4 * 3
+    layernorm_workspace_bytes = (
+        int(valid_rows) * int(n_token) * int(feature_dim) * 4 * 3
+    )
     return layernorm_workspace_bytes <= max_bytes
 
 
@@ -255,9 +257,8 @@ class DiffusionConditioning(nn.Module):
         source_rows = int(original_n) * int(original_n)
         launch = flat.new_zeros(source_rows, flat.shape[-1])
         row_offsets = (
-            (torch.arange(valid_rows, device=x.device) + int(row_start))
-            * int(original_n)
-        )
+            torch.arange(valid_rows, device=x.device) + int(row_start)
+        ) * int(original_n)
         source_index = (
             row_offsets[:, None]
             + torch.arange(int(original_n), device=x.device)[None, :]
@@ -713,9 +714,13 @@ class DiffusionConditioning(nn.Module):
         valid_rows = max(0, min(row_end, n_token) - row_start)
         if valid_rows == 0:
             return pair_z_row_slab.contiguous()
-        flat = pair_z_row_slab[..., :valid_rows, :n_token, :].contiguous().reshape(
-            valid_rows * n_token,
-            pair_z_row_slab.shape[-1],
+        flat = (
+            pair_z_row_slab[..., :valid_rows, :n_token, :]
+            .contiguous()
+            .reshape(
+                valid_rows * n_token,
+                pair_z_row_slab.shape[-1],
+            )
         )
         global_flat_start = row_start * n_token
         source_rows = n_token * n_token
@@ -1305,12 +1310,14 @@ class DiffusionModule(nn.Module):
                 else:
                     s_trunk = 0 * s_trunk
                     z_trunk_for_cache = 0 * z_trunk
-            pair_z, pair_z_spec = self.diffusion_conditioning.prepare_cache_foldcp_local(
-                input_feature_dict["relp"],
-                z_trunk_for_cache,
-                pair_z_spec,
-                foldcp_mesh,
-                inplace_safe,
+            pair_z, pair_z_spec = (
+                self.diffusion_conditioning.prepare_cache_foldcp_local(
+                    input_feature_dict["relp"],
+                    z_trunk_for_cache,
+                    pair_z_spec,
+                    foldcp_mesh,
+                    inplace_safe,
+                )
             )
         # Conditioning, shared across difference samples
         # Diffusion_conditioning consumes 7-8G when token num is 768,
@@ -1436,7 +1443,9 @@ class DiffusionModule(nn.Module):
                 z_spec=pair_z_spec,
                 mesh=foldcp_mesh,
                 inplace_safe=inplace_safe,
-                extra_attn_bias=input_feature_dict.get("structural_pair_attn_bias", None),
+                extra_attn_bias=input_feature_dict.get(
+                    "structural_pair_attn_bias", None
+                ),
                 enable_efficient_fusion=enable_efficient_fusion,
             )
         elif enable_efficient_fusion:
@@ -1449,7 +1458,9 @@ class DiffusionModule(nn.Module):
                 inplace_safe=inplace_safe,
                 chunk_size=chunk_size,
                 enable_efficient_fusion=enable_efficient_fusion,
-                extra_attn_bias=input_feature_dict.get("structural_pair_attn_bias", None),
+                extra_attn_bias=input_feature_dict.get(
+                    "structural_pair_attn_bias", None
+                ),
             )
         else:
             z = z_pair.to(dtype=torch.float32)
@@ -1460,7 +1471,9 @@ class DiffusionModule(nn.Module):
                 inplace_safe=inplace_safe,
                 chunk_size=chunk_size,
                 enable_efficient_fusion=enable_efficient_fusion,
-                extra_attn_bias=input_feature_dict.get("structural_pair_attn_bias", None),
+                extra_attn_bias=input_feature_dict.get(
+                    "structural_pair_attn_bias", None
+                ),
             )
 
         a_token = self.layernorm_a(a_token)

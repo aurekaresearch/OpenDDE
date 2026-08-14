@@ -28,7 +28,9 @@ def online_softmax_update(
     prev_scale = torch.exp(amax + lse - new_amax)
     block_scale = torch.exp(block_amax + block_lse - new_amax)
     denom = prev_scale + block_scale
-    new_out = (out * prev_scale.unsqueeze(-1) + block_out * block_scale.unsqueeze(-1)) / denom.unsqueeze(-1)
+    new_out = (
+        out * prev_scale.unsqueeze(-1) + block_out * block_scale.unsqueeze(-1)
+    ) / denom.unsqueeze(-1)
     new_lse = torch.log(denom)
     return new_out, new_lse, new_amax
 

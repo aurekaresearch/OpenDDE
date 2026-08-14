@@ -81,6 +81,7 @@ def _tfg_cfg():
         "terms": {"_MockGeoPotential": {"interval": 1, "weight": 0.01}},
     }
 
+
 def test_sample_diffusion_shape_and_determinism_without_guidance():
     _seed(0)
     out1 = sample_diffusion(N_sample=3, **_inputs())
@@ -89,11 +90,13 @@ def test_sample_diffusion_shape_and_determinism_without_guidance():
     assert out1.shape == (3, 6, 3)
     torch.testing.assert_close(out1, out2)
 
+
 def test_tfg_guidance_runs_and_preserves_n_sample():
     _seed(0)
     out = sample_diffusion(N_sample=2, guidance_configs=_tfg_cfg(), **_inputs())
     assert out.shape == (2, 6, 3)
     assert torch.isfinite(out).all()
+
 
 def test_tfg_guidance_chunked_preserves_shape():
     _seed(0)
@@ -123,6 +126,7 @@ def test_sample_diffusion_forwards_pair_z_spec_without_guidance():
     assert out.shape == (1, 6, 3)
     assert seen_specs
     assert all(spec is sentinel for spec in seen_specs)
+
 
 def test_tfg_guidance_forwards_pair_z_spec_to_denoiser():
     _seed(0)

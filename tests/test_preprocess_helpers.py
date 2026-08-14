@@ -6,9 +6,7 @@ import shutil
 from pathlib import Path
 
 
-def test_generate_infer_jsons_keeps_non_sdf_ligand_file_intact(
-    tmp_path, monkeypatch
-):
+def test_generate_infer_jsons_keeps_non_sdf_ligand_file_intact(tmp_path, monkeypatch):
     module = importlib.import_module("runner.batch_inference")
     ligand_file = tmp_path / "lig.mol"
     ligand_file.write_text("mock mol")

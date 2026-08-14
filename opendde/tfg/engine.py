@@ -66,7 +66,9 @@ def _sample_eps(
     """
     if std == 0.0:
         return torch.zeros((1, *shape), device=device, dtype=dtype)
-    return std * torch.randn((k, *shape), device=device, dtype=dtype, generator=generator)
+    return std * torch.randn(
+        (k, *shape), device=device, dtype=dtype, generator=generator
+    )
 
 
 def _logmeanexp(x: torch.Tensor, dim: int) -> torch.Tensor:

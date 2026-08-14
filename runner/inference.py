@@ -556,9 +556,12 @@ def infer_predict(runner: InferenceRunner, configs: Any) -> None:
                     ) as f:
                         f.write(error_message)
                 finally:
-                    del data, atom_array, prediction
+                    # `batch` also references the tensors moved to the device, so
+                    # drop it here to release them on every path, including the
+                    # unpacking above failing.
+                    del batch, data, atom_array, prediction
                     cleanup_device_memory(runner.device, collect_garbage=False)
-            cleanup_device_memory(runner.device)
+            cleanup_device_memory(runner.device, synchronize=True)
             t1_end = time.time()
             logger.info(
                 f"[Rank {DIST_WRAPPER.rank}] Seed {seed} completed in {t1_end - t1_start:.2f}s."

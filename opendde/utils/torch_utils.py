@@ -25,13 +25,16 @@ def to_device(obj, device, non_blocking: bool = False):
 def cleanup_device_memory(
     device: torch.device | str,
     collect_garbage: bool = True,
+    synchronize: bool = False,
 ) -> None:
-    """Collect garbage and clear the cache for an available accelerator."""
+    """Collect garbage, optionally synchronize, and clear an accelerator cache."""
     selected_device = torch.device(device)
     if collect_garbage:
         gc.collect()
 
     if selected_device.type == "cuda" and torch.cuda.is_available():
+        if synchronize:
+            torch.cuda.synchronize(device=selected_device)
         torch.cuda.empty_cache()
 
 

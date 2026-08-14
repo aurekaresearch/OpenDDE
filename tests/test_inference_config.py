@@ -2,6 +2,7 @@
 # Copyright (c) 2026 Aureka AI Research
 import inspect
 import os
+import weakref
 from types import SimpleNamespace
 
 import pytest
@@ -760,3 +761,91 @@ def test_main_closes_runner_when_inference_fails(monkeypatch):
         inference.main(input_config)
 
     assert len(closed) == 1
+
+
+def test_infer_predict_releases_batch_before_seed_cleanup(monkeypatch, tmp_path):
+    from runner import inference
+
+    class WeakrefableData(dict):
+        pass
+
+    references = []
+
+    class OneBatchIterator:
+        def __init__(self):
+            self.done = False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self.done:
+                raise StopIteration
+            self.done = True
+            data = WeakrefableData(
+                sample_name="sample",
+                sample_index=0,
+                N_asym=torch.tensor(1),
+                N_token=torch.tensor(1),
+                N_atom=torch.tensor(1),
+                N_msa=torch.tensor(1),
+                entity_poly_type={},
+                input_feature_dict={},
+            )
+            references.append(weakref.ref(data))
+            return [(data, None, "")]
+
+    class OneBatchLoader:
+        dataset = [object()]
+
+        def __iter__(self):
+            return OneBatchIterator()
+
+    cleanup_states = []
+    cleanup_kwargs = []
+
+    def record_cleanup(_device, **kwargs):
+        cleanup_kwargs.append(kwargs)
+        if references:
+            cleanup_states.append(all(reference() is None for reference in references))
+
+    input_path = tmp_path / "input.json"
+    input_path.write_text('[{"modelSeeds": [1, 2]}]', encoding="utf-8")
+    runner = SimpleNamespace(
+        device=torch.device("cpu"),
+        error_dir=str(tmp_path / "errors"),
+        foldcp_config=SimpleNamespace(enabled=False),
+        update_model_configs=lambda _configs: None,
+        predict=lambda _data: {},
+        dumper=SimpleNamespace(dump=lambda **_kwargs: None),
+    )
+    configs = SimpleNamespace(
+        input_json_path=str(input_path),
+        seeds=[1, 2],
+        deterministic=False,
+        dump_dir=str(tmp_path),
+        skip_amp=SimpleNamespace(confidence_head=False, sample_diffusion=False),
+    )
+
+    monkeypatch.setattr(
+        inference,
+        "get_inference_dataloader",
+        lambda **_kwargs: OneBatchLoader(),
+    )
+    monkeypatch.setattr(inference, "cleanup_device_memory", record_cleanup)
+    monkeypatch.setattr(inference, "seed_everything", lambda **_kwargs: None)
+
+    inference.infer_predict(runner, configs)
+
+    assert cleanup_states
+    assert all(cleanup_states)
+    # Per seed: full cleanup before the loop, per-batch cleanup without garbage
+    # collection, then a synchronizing cleanup at the seed boundary.
+    assert cleanup_kwargs == [
+        {},
+        {"collect_garbage": False},
+        {"synchronize": True},
+        {},
+        {"collect_garbage": False},
+        {"synchronize": True},
+    ]

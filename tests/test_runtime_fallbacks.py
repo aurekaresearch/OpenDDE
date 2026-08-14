@@ -164,6 +164,30 @@ def test_cpu_cleanup_does_not_touch_visible_cuda(monkeypatch):
     torch_utils.cleanup_device_memory("cpu", collect_garbage=False)
 
 
+def test_cuda_cleanup_synchronizes_only_when_requested(monkeypatch):
+    from opendde.utils import torch_utils
+
+    calls = []
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        torch.cuda,
+        "synchronize",
+        lambda *, device: calls.append(("synchronize", device)),
+    )
+    monkeypatch.setattr(
+        torch.cuda, "empty_cache", lambda: calls.append(("empty", None))
+    )
+
+    torch_utils.cleanup_device_memory("cuda:0", collect_garbage=False)
+    torch_utils.cleanup_device_memory("cuda:0", collect_garbage=False, synchronize=True)
+
+    assert calls == [
+        ("empty", None),
+        ("synchronize", torch.device("cuda:0")),
+        ("empty", None),
+    ]
+
+
 def test_fused_layer_norm_uses_torch_fallback_for_cpu(monkeypatch):
     from opendde.model.layer_norm import layer_norm
 

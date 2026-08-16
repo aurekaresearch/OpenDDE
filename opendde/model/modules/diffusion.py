@@ -8,6 +8,7 @@ import torch.distributed as dist
 import torch.nn as nn
 
 from opendde.distributed.foldcp.config import FoldCPConfig
+from opendde.distributed.foldcp.atom_window import FoldCPWindowShardSpec
 from opendde.distributed.foldcp.mesh import FoldCPProcessMesh
 from opendde.distributed.foldcp.launch import (
     foldcp_linear_with_source_launch_shape,
@@ -28,6 +29,7 @@ from opendde.model.modules.transformer import (
     AtomAttentionDecoder,
     AtomAttentionEncoder,
     DiffusionTransformer,
+    FoldCPQueryOwnedAttentionBias,
 )
 from opendde.model.triangular.layers import LayerNorm
 from opendde.model.utils import expand_at_dim, get_checkpoint_fn, permute_final_dims
@@ -1252,6 +1254,10 @@ class DiffusionModule(nn.Module):
         use_conditioning: bool = True,
         enable_efficient_fusion: bool = False,
         pair_z_spec: Optional[FoldCPPairShardSpec] = None,
+        atom_window_spec: Optional[FoldCPWindowShardSpec] = None,
+        foldcp_attention_bias: Optional[
+            list[torch.Tensor | FoldCPQueryOwnedAttentionBias]
+        ] = None,
     ) -> torch.Tensor:
         """The denoising network used by diffusion sampling.
         As in EDM equation (7), this is F_theta(c_in * x, c_noise(sigma)).
@@ -1294,7 +1300,6 @@ class DiffusionModule(nn.Module):
             blocks_per_ckpt = None
         foldcp_mesh = self._maybe_foldcp_mesh()
 
-        atom_window_spec = None
         if foldcp_mesh is not None and pair_z_spec is not None and r_noisy.is_cuda:
             self.atom_attention_encoder._warmup_foldcp_atom_window_p2p(
                 mesh=foldcp_mesh,
@@ -1399,6 +1404,7 @@ class DiffusionModule(nn.Module):
                     z_spec=pair_z_spec,
                     p_lm=p_lm,
                     c_l=c_l,
+                    window_spec=atom_window_spec,
                     inplace_safe=inplace_safe,
                 )
             else:
@@ -1447,6 +1453,7 @@ class DiffusionModule(nn.Module):
                     "structural_pair_attn_bias", None
                 ),
                 enable_efficient_fusion=enable_efficient_fusion,
+                projected_bias_local=foldcp_attention_bias,
             )
         elif enable_efficient_fusion:
             z = self.normalize(z_pair.to(dtype=torch.float32))
@@ -1532,6 +1539,10 @@ class DiffusionModule(nn.Module):
         use_conditioning: bool = True,
         enable_efficient_fusion: bool = False,
         pair_z_spec: Optional[FoldCPPairShardSpec] = None,
+        atom_window_spec: Optional[FoldCPWindowShardSpec] = None,
+        foldcp_attention_bias: Optional[
+            list[torch.Tensor | FoldCPQueryOwnedAttentionBias]
+        ] = None,
     ) -> torch.Tensor:
         """One step denoise: x_noisy, noise_level -> x_denoised
 
@@ -1590,6 +1601,8 @@ class DiffusionModule(nn.Module):
             use_conditioning=use_conditioning,
             enable_efficient_fusion=enable_efficient_fusion,
             pair_z_spec=pair_z_spec,
+            atom_window_spec=atom_window_spec,
+            foldcp_attention_bias=foldcp_attention_bias,
         )
 
         # Rescale updates to positions and combine with input positions

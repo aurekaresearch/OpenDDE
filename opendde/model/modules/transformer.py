@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Aureka AI Research
+import math
 import os
+from dataclasses import dataclass
 from functools import partial
 from typing import Any, Optional, Union, cast
 
@@ -34,6 +36,67 @@ from opendde.model.utils import (
     checkpoint_blocks,
     permute_final_dims,
 )
+from opendde.utils.logger import get_logger
+
+logger = get_logger(__name__)
+
+
+# This is a resident-cache budget, not a total construction or device-memory
+# limit. It is sized for the validated inference envelope: MSA disabled, at most
+# 4000 structural tokens, 1xP with P in {2, 4, 8} on 80 GiB devices. The resident
+# cache costs 24 blocks * 16 heads * ceil(N/P) * N * 4 B, so the worst case in
+# that envelope is N=4000 with P=2 at 11.44 GiB, leaving ~40% budget headroom.
+#
+# A 1xP cache build also temporarily materializes the full N*N*c_z(+1) fp32
+# gathered source and P-sharded query-owned/projection workspaces. Those
+# temporaries are not included in this resident budget, so this gate is not an
+# OOM predictor. It does run before the gather, allowing a lower budget to avoid
+# both the resident cache and its construction workspace.
+#
+# The budget does NOT cover MSA-enabled runs at the capacity frontier, where the
+# measured headroom is under 1 GiB (N=4000/P=8 peaks at 79.25 G of 80 G). Those
+# runs must lower OPENDDE_FOLDCP_DIFFUSION_BIAS_CACHE_MAX_BYTES so the cache
+# stays off, otherwise it will push the run into OOM.
+_FOLDCP_DIFFUSION_BIAS_CACHE_MAX_BYTES = 16 * 1024**3
+
+
+def _foldcp_diffusion_bias_cache_max_bytes() -> int:
+    """Return the resident budget for the per-block diffusion pair-bias cache."""
+
+    value = os.environ.get("OPENDDE_FOLDCP_DIFFUSION_BIAS_CACHE_MAX_BYTES")
+    if value is None or value == "":
+        return _FOLDCP_DIFFUSION_BIAS_CACHE_MAX_BYTES
+    return max(0, int(value))
+
+
+def foldcp_diffusion_bias_cache_is_safe(
+    *,
+    n_blocks: int,
+    n_heads: int,
+    bias_rows: int,
+    bias_cols: int,
+    element_size: int,
+) -> bool:
+    """Check the resident cost of caching one pair bias per diffusion block.
+
+    Every block retains a [n_heads, bias_rows, bias_cols] tile for the whole
+    sampling loop, so the total grows as n_token**2 / P. Callers recompute the
+    bias per denoise step when the estimate does not fit. This check does not
+    include temporary cache-construction workspaces or predict total device
+    peak memory.
+
+    All inputs are globally consistent quantities, so every rank reaches the
+    same verdict and none of them skips the collectives in the cache build.
+    """
+
+    resident_bytes = (
+        int(n_blocks)
+        * int(n_heads)
+        * int(bias_rows)
+        * int(bias_cols)
+        * int(element_size)
+    )
+    return resident_bytes <= _foldcp_diffusion_bias_cache_max_bytes()
 
 
 def _attention_pair_bias_row_chunk_size(n_token: int) -> int:
@@ -46,6 +109,36 @@ def _attention_pair_bias_row_chunk_size(n_token: int) -> int:
     if value <= 0:
         return n_token
     return min(n_token, value)
+
+
+def _foldcp_diffusion_query_range(
+    *,
+    n_token: int,
+    cp_size: int,
+    cp_rank: int,
+) -> tuple[int, int]:
+    """Return a balanced contiguous query-row range for one 1xP rank."""
+
+    n_token = int(n_token)
+    cp_size = int(cp_size)
+    cp_rank = int(cp_rank)
+    if n_token <= 0:
+        raise ValueError("n_token must be positive")
+    if cp_size <= 0:
+        raise ValueError("cp_size must be positive")
+    if not 0 <= cp_rank < cp_size:
+        raise ValueError("cp_rank must be in [0, cp_size)")
+    return (
+        n_token * cp_rank // cp_size,
+        n_token * (cp_rank + 1) // cp_size,
+    )
+
+
+@dataclass(frozen=True)
+class FoldCPQueryOwnedAttentionBias:
+    """Static diffusion bias after the 1xP column-to-query transpose."""
+
+    tensor: torch.Tensor
 
 
 class AttentionPairBias(nn.Module):
@@ -306,6 +399,9 @@ class AttentionPairBias(nn.Module):
         extra_attn_bias: Optional[torch.Tensor] = None,
         inplace_safe: bool = False,
         enable_efficient_fusion: bool = False,
+        projected_bias_local: Optional[
+            torch.Tensor | FoldCPQueryOwnedAttentionBias
+        ] = None,
     ) -> torch.Tensor:
         q_proj, k_proj, v_proj = self.attention._prep_qkv(
             q_x=q,
@@ -322,53 +418,132 @@ class AttentionPairBias(nn.Module):
         ) = self._foldcp_valid_ranges(z_spec)
         tile_rows = z_spec.local_shape[z_spec.pair_dims[0]]
         tile_cols = z_spec.local_shape[z_spec.pair_dims[1]]
-        local_raw = q.new_zeros(
+        side = mesh.layout.shape[1]
+        is_one_by_p = mesh.layout.shape[0] == 1 and side > 1
+        # A 1xP rank never loses rows, but its columns can be pure padding when
+        # N is small relative to P. Such a rank still owns query rows and still
+        # has to join every collective below, so its (all-zero) bias tile is
+        # built unconditionally; the padded columns are dropped by the
+        # truncation to n_token after the transpose.
+        query_owned_bias = None
+        bias_tile = None
+        if is_one_by_p or (valid_rows > 0 and valid_cols > 0):
+            q_chunk = q[..., row_start:row_end, :]
+            if isinstance(projected_bias_local, FoldCPQueryOwnedAttentionBias):
+                query_owned_bias = projected_bias_local.tensor
+                bias_local = None
+            elif projected_bias_local is None:
+                bias_local = self.project_foldcp_attention_bias_local(
+                    z_local=z_local,
+                    z_spec=z_spec,
+                    extra_attn_bias=extra_attn_bias,
+                    enable_efficient_fusion=enable_efficient_fusion,
+                )
+            else:
+                bias_local = projected_bias_local
+            if bias_local is not None:
+                bias_local = self._align_bias_to_query(
+                    bias_local,
+                    q_chunk,
+                    n_pair_dims=2,
+                ).contiguous()
+
+                if bias_local.shape[-1] != tile_cols:
+                    bias_tile = bias_local.new_zeros(*bias_local.shape[:-1], tile_cols)
+                    bias_tile[..., : bias_local.shape[-1]] = bias_local
+                else:
+                    bias_tile = bias_local
+
+        if is_one_by_p:
+            n_token = q.shape[-2]
+            query_tile_rows = int(math.ceil(n_token / side))
+            group_rank = mesh.coord[1]
+            query_start, query_end = _foldcp_diffusion_query_range(
+                n_token=n_token,
+                cp_size=side,
+                cp_rank=group_rank,
+            )
+            valid_query_rows = query_end - query_start
+            if query_owned_bias is not None:
+                row_bias = query_owned_bias
+            elif bias_tile is not None:
+                row_bias = self._foldcp_transpose_bias_to_query_rows(
+                    bias_tile=bias_tile,
+                    n_token=n_token,
+                    mesh=mesh,
+                )
+            else:
+                raise RuntimeError(
+                    "Fold-CP 1xP diffusion attention needs either a query-owned "
+                    "bias cache or a local pair-bias tile."
+                )
+            local_raw = q_proj.new_zeros(
+                *q_proj.shape[:-3],
+                query_tile_rows,
+                q_proj.shape[-3],
+                q_proj.shape[-1],
+            )
+            q_local = q[..., query_start:query_end, :]
+            row_bias = self._align_bias_to_query(
+                row_bias[..., :valid_query_rows, :],
+                q_local,
+                n_pair_dims=2,
+            )
+            raw_chunk = _attention(
+                q=q_proj[..., query_start:query_end, :],
+                k=k_proj,
+                v=v_proj,
+                attn_bias=row_bias,
+                use_efficient_implementation=(
+                    self.attention.use_efficient_implementation
+                ),
+                inplace_safe=inplace_safe,
+            )
+            local_raw[..., :valid_query_rows, :, :].copy_(raw_chunk.transpose(-2, -3))
+
+            local_raw_front = local_raw.movedim(-3, 0).contiguous()
+            gathered_raw_front = local_raw_front.new_empty(
+                side * query_tile_rows,
+                *local_raw_front.shape[1:],
+            )
+            dist.all_gather_into_tensor(
+                gathered_raw_front,
+                local_raw_front,
+                group=mesh.group_2d,
+            )
+            del local_raw_front, local_raw
+            full_raw = q_proj.new_empty(
+                *q_proj.shape[:-3],
+                n_token,
+                q_proj.shape[-3],
+                q_proj.shape[-1],
+            )
+            for source_col in range(side):
+                source_start, source_end = _foldcp_diffusion_query_range(
+                    n_token=n_token,
+                    cp_size=side,
+                    cp_rank=source_col,
+                )
+                source_front = gathered_raw_front[
+                    source_col * query_tile_rows : (source_col + 1) * query_tile_rows
+                ]
+                full_raw[..., source_start:source_end, :, :].copy_(
+                    source_front[: source_end - source_start].movedim(0, -3)
+                )
+            del gathered_raw_front
+            return self.attention._wrap_up(full_raw, q)
+
+        local_raw = q_proj.new_zeros(
             *q_proj.shape[:-3],
             tile_rows,
             q_proj.shape[-3],
             q_proj.shape[-1],
         )
         if valid_rows > 0 and valid_cols > 0:
-            q_chunk = q[..., row_start:row_end, :]
-            q_proj_chunk = q_proj[..., row_start:row_end, :]
-            z_chunk = z_local[..., :valid_rows, :valid_cols, :]
-            if enable_efficient_fusion:
-                layernorm_z_weight = cast(torch.Tensor, self.layernorm_z.weight)
-                weight = (self.linear_nobias_z.weight * layernorm_z_weight[None, :])[
-                    :, :, None, None
-                ]
-                bias_local = F.conv2d(permute_final_dims(z_chunk, [2, 0, 1]), weight)
-            else:
-                bias_local = self.linear_nobias_z(self.layernorm_z(z_chunk))
-                bias_local = permute_final_dims(bias_local, [2, 0, 1])
-            if extra_attn_bias is not None:
-                if extra_attn_bias.shape[-2:] == z_local.shape[-3:-1]:
-                    extra_local = extra_attn_bias[..., :valid_rows, :valid_cols]
-                else:
-                    extra_local = extra_attn_bias[
-                        ..., row_start:row_end, col_start:col_end
-                    ]
-                while len(extra_local.shape) < len(bias_local.shape) - 1:
-                    extra_local = extra_local.unsqueeze(dim=0)
-                if len(extra_local.shape) == len(bias_local.shape) - 1:
-                    extra_local = extra_local.unsqueeze(dim=-3)
-                bias_local = bias_local + extra_local.to(
-                    dtype=bias_local.dtype,
-                    device=bias_local.device,
+            if bias_tile is None:
+                raise RuntimeError(
+                    "Fold-CP diffusion attention needs a local pair-bias tile."
                 )
-            bias_local = self._align_bias_to_query(
-                bias_local,
-                q_chunk,
-                n_pair_dims=2,
-            ).contiguous()
-
-            if bias_local.shape[-1] != tile_cols:
-                bias_tile = bias_local.new_zeros(*bias_local.shape[:-1], tile_cols)
-                bias_tile[..., : bias_local.shape[-1]] = bias_local
-            else:
-                bias_tile = bias_local
-
-            side = mesh.layout.shape[1]
             ring = mesh.ring_comm()
             gathered_bias: list[torch.Tensor | None] = [None for _ in range(side)]
             gathered_bias[mesh.coord[1]] = bias_tile
@@ -386,7 +561,7 @@ class AttentionPairBias(nn.Module):
                 dim=-1,
             )[..., : q.shape[-2]].contiguous()
             raw_chunk = _attention(
-                q=q_proj_chunk,
+                q=q_proj[..., row_start:row_end, :],
                 k=k_proj,
                 v=v_proj,
                 attn_bias=row_bias,
@@ -402,6 +577,108 @@ class AttentionPairBias(nn.Module):
             row_dim=-3,
         )
         return self.attention._wrap_up(full_raw, q)
+
+    @staticmethod
+    def _foldcp_transpose_bias_to_query_rows(
+        *,
+        bias_tile: torch.Tensor,
+        n_token: int,
+        mesh: FoldCPProcessMesh,
+    ) -> torch.Tensor:
+        """Transpose a 1xP column tile into this rank's contiguous query rows."""
+
+        side = int(mesh.layout.shape[1])
+        tile_cols = int(bias_tile.shape[-1])
+        query_tile_rows = int(math.ceil(n_token / side))
+        send_bias_tensor = bias_tile.new_zeros(
+            side,
+            *bias_tile.shape[:-2],
+            query_tile_rows,
+            tile_cols,
+        )
+        for destination_col in range(side):
+            destination_start, destination_end = _foldcp_diffusion_query_range(
+                n_token=n_token,
+                cp_size=side,
+                cp_rank=destination_col,
+            )
+            send_bias_tensor[
+                destination_col,
+                ...,
+                : destination_end - destination_start,
+                :,
+            ] = bias_tile[..., destination_start:destination_end, :]
+        received_bias_tensor = torch.empty_like(send_bias_tensor)
+        dist.all_to_all_single(
+            received_bias_tensor,
+            send_bias_tensor.contiguous(),
+            group=mesh.group_2d,
+        )
+        row_bias = torch.cat(
+            [received_bias_tensor[source_col] for source_col in range(side)],
+            dim=-1,
+        )[..., :n_token].contiguous()
+        query_start, query_end = _foldcp_diffusion_query_range(
+            n_token=n_token,
+            cp_size=side,
+            cp_rank=int(mesh.coord[1]),
+        )
+        return row_bias[..., : query_end - query_start, :]
+
+    def _project_attention_bias(
+        self,
+        z: torch.Tensor,
+        extra_attn_bias: Optional[torch.Tensor] = None,
+        enable_efficient_fusion: bool = False,
+    ) -> torch.Tensor:
+        if enable_efficient_fusion and z.shape[-3] > 0 and z.shape[-2] > 0:
+            layernorm_z_weight = cast(torch.Tensor, self.layernorm_z.weight)
+            weight = (self.linear_nobias_z.weight * layernorm_z_weight[None, :])[
+                :, :, None, None
+            ]
+            bias = F.conv2d(permute_final_dims(z, [2, 0, 1]), weight)
+        else:
+            # conv2d rejects zero spatial dimensions. A pure-padding 1xP rank
+            # still needs an empty projected bias so it can join the transpose.
+            bias = self.linear_nobias_z(self.layernorm_z(z))
+            bias = permute_final_dims(bias, [2, 0, 1])
+        if extra_attn_bias is not None:
+            while len(extra_attn_bias.shape) < len(bias.shape) - 1:
+                extra_attn_bias = extra_attn_bias.unsqueeze(dim=0)
+            if len(extra_attn_bias.shape) == len(bias.shape) - 1:
+                extra_attn_bias = extra_attn_bias.unsqueeze(dim=-3)
+            bias = bias + extra_attn_bias.to(dtype=bias.dtype, device=bias.device)
+        return bias.contiguous()
+
+    def project_foldcp_attention_bias_local(
+        self,
+        z_local: torch.Tensor,
+        z_spec: FoldCPPairShardSpec,
+        extra_attn_bias: Optional[torch.Tensor] = None,
+        enable_efficient_fusion: bool = False,
+    ) -> torch.Tensor:
+        """Project the static local pair bias once for diffusion sampling."""
+
+        (
+            row_start,
+            row_end,
+            col_start,
+            col_end,
+            valid_rows,
+            valid_cols,
+        ) = self._foldcp_valid_ranges(z_spec)
+        z_chunk = z_local[..., :valid_rows, :valid_cols, :]
+        extra_local = None
+        if extra_attn_bias is not None:
+            if extra_attn_bias.shape[-2:] == z_local.shape[-3:-1]:
+                extra_local = extra_attn_bias[..., :valid_rows, :valid_cols]
+            else:
+                extra_local = extra_attn_bias[..., row_start:row_end, col_start:col_end]
+        return self._project_attention_bias(
+            z=z_chunk,
+            extra_attn_bias=extra_local,
+            enable_efficient_fusion=enable_efficient_fusion,
+        )
 
     def local_multihead_attention(
         self,
@@ -682,6 +959,9 @@ class AttentionPairBias(nn.Module):
         inplace_safe: bool = False,
         extra_attn_bias: Optional[torch.Tensor] = None,
         enable_efficient_fusion: bool = False,
+        projected_bias_local: Optional[
+            torch.Tensor | FoldCPQueryOwnedAttentionBias
+        ] = None,
     ) -> torch.Tensor:
         if self.has_s:
             a = self.layernorm_a(a=a, s=s)
@@ -705,6 +985,7 @@ class AttentionPairBias(nn.Module):
             extra_attn_bias=extra_attn_bias,
             inplace_safe=inplace_safe,
             enable_efficient_fusion=enable_efficient_fusion,
+            projected_bias_local=projected_bias_local,
         )
 
         if self.has_s:
@@ -859,6 +1140,9 @@ class DiffusionTransformerBlock(nn.Module):
         inplace_safe: bool = False,
         extra_attn_bias: Optional[torch.Tensor] = None,
         enable_efficient_fusion: bool = False,
+        projected_bias_local: Optional[
+            torch.Tensor | FoldCPQueryOwnedAttentionBias
+        ] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         attn_out = self.residual_path(
             self.attention_pair_bias.forward_foldcp_local_z(
@@ -870,6 +1154,7 @@ class DiffusionTransformerBlock(nn.Module):
                 extra_attn_bias=extra_attn_bias,
                 inplace_safe=inplace_safe,
                 enable_efficient_fusion=enable_efficient_fusion,
+                projected_bias_local=projected_bias_local,
             )
         )
         if inplace_safe:
@@ -1029,8 +1314,17 @@ class DiffusionTransformer(nn.Module):
         inplace_safe: bool = False,
         extra_attn_bias: Optional[torch.Tensor] = None,
         enable_efficient_fusion: bool = False,
+        projected_bias_local: Optional[
+            list[torch.Tensor | FoldCPQueryOwnedAttentionBias]
+        ] = None,
     ) -> torch.Tensor:
-        for block in self.blocks:
+        if projected_bias_local is not None and len(projected_bias_local) != len(
+            self.blocks
+        ):
+            raise ValueError(
+                "Fold-CP projected bias cache must contain one tensor per block."
+            )
+        for block_idx, block in enumerate(self.blocks):
             a, s, z_local = block.forward_foldcp_local_z(
                 a=a,
                 s=s,
@@ -1040,9 +1334,207 @@ class DiffusionTransformer(nn.Module):
                 inplace_safe=inplace_safe,
                 extra_attn_bias=extra_attn_bias,
                 enable_efficient_fusion=enable_efficient_fusion,
+                projected_bias_local=(
+                    None
+                    if projected_bias_local is None
+                    else projected_bias_local[block_idx]
+                ),
             )
         del s, z_local
         return a
+
+    def prepare_foldcp_attention_bias_cache(
+        self,
+        z_local: torch.Tensor,
+        z_spec: FoldCPPairShardSpec,
+        mesh: FoldCPProcessMesh,
+        extra_attn_bias: Optional[torch.Tensor] = None,
+        enable_efficient_fusion: bool = False,
+    ) -> Optional[list[torch.Tensor | FoldCPQueryOwnedAttentionBias]]:
+        """Build per-block local pair-bias projections shared by denoise steps.
+
+        Returns None when the resident cache would exceed its memory budget; the
+        caller then leaves the per-step projection in place.
+        """
+
+        if not self.blocks:
+            return []
+        (
+            row_start,
+            row_end,
+            col_start,
+            col_end,
+            valid_rows,
+            valid_cols,
+        ) = self.blocks[0].attention_pair_bias._foldcp_valid_ranges(z_spec)
+        n_token = int(z_spec.original_shape[z_spec.pair_dims[1]])
+        tile_cols = int(z_spec.local_shape[z_spec.pair_dims[1]])
+        is_one_by_p = mesh.layout.shape[0] == 1 and mesh.layout.shape[1] > 1
+        # The 1xP transpose turns each column tile into contiguous query rows,
+        # so the resident tile is [H, ceil(N / P), N] instead of [H, rows, cols].
+        mesh_cols = int(mesh.layout.shape[1])
+        bias_rows = (
+            (n_token + mesh_cols - 1) // mesh_cols if is_one_by_p else valid_rows
+        )
+        bias_cols = n_token if is_one_by_p else valid_cols
+        n_heads = self.blocks[0].attention_pair_bias.n_heads
+        if not foldcp_diffusion_bias_cache_is_safe(
+            n_blocks=len(self.blocks),
+            n_heads=n_heads,
+            bias_rows=bias_rows,
+            bias_cols=bias_cols,
+            element_size=z_local.element_size(),
+        ):
+            resident_gib = (
+                len(self.blocks)
+                * n_heads
+                * bias_rows
+                * bias_cols
+                * z_local.element_size()
+                / 1024**3
+            )
+            # Never degrade silently: without this line the sampling loop simply
+            # runs several times slower and still looks healthy.
+            logger.warning(
+                "Fold-CP diffusion pair-bias resident cache disabled: %.2f GiB "
+                "of resident storage needed for %d blocks at n_token=%d, "
+                "mesh=%dx%d, but the resident budget is %.2f GiB. Each denoise "
+                "step will reproject the bias. Raise "
+                "OPENDDE_FOLDCP_DIFFUSION_BIAS_CACHE_MAX_BYTES to re-enable it.",
+                resident_gib,
+                len(self.blocks),
+                n_token,
+                mesh.layout.shape[0],
+                mesh.layout.shape[1],
+                _foldcp_diffusion_bias_cache_max_bytes() / 1024**3,
+            )
+            return None
+
+        if not is_one_by_p:
+            return [
+                block.attention_pair_bias.project_foldcp_attention_bias_local(
+                    z_local=z_local,
+                    z_spec=z_spec,
+                    extra_attn_bias=extra_attn_bias,
+                    enable_efficient_fusion=enable_efficient_fusion,
+                )
+                for block in self.blocks
+            ]
+
+        attention_pair_bias = self.blocks[0].attention_pair_bias
+        z_tile = z_local[..., :valid_rows, :valid_cols, :]
+        if z_tile.shape[-2] != tile_cols:
+            padded_z_tile = z_tile.new_zeros(
+                *z_tile.shape[:-2], tile_cols, z_tile.shape[-1]
+            )
+            padded_z_tile[..., : z_tile.shape[-2], :] = z_tile
+            z_tile = padded_z_tile
+
+        extra_local = None
+        if extra_attn_bias is not None:
+            if extra_attn_bias.shape[-2:] == z_local.shape[-3:-1]:
+                extra_local = extra_attn_bias[..., :valid_rows, :valid_cols]
+            else:
+                extra_local = extra_attn_bias[..., row_start:row_end, col_start:col_end]
+            if extra_local.shape[-1] != tile_cols:
+                padded_extra_local = extra_local.new_zeros(
+                    *extra_local.shape[:-1], tile_cols
+                )
+                padded_extra_local[..., : extra_local.shape[-1]] = extra_local
+                extra_local = padded_extra_local
+
+        packed_extra_bias = (
+            extra_local is not None and extra_local.shape == z_tile.shape[:-1]
+        )
+        if packed_extra_bias:
+            local_cols_front = z_tile.new_empty(
+                tile_cols,
+                *z_tile.shape[:-3],
+                z_tile.shape[-3],
+                z_tile.shape[-1] + 1,
+            )
+            local_cols_front[..., :-1].copy_(z_tile.movedim(-2, 0))
+            local_cols_front[..., -1].copy_(
+                extra_local.to(dtype=z_tile.dtype, device=z_tile.device).movedim(-1, 0)
+            )
+        else:
+            local_cols_front = z_tile.movedim(-2, 0).contiguous()
+        del z_tile
+
+        # Every block projects the same pair source. Gather it once, then build
+        # all block caches locally instead of transposing 24 projected biases.
+        # The full gathered source is temporary and is released before the
+        # resident per-block cache is constructed.
+        gathered_cols_front = local_cols_front.new_empty(
+            mesh_cols * tile_cols, *local_cols_front.shape[1:]
+        )
+        dist.all_gather_into_tensor(
+            gathered_cols_front,
+            local_cols_front,
+            group=mesh.group_2d,
+        )
+        del local_cols_front
+        query_start, query_end = _foldcp_diffusion_query_range(
+            n_token=n_token,
+            cp_size=mesh_cols,
+            cp_rank=int(mesh.coord[1]),
+        )
+        query_owned_shared_pair = gathered_cols_front[:n_token].movedim(0, -2)[
+            ..., query_start:query_end, :, :
+        ]
+        query_owned_extra_bias = None
+        if packed_extra_bias:
+            query_owned_z = query_owned_shared_pair[..., :-1].contiguous()
+            query_owned_extra_bias = query_owned_shared_pair[..., -1].contiguous()
+        else:
+            query_owned_z = query_owned_shared_pair.contiguous()
+        del gathered_cols_front, query_owned_shared_pair
+        if extra_local is not None and not packed_extra_bias:
+            query_owned_extra_bias = (
+                attention_pair_bias._foldcp_transpose_bias_to_query_rows(
+                    bias_tile=extra_local,
+                    n_token=n_token,
+                    mesh=mesh,
+                )
+            )
+        del extra_local
+
+        # Restore the original [N, ceil(N/P)] spatial shape for the pointwise
+        # projection, then transpose its output back to query-owned rows.
+        valid_query_rows = query_owned_z.shape[-3]
+        projection_z = query_owned_z.new_zeros(
+            *query_owned_z.shape[:-3],
+            n_token,
+            tile_cols,
+            query_owned_z.shape[-1],
+        )
+        projection_z[..., :valid_query_rows, :] = query_owned_z.transpose(-3, -2)
+        del query_owned_z
+        projection_extra_bias = None
+        if query_owned_extra_bias is not None:
+            projection_extra_bias = query_owned_extra_bias.new_zeros(
+                *query_owned_extra_bias.shape[:-2], n_token, tile_cols
+            )
+            projection_extra_bias[..., :valid_query_rows] = (
+                query_owned_extra_bias.transpose(-2, -1)
+            )
+        del query_owned_extra_bias
+
+        query_owned_biases = []
+        for block in self.blocks:
+            projected_bias = block.attention_pair_bias._project_attention_bias(
+                z=projection_z,
+                extra_attn_bias=projection_extra_bias,
+                enable_efficient_fusion=enable_efficient_fusion,
+            )
+            query_owned_biases.append(
+                FoldCPQueryOwnedAttentionBias(
+                    projected_bias.transpose(-2, -1)[
+                        ..., :valid_query_rows, :
+                    ].contiguous()
+                )
+            )
+        return query_owned_biases
 
     def forward_foldcp_window(
         self,
@@ -1716,22 +2208,80 @@ class AtomAttentionEncoder(nn.Module):
         device: torch.device,
         dtype: torch.dtype,
     ) -> None:
-        """Initialize NCCL P2P communicators before high-memory atom windows."""
+        """Initialize NCCL P2P communicators before high-memory atom windows.
+
+        The flat ring below is exactly `Ring2DComm.comm_row` on the 1xP launch
+        layout, where every column and skew shift collapses to a self-comm, and
+        circulating a token also keeps the mesh in step. A square mesh shifts
+        along the column axis and by -row/-col as well, so those links are
+        warmed first instead of connecting lazily inside the atom-window loop.
+
+        Each skip below depends only on the coordinate the partner shares, so
+        every rank on a given link makes the same decision and the sends and
+        receives stay matched.
+        """
 
         if getattr(self, "_foldcp_atom_window_p2p_warmed", False):
             return
         group_rank = dist.get_rank(mesh.group_2d)
         token = torch.zeros(1, device=device, dtype=dtype)
-        for src_rank in range(mesh.layout.numel):
-            src_global_rank = dist.get_global_rank(mesh.group_2d, src_rank)
-            if group_rank == src_rank:
-                for dst_rank in range(mesh.layout.numel):
-                    if dst_rank == src_rank:
-                        continue
-                    dst_global_rank = dist.get_global_rank(mesh.group_2d, dst_rank)
-                    dist.send(token, dst=dst_global_rank, group=mesh.group_2d)
-            else:
-                dist.recv(token, src=src_global_rank, group=mesh.group_2d)
+
+        coord = mesh.layout.to_coord(group_rank)
+        skew_ops: list[dist.P2POp] = []
+        skew_buffers: list[torch.Tensor] = []
+        for axis, shift in ((1, -coord[0]), (0, -1), (0, -coord[1])):
+            send_rank = mesh.layout.shifted_rank(coord, axis=axis, shift=shift)
+            recv_rank = mesh.layout.shifted_rank(coord, axis=axis, shift=-shift)
+            if send_rank == group_rank and recv_rank == group_rank:
+                continue
+            send_chunk = torch.zeros_like(token)
+            recv_chunk = torch.empty_like(token)
+            skew_buffers.extend((send_chunk, recv_chunk))
+            skew_ops.extend(
+                (
+                    dist.P2POp(
+                        dist.isend,
+                        send_chunk,
+                        dist.get_global_rank(mesh.group_2d, send_rank),
+                        mesh.group_2d,
+                    ),
+                    dist.P2POp(
+                        dist.irecv,
+                        recv_chunk,
+                        dist.get_global_rank(mesh.group_2d, recv_rank),
+                        mesh.group_2d,
+                    ),
+                )
+            )
+        if skew_ops:
+            for work in dist.batch_isend_irecv(skew_ops):
+                work.wait()
+        del skew_ops, skew_buffers
+
+        send_chunk = token
+        for _ in range(1, mesh.layout.numel):
+            recv_chunk = torch.empty_like(token)
+            send_rank = (group_rank - 1) % mesh.layout.numel
+            recv_rank = (group_rank + 1) % mesh.layout.numel
+            work = dist.batch_isend_irecv(
+                [
+                    dist.P2POp(
+                        dist.isend,
+                        send_chunk,
+                        dist.get_global_rank(mesh.group_2d, send_rank),
+                        mesh.group_2d,
+                    ),
+                    dist.P2POp(
+                        dist.irecv,
+                        recv_chunk,
+                        dist.get_global_rank(mesh.group_2d, recv_rank),
+                        mesh.group_2d,
+                    ),
+                ]
+            )
+            for item in work:
+                item.wait()
+            send_chunk = recv_chunk
         self._foldcp_atom_window_p2p_warmed = True
 
     def prepare_cache_foldcp_window(

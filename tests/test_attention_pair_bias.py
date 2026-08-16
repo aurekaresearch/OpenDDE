@@ -4,11 +4,16 @@ import math
 import os
 import time
 import unittest
+from unittest import mock
 
 import torch
 
 os.environ["LAYERNORM_TYPE"] = "torch"
-from opendde.model.modules.transformer import AttentionPairBias
+from opendde.model.modules.transformer import (
+    AttentionPairBias,
+    _foldcp_diffusion_query_range,
+    foldcp_diffusion_bias_cache_is_safe,
+)
 
 
 class TestAttentionPairBias(unittest.TestCase):
@@ -31,6 +36,71 @@ class TestAttentionPairBias(unittest.TestCase):
         ).to(self.device)
 
         return model
+
+    def test_foldcp_diffusion_query_range(self) -> None:
+        for n_token, cp_size in ((1, 2), (9, 4), (13, 8), (17, 3)):
+            with self.subTest(n_token=n_token, cp_size=cp_size):
+                ranges = [
+                    _foldcp_diffusion_query_range(
+                        n_token=n_token,
+                        cp_size=cp_size,
+                        cp_rank=cp_rank,
+                    )
+                    for cp_rank in range(cp_size)
+                ]
+                self.assertEqual(ranges[0][0], 0)
+                self.assertEqual(ranges[-1][1], n_token)
+                self.assertTrue(
+                    all(left[1] == right[0] for left, right in zip(ranges, ranges[1:]))
+                )
+                lengths = [end - start for start, end in ranges]
+                self.assertLessEqual(max(lengths) - min(lengths), 1)
+
+        invalid_args = (
+            {"n_token": 0, "cp_size": 2, "cp_rank": 0},
+            {"n_token": 1, "cp_size": 0, "cp_rank": 0},
+            {"n_token": 1, "cp_size": 2, "cp_rank": -1},
+            {"n_token": 1, "cp_size": 2, "cp_rank": 2},
+        )
+        for args in invalid_args:
+            with self.subTest(args=args), self.assertRaises(ValueError):
+                _foldcp_diffusion_query_range(**args)
+
+    def test_foldcp_diffusion_bias_cache_budget_boundary(self) -> None:
+        cache_args = {
+            "n_blocks": 2,
+            "n_heads": 3,
+            "bias_rows": 5,
+            "bias_cols": 7,
+            "element_size": 4,
+        }
+        resident_bytes = 2 * 3 * 5 * 7 * 4
+        variable = "OPENDDE_FOLDCP_DIFFUSION_BIAS_CACHE_MAX_BYTES"
+        with mock.patch.dict(os.environ, {variable: str(resident_bytes)}):
+            self.assertTrue(foldcp_diffusion_bias_cache_is_safe(**cache_args))
+        with mock.patch.dict(os.environ, {variable: str(resident_bytes - 1)}):
+            self.assertFalse(foldcp_diffusion_bias_cache_is_safe(**cache_args))
+
+    def test_project_attention_bias_fusion_accepts_zero_width(self) -> None:
+        model = self.get_model(has_s=False, n_heads=2, c_a=4, c_z=3)
+        z = torch.empty((13, 0, 3), device=self.device)
+        extra_attn_bias = torch.empty((13, 0), device=self.device)
+
+        expected = model._project_attention_bias(
+            z,
+            extra_attn_bias=extra_attn_bias,
+            enable_efficient_fusion=False,
+        )
+        actual = model._project_attention_bias(
+            z,
+            extra_attn_bias=extra_attn_bias,
+            enable_efficient_fusion=True,
+        )
+
+        self.assertEqual(actual.shape, (2, 13, 0))
+        self.assertEqual(actual.dtype, expected.dtype)
+        self.assertEqual(actual.device, expected.device)
+        self.assertTrue(torch.equal(actual, expected))
 
     def test_shape(self) -> None:
         """

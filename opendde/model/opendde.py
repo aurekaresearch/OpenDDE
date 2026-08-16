@@ -1003,6 +1003,8 @@ class OpenDDE(nn.Module):
             pair_z_spec=sample_pair_z_spec,
             p_lm=cache["p_lm/c_l"][0],
             c_l=cache["p_lm/c_l"][1],
+            atom_window_spec=cache.get("atom_window_spec"),
+            foldcp_attention_bias=cache.get("diffusion_attn_bias"),
             N_sample=N_sample,
             noise_schedule=noise_schedule,
             attn_chunk_size=chunk_size,
@@ -1067,7 +1069,11 @@ class OpenDDE(nn.Module):
         foldcp_mesh: Optional[Any],
         diffusion_z_spec: Optional[Any],
     ) -> dict[str, Any]:
-        cache: dict[str, Any] = {"pair_z_spec": None}
+        cache: dict[str, Any] = {
+            "pair_z_spec": None,
+            "atom_window_spec": None,
+            "diffusion_attn_bias": None,
+        }
         if self.enable_diffusion_shared_vars_cache:
             if foldcp_mesh is not None and diffusion_z_spec is not None:
                 cache["pair_z"], cache["pair_z_spec"] = autocasting_disable_decorator(
@@ -1087,8 +1093,48 @@ class OpenDDE(nn.Module):
                 )(self.diffusion_module.diffusion_conditioning.prepare_cache)(
                     input_feature_dict["relp"], z, False
                 )
-            if os.environ.get("OPENDDE_FOLDCP_MODE", "single") == "distributed":
-                cache["p_lm/c_l"] = [None, None]
+            if foldcp_mesh is not None and cache["pair_z_spec"] is not None:
+                (
+                    p_lm,
+                    c_l,
+                    cache["atom_window_spec"],
+                ) = autocasting_disable_decorator(
+                    self.configs.skip_amp.sample_diffusion
+                )(
+                    self.diffusion_module.atom_attention_encoder.prepare_cache_foldcp_window
+                )(
+                    ref_pos=input_feature_dict["ref_pos"],
+                    ref_charge=input_feature_dict["ref_charge"],
+                    ref_mask=input_feature_dict["ref_mask"],
+                    ref_element=input_feature_dict["ref_element"],
+                    ref_atom_name_chars=input_feature_dict["ref_atom_name_chars"],
+                    atom_to_token_idx=input_feature_dict["atom_to_token_idx"],
+                    d_lm=input_feature_dict["d_lm"],
+                    v_lm=input_feature_dict["v_lm"],
+                    pad_info=input_feature_dict["pad_info"],
+                    mesh=foldcp_mesh,
+                    r_l=True,
+                    z=cache["pair_z"],
+                    z_spec=cache["pair_z_spec"],
+                    inplace_safe=False,
+                )
+                cache["p_lm/c_l"] = [p_lm, c_l]
+                cache_z = cache["pair_z"].to(dtype=torch.float32)
+                if self.enable_efficient_fusion:
+                    cache_z = self.diffusion_module.normalize(cache_z)
+                cache["diffusion_attn_bias"] = autocasting_disable_decorator(
+                    self.configs.skip_amp.sample_diffusion
+                )(
+                    self.diffusion_module.diffusion_transformer.prepare_foldcp_attention_bias_cache
+                )(
+                    z_local=cache_z,
+                    z_spec=cache["pair_z_spec"],
+                    mesh=foldcp_mesh,
+                    extra_attn_bias=input_feature_dict.get(
+                        "structural_pair_attn_bias", None
+                    ),
+                    enable_efficient_fusion=self.enable_efficient_fusion,
+                )
             else:
                 cache["p_lm/c_l"] = autocasting_disable_decorator(
                     self.configs.skip_amp.sample_diffusion

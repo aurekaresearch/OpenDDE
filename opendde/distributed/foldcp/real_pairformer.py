@@ -1711,7 +1711,7 @@ def _distributed_triangle_multiplication_source_matmul(
         b_local_host = None
         if offload_b:
             b_local_host = b_local
-            del b_local
+            b_local = None
         a_full_k_prepared = None
         if direct_matmul_lhs:
             incoming = direction == TriangleMultiplicationDirection.INCOMING

@@ -6,6 +6,55 @@ User-facing changes to OpenDDE are documented here.
 
 No changes yet.
 
+## [1.1.0] - 2026-08-16
+
+### Added
+
+- Accelerated multi-GPU Fold-CP `1 x P` diffusion by caching query-owned
+  attention biases and atom-window state across denoising steps, avoiding
+  repeated pair-bias projection and communication.
+
+  Controlled cache-on/cache-off benchmarks on NVIDIA A100(80GB) GPUs with
+  200 diffusion steps measured the following speedups across validated 2-, 4-,
+  and 8-GPU Fold-CP configurations:
+
+  | Timed region | Speedup |
+  | --- | ---: |
+  | Full forward | **1.64×–1.85×** |
+  | Diffusion sampling | **2.27×–2.68×** |
+
+  These timings cover model execution, excluding external MSA generation, input
+  preprocessing, and result serialization. Exact gains vary with input size and
+  GPU topology; all same-topology cache-on/cache-off output comparisons were
+  bitwise identical.
+
+- Added a configurable resident-memory budget for the Fold-CP diffusion cache.
+  The budget defaults to 16 GiB per Fold-CP rank (one rank per GPU) and is not
+  preallocated. The actual cache size depends on the input and GPU count. If the
+  estimated resident storage exceeds the budget, OpenDDE warns and automatically
+  falls back to per-step projection. Set
+  `OPENDDE_FOLDCP_DIFFUSION_BIAS_CACHE_MAX_BYTES` to a byte value to override
+  the default.
+
+### Fixed
+
+- Released inference batches before synchronized CUDA cleanup at seed
+  boundaries, preventing device tensors from remaining live across multi-seed
+  inference.
+- Kept the Fold-CP triangle-multiplication operand bound after host offload,
+  preventing an `UnboundLocalError` in the offloaded `1 x P` path.
+- Ensured fully padded `1 x P` ranks still participate in diffusion collectives
+  and made fused attention-bias projection handle zero-width shards safely.
+
+### Compatibility
+
+- The new query-owned cache is enabled automatically for multi-GPU Fold-CP under
+  the existing shared-variable cache setting, which is on by default for
+  inference. Normal single-GPU, non-Fold-CP inference never constructs this
+  cache and continues to use its existing diffusion path.
+- Model checkpoints and input/output formats remain compatible with OpenDDE
+  1.0.x.
+
 ## [1.0.3] - 2026-08-05
 
 ### Added
@@ -73,7 +122,8 @@ For installation and upgrade commands, see the
 
 - Initial PyPI bootstrap release of the `opendde` package name.
 
-[Unreleased]: https://github.com/aurekaresearch/OpenDDE/compare/v1.0.3...HEAD
+[Unreleased]: https://github.com/aurekaresearch/OpenDDE/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/aurekaresearch/OpenDDE/releases/tag/v1.1.0
 [1.0.3]: https://github.com/aurekaresearch/OpenDDE/releases/tag/v1.0.3
 [1.0.2]: https://github.com/aurekaresearch/OpenDDE/releases/tag/v1.0.2
 [1.0.1]: https://github.com/aurekaresearch/OpenDDE/releases/tag/v1.0.1

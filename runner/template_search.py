@@ -169,6 +169,8 @@ def update_template_info(
         for sequence in infer_data["sequences"]:
             if "proteinChain" in sequence:
                 protein_chain = sequence["proteinChain"]
+                if "templates" in protein_chain:
+                    continue
                 # Skip if templatesPath already exists and is valid
                 if "templatesPath" in protein_chain and os.path.exists(
                     protein_chain["templatesPath"]

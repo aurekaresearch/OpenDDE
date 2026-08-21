@@ -4,7 +4,9 @@ User-facing changes to OpenDDE are documented here.
 
 ## [Unreleased]
 
-No changes yet.
+### Added
+
+- Added sparse indexed mmCIF templates through `proteinChain.templates`.
 
 ## [1.1.0] - 2026-08-16
 

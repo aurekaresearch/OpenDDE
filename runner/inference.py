@@ -6,8 +6,9 @@ import os
 import random
 import time
 import traceback
-from collections.abc import Mapping, Sized
+from collections.abc import Mapping, Sequence, Sized
 from contextlib import nullcontext
+from copy import copy
 from datetime import timedelta
 from os.path import exists as opexists
 from os.path import join as opjoin
@@ -23,6 +24,8 @@ from opendde.config.inference import (
 )
 from opendde.config.schema import OpenDDEConfig
 from opendde.data.inference.infer_dataloader import get_inference_dataloader
+from opendde.data.template.template_input import needs_template_search
+from opendde.data.tools import kalign
 from opendde.distributed.foldcp.config import (
     FOLDCP_ENVIRONMENT_KEYS,
     FoldCPConfig,
@@ -99,6 +102,40 @@ def _download_inference_assets(configs: OpenDDEConfig) -> None:
         raise error
 
 
+def _prepare_template_dependencies(
+    configs: OpenDDEConfig,
+    input_json_paths: Sequence[str] | None,
+) -> None:
+    """Prepare only the template dependencies required by the inputs."""
+    paths = tuple(input_json_paths or ())
+    if not paths:
+        input_json_path = getattr(configs, "input_json_path", None)
+        paths = (str(input_json_path),) if input_json_path else ()
+
+    needs_search = bool(getattr(configs, "use_template", False))
+    if needs_search and paths:
+        try:
+            needs_search = False
+            for path in paths:
+                with open(path, encoding="utf-8") as file:
+                    if needs_template_search(json.load(file)):
+                        needs_search = True
+                        break
+        except Exception:
+            needs_search = True
+
+    if needs_search:
+        configs.data.template.kalign_binary_path = kalign.resolve_kalign_binary(
+            configs.data.template.kalign_binary_path
+        )
+
+    asset_configs = configs
+    if bool(getattr(configs, "use_template", False)) and not needs_search:
+        asset_configs = copy(configs)
+        asset_configs.use_template = False
+    _download_inference_assets(asset_configs)
+
+
 class InferenceRunner(object):
     """
     Runner class for AlphaFold3 model inference.
@@ -107,6 +144,8 @@ class InferenceRunner(object):
     Args:
         configs (OpenDDEConfig): Configuration object for inference.
         foldcp_config (FoldCPConfig | None): Pre-validated Fold-CP settings.
+        input_json_paths (Sequence[str] | None): Inputs used to determine whether
+            template search dependencies are required.
     """
 
     def __init__(
@@ -114,6 +153,7 @@ class InferenceRunner(object):
         configs: OpenDDEConfig,
         *,
         foldcp_config: FoldCPConfig | None = None,
+        input_json_paths: Sequence[str] | None = None,
     ) -> None:
         self._owns_process_group = False
         self._foldcp_environment_before_publish: dict[str, str | None] | None = None
@@ -129,7 +169,7 @@ class InferenceRunner(object):
                 rank=DIST_WRAPPER.rank,
             )
             self.init_env()
-            _download_inference_assets(self.configs)
+            _prepare_template_dependencies(self.configs, input_json_paths)
             self.init_basics()
             with skip_random_init() if self.configs.load_strict else nullcontext():
                 self.init_model()

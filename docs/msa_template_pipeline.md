@@ -131,4 +131,5 @@ Override downloads:
 - RNA MSA: `nhmmer`, `hmmalign`, `hmmbuild`.
 - Search database decompression: `zstd` command, or the optional Python
   `zstandard` package for Python auto-downloads.
-- Template inference: `kalign`.
+- Search-hit template inference: `kalign`. Explicit indexed templates do not
+  use it.

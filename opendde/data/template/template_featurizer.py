@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Aureka AI Research
 import dataclasses
+from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Self, Sequence, TypeAlias
 
 import numpy as np
@@ -13,17 +14,25 @@ from opendde.data.constants import (
     RNA_CHAIN,
 )
 from opendde.data.msa.msa_utils import map_to_standard
-from opendde.data.template.template_parser import HHRParser, HmmsearchA3MParser
+from opendde.data.template.template_input import get_explicit_templates
+from opendde.data.template.template_parser import (
+    HHRParser,
+    HmmsearchA3MParser,
+    TemplateParser,
+)
 from opendde.data.template.template_utils import (
     TEMPLATE_FEATURES,
     DistogramFeaturesConfig,
     TemplateFeatures,
     TemplateHitFeaturizer,
+    TemplateHitProcessor,
 )
 from opendde.data.utils import pad_to
 from opendde.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+MAX_TEMPLATES = 4
 
 BatchDict: TypeAlias = dict[str, np.ndarray]
 FeatureDict: TypeAlias = Mapping[str, np.ndarray]
@@ -38,7 +47,7 @@ class TemplateFeatureAssemblyLine:
         max_templates: Maximum number of templates to include in the features.
     """
 
-    def __init__(self, max_templates: int = 4) -> None:
+    def __init__(self, max_templates: int = MAX_TEMPLATES) -> None:
         self.max_templates = max_templates
 
     def assemble(
@@ -241,11 +250,143 @@ class InferenceTemplateFeaturizer:
     """Simplified featurizer for inference, leveraging the same assembly logic."""
 
     @staticmethod
+    def _load_explicit_template_mmcif(
+        template_info: Mapping[str, Any],
+        *,
+        json_path: Optional[str],
+        template_index: int,
+    ) -> tuple[str, str]:
+        mmcif = template_info.get("mmcif")
+        mmcif_path = template_info.get("mmcifPath")
+        if mmcif is not None and mmcif_path is not None:
+            raise ValueError(
+                "Explicit template entry accepts only one of mmcif or mmcifPath."
+            )
+        if mmcif is None and mmcif_path is None:
+            raise ValueError(
+                "Explicit template entry requires either mmcif or mmcifPath."
+            )
+        if mmcif_path is not None:
+            if not isinstance(mmcif_path, str) or not mmcif_path:
+                raise ValueError(
+                    "Explicit template mmcifPath must be a non-empty string."
+                )
+            resolved_path = Path(mmcif_path)
+            if not resolved_path.is_absolute():
+                base_dir = Path(json_path).resolve().parent if json_path else Path()
+                resolved_path = (base_dir / resolved_path).resolve()
+            return resolved_path.read_text(encoding="utf-8"), resolved_path.stem
+        if not isinstance(mmcif, str) or not mmcif:
+            raise ValueError("Explicit template mmcif must be a non-empty string.")
+        return mmcif, f"template_{template_index}"
+
+    @staticmethod
+    def _validate_explicit_indices(name: str, value: Any) -> list[int]:
+        if not isinstance(value, list):
+            raise ValueError(
+                f"Explicit template {name} must be a list of JSON integers."
+            )
+        if not value:
+            raise ValueError(f"Explicit template {name} must be non-empty.")
+        if any(type(index) is not int for index in value):
+            raise ValueError(f"Explicit template {name} must contain JSON integers.")
+        if any(index < 0 for index in value):
+            raise ValueError("Explicit template indices must be non-negative integers.")
+        return value
+
+    @staticmethod
+    def _build_explicit_template_features(
+        *,
+        query_seq: str,
+        raw_templates: list[Any],
+        json_path: Optional[str],
+    ) -> list[Dict[str, Any]]:
+        if not isinstance(raw_templates, list):
+            raise TypeError("proteinChain.templates must be a list.")
+
+        processor = TemplateHitProcessor(mmcif_dir="")
+        explicit_features: list[Dict[str, Any]] = []
+        for template_index, template_info in enumerate(raw_templates[:MAX_TEMPLATES]):
+            if not isinstance(template_info, Mapping):
+                raise TypeError(
+                    "Each explicit template entry must be an object with "
+                    "mmcif/mmcifPath + queryIndices/templateIndices."
+                )
+
+            mmcif_string, file_id = (
+                InferenceTemplateFeaturizer._load_explicit_template_mmcif(
+                    template_info,
+                    json_path=json_path,
+                    template_index=template_index,
+                )
+            )
+            query_indices = InferenceTemplateFeaturizer._validate_explicit_indices(
+                "queryIndices", template_info.get("queryIndices")
+            )
+            template_indices = InferenceTemplateFeaturizer._validate_explicit_indices(
+                "templateIndices", template_info.get("templateIndices")
+            )
+            if len(set(query_indices)) != len(query_indices):
+                raise ValueError("Explicit template queryIndices must be unique.")
+            if len(query_indices) != len(template_indices):
+                raise ValueError(
+                    "Explicit template queryIndices and templateIndices must have "
+                    "the same length."
+                )
+            if max(query_indices) >= len(query_seq):
+                raise ValueError(
+                    "Explicit template queryIndices exceed query sequence length."
+                )
+
+            parsed = TemplateParser.parse(
+                file_id=file_id,
+                mmcif_string=mmcif_string,
+                auth_chain_id=None,
+            )
+            if parsed.mmcif_object is None:
+                raise ValueError(f"Failed to parse explicit template mmCIF: {file_id}")
+
+            chain_items = list(parsed.mmcif_object.chain_to_seqres.items())
+            if len(chain_items) != 1:
+                raise ValueError(
+                    "Explicit template mmCIF must contain exactly one protein chain."
+                )
+            chain_id, template_seq = chain_items[0]
+            if max(template_indices) >= len(template_seq):
+                raise ValueError(
+                    "Explicit template templateIndices exceed template sequence length."
+                )
+
+            release_date = parsed.mmcif_object.header.get("release_date")
+            if not release_date:
+                raise ValueError(
+                    "Explicit template mmCIF is missing "
+                    "_pdbx_audit_revision_history.revision_date."
+                )
+            mapping = dict(zip(query_indices, template_indices))
+            features, _ = processor._extract_template_features(
+                parsed.mmcif_object,
+                file_id,
+                mapping,
+                template_seq,
+                query_seq,
+                chain_id,
+                minimum_atom_count=1,
+            )
+            features["template_release_date"] = np.array(
+                release_date.encode(), dtype=object
+            )
+            explicit_features.append(features)
+
+        return explicit_features
+
+    @staticmethod
     def make_template_feature(
         bioassembly: Sequence[Mapping[str, Any]],
         atom_array: AtomArray,
         use_template: bool = True,
         online_template_featurizer: Optional[TemplateHitFeaturizer] = None,
+        json_path: Optional[str] = None,
     ) -> Dict[str, np.ndarray]:
         """
         Generates template features during inference.
@@ -255,6 +396,7 @@ class InferenceTemplateFeaturizer:
             atom_array: Parsed atom structure.
             use_template: Whether to use templates.
             online_template_featurizer: Featurizer for processing template hits.
+            json_path: Input JSON path used to resolve relative mmCIF paths.
 
         Returns:
             Dictionary of template features.
@@ -268,6 +410,7 @@ class InferenceTemplateFeaturizer:
 
         for eid, info in enumerate(bioassembly):
             seq, count, ctype, t_path = "", 0, LIGAND_CHAIN_TYPES, ""
+            explicit_templates = None
 
             if "proteinChain" in info:
                 c = info["proteinChain"]
@@ -277,6 +420,8 @@ class InferenceTemplateFeaturizer:
                     PROTEIN_CHAIN,
                     c.get("templatesPath", ""),
                 )
+                if use_template:
+                    explicit_templates = get_explicit_templates(c)
             elif "rnaSequence" in info:
                 c = info["rnaSequence"]
                 seq, count, ctype = c["sequence"], c["count"], RNA_CHAIN
@@ -290,7 +435,15 @@ class InferenceTemplateFeaturizer:
                 count, ctype = info["ion"]["count"], LIGAND_CHAIN_TYPES
 
             templates = []
-            if t_path and use_template and online_template_featurizer:
+            if explicit_templates:
+                templates = (
+                    InferenceTemplateFeaturizer._build_explicit_template_features(
+                        query_seq=seq,
+                        raw_templates=explicit_templates,
+                        json_path=json_path,
+                    )
+                )
+            elif t_path and use_template and online_template_featurizer:
                 assert ctype == PROTEIN_CHAIN, "Only protein templates are supported."
                 with open(t_path, "r") as f:
                     content = f.read()
@@ -336,7 +489,7 @@ class InferenceTemplateFeaturizer:
 
         # Assemble features
         return (
-            TemplateFeatureAssemblyLine(max_templates=4)
+            TemplateFeatureAssemblyLine(max_templates=MAX_TEMPLATES)
             .assemble(template_meta_infos, std_idxs)
             .as_opendde_dict()
         )

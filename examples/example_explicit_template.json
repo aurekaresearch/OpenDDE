@@ -1,0 +1,21 @@
+[
+  {
+    "name": "2lwu_explicit_sparse_template",
+    "modelSeeds": [101],
+    "sequences": [
+      {
+        "proteinChain": {
+          "sequence": "GHCIPTTSGPICLRD",
+          "count": 1,
+          "templates": [
+            {
+              "mmcifPath": "2lwu.cif",
+              "queryIndices": [0, 2, 4, 6, 8, 10, 12, 14],
+              "templateIndices": [0, 2, 4, 6, 8, 10, 12, 14]
+            }
+          ]
+        }
+      }
+    ]
+  }
+]

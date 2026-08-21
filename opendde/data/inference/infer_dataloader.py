@@ -15,7 +15,11 @@ from torch.utils.data import DataLoader, Dataset, DistributedSampler
 from opendde.data.core import ccd
 from opendde.data.inference.json_to_feature import SampleDictToFeatures
 from opendde.data.msa.msa_featurizer import InferenceMSAFeaturizer
-from opendde.data.template.template_featurizer import InferenceTemplateFeaturizer
+from opendde.data.template.template_featurizer import (
+    MAX_TEMPLATES,
+    InferenceTemplateFeaturizer,
+)
+from opendde.data.template.template_input import needs_template_search
 from opendde.data.template.template_utils import TemplateHitFeaturizer
 from opendde.data.utils import data_type_transform, make_dummy_feature
 from opendde.utils.distributed import DIST_WRAPPER
@@ -74,7 +78,7 @@ class InferenceDataset(Dataset):
         )
         with open(self.input_json_path, "r") as f:
             self.inputs = cast(list[dict[str, Any]], json.load(f))
-        if self.use_template:
+        if self.use_template and needs_template_search(self.inputs):
             template_mmcif_dir = configs.data.template.prot_template_mmcif_dir
             fetch_remote = configs.data.template.get("fetch_remote", True)
             if not fetch_remote:
@@ -94,7 +98,7 @@ class InferenceDataset(Dataset):
             self.online_template_featurizer = TemplateHitFeaturizer(
                 mmcif_dir=configs.data.template.prot_template_mmcif_dir,
                 template_cache_dir=configs.data.template.prot_template_cache_dir,
-                max_hits=4,
+                max_hits=MAX_TEMPLATES,
                 kalign_binary_path=configs.data.template.kalign_binary_path,
                 max_template_date="2021-09-30",
                 release_dates_path=configs.data.template.release_dates_path,
@@ -155,6 +159,7 @@ class InferenceDataset(Dataset):
             atom_array=atom_array,
             use_template=self.use_template,
             online_template_featurizer=self.online_template_featurizer,
+            json_path=self.input_json_path,
         )
         # Make dummy features for not implemented features
         dummy_feats = []

@@ -329,6 +329,9 @@ class TemplateParser:
         chem_comps = TemplateParser._mmcif_loop_to_dict(
             "_chem_comp.", "_chem_comp.id", parsed_info
         )
+        entity_polys = TemplateParser._mmcif_loop_to_dict(
+            "_entity_poly.", "_entity_poly.entity_id", parsed_info
+        )
         struct_asyms = TemplateParser._mmcif_loop_to_list("_struct_asym.", parsed_info)
 
         entity_to_mmcif_chains = collections.defaultdict(list)
@@ -339,8 +342,11 @@ class TemplateParser:
 
         valid_chains = {}
         for entity_id, seq_info in polymers.items():
+            entity_poly_type = (
+                entity_polys.get(entity_id, {}).get("_entity_poly.type", "").lower()
+            )
             # Check if any component is peptide-like.
-            is_protein = any(
+            is_protein = entity_poly_type.strip().startswith("polypeptide(") or any(
                 "peptide" in chem_comps.get(m.id, {}).get("_chem_comp.type", "")
                 for m in seq_info
             )

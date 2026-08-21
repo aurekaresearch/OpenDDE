@@ -63,6 +63,61 @@ match `count`.
 - `templatesPath`: optional template hits file (`.a3m` or `.hhr`), used only with
   `--use_template true`.
 
+### Protein template modes
+
+`--use_template false` disables template features for every chain. With
+`--use_template true`, each protein chain independently selects one mode:
+
+| Chain fields | Behavior |
+| --- | --- |
+| Neither `templates` nor `templatesPath` | Eligible for the existing automatic template-search pipeline. |
+| `templatesPath` | Use the existing HHR/A3M search-hit pipeline. |
+| `templates: []` | Explicitly disable templates for this chain. Automatic search does not overwrite it. |
+| Non-empty `templates` | Use the supplied structures and index mappings exactly; automatic search does not overwrite them. |
+
+Do not set `templates` and `templatesPath` on the same chain. Existing inputs
+that omit `templates` retain their previous automatic-search or
+`templatesPath` behavior.
+
+Each explicit template is an object with this shape:
+
+```json
+{
+  "mmcifPath": "templates/target.cif",
+  "queryIndices": [0, 1, 4, 5],
+  "templateIndices": [0, 1, 2, 3]
+}
+```
+
+- Set exactly one of `mmcifPath` or `mmcif`. `mmcif` contains the complete
+  mmCIF document as a JSON string. A relative `mmcifPath` is resolved from the
+  directory containing the input JSON file.
+- `queryIndices` and `templateIndices` are paired, zero-based positions in the
+  query sequence and parsed template polymer sequence, respectively. They are
+  not PDB author residue numbers.
+- Both arrays must be non-empty, have equal length, contain only non-negative
+  integers, and stay within their corresponding sequences. `queryIndices` must
+  be unique; array order defines the residue pairs.
+- The pair at each array position defines one residue mapping. Query residues
+  omitted from `queryIndices` remain untemplated, enabling sparse conditioning.
+- The mmCIF must contain exactly one protein polymer chain and a valid PDBx
+  revision date.
+- OpenDDE uses at most four templates per protein chain, taking the first four
+  in JSON order. Entries after the first four are ignored.
+- Explicit templates bypass the automatic search-hit release-date cutoff and
+  near-duplicate filtering. The caller is responsible for choosing suitable
+  template structures and enforcing any dataset cutoff.
+
+When every template-enabled protein chain uses explicit `templates` (or
+`templates: []`), template processing does not invoke automatic search,
+Kalign, a template-search database or cache, or template-network access. Normal
+checkpoint and common runtime assets are still required. A mixed input still
+needs search infrastructure for any chain using automatic search or
+`templatesPath`.
+
+See the runnable sparse example in
+[`examples/example_explicit_template.json`](../examples/example_explicit_template.json).
+
 ## `dnaSequence`
 
 ```json

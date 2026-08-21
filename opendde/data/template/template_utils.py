@@ -594,6 +594,7 @@ class TemplateHitProcessor:
         query_seq: str,
         chain_id: str,
         _zero_center: bool = True,
+        minimum_atom_count: int = 5,
     ) -> Tuple[Dict[str, Any], Optional[str]]:
         """Generates features for a template hit."""
         if not mmcif_obj or not mmcif_obj.chain_to_seqres:
@@ -618,7 +619,7 @@ class TemplateHitProcessor:
                 out_mask[q_idx] = all_mask[t_idx]
                 out_seq[q_idx] = template_seq[t_idx]
 
-        if np.sum(out_mask) < 5:
+        if np.sum(out_mask) < minimum_atom_count:
             raise TemplateAtomMaskAllZerosError(
                 f"Empty atom mask for {pdb_id}_{chain_id}"
             )

@@ -24,7 +24,6 @@ from opendde.config.schema import (
 )
 from opendde.data.inference.json_maker import cif_to_input_json
 from opendde.data.inference.json_parser import lig_file_to_atom_info
-from opendde.data.tools import kalign
 from opendde.data.utils import pdb_to_cif
 from opendde.distributed.foldcp.config import FoldCPConfig
 from opendde.utils.logger import get_logger
@@ -285,6 +284,7 @@ def get_default_runner(
     foldcp_size_cp: int = 1,
     foldcp_devices: str = "",
     foldcp_metrics_jsonl: str = "",
+    input_json_paths: Optional[List[str]] = None,
     *,
     device: InferenceDevice = "auto",
 ) -> InferenceRunner:
@@ -317,6 +317,7 @@ def get_default_runner(
         foldcp_size_cp (int): Number of context-parallel ranks.
         foldcp_devices (str): Optional visible device list recorded in metrics.
         foldcp_metrics_jsonl (str): Optional JSONL path for benchmark records.
+        input_json_paths (Optional[List[str]]): Input JSON files.
 
     Returns:
         InferenceRunner: An instance of InferenceRunner.
@@ -360,12 +361,14 @@ def get_default_runner(
     configs.need_atom_confidence = need_atom_confidence
     configs.sample_diffusion.guidance["enable"] = use_tfg_guidance
 
-    if kalign_binary_path is not None or use_template:
-        configs.data.template.kalign_binary_path = kalign.resolve_kalign_binary(
-            kalign_binary_path
-        )
+    if kalign_binary_path is not None:
+        configs.data.template.kalign_binary_path = kalign_binary_path
 
-    runner = InferenceRunner(configs, foldcp_config=foldcp_config)
+    runner = InferenceRunner(
+        configs,
+        foldcp_config=foldcp_config,
+        input_json_paths=input_json_paths,
+    )
     configs = runner.configs
     logger.info(
         f"Inference by OpenDDE: model_name: {model_name}, dtype: {configs.dtype}"
@@ -517,6 +520,7 @@ def inference_jsons(
         foldcp_size_cp=foldcp_size_cp,
         foldcp_devices=foldcp_devices,
         foldcp_metrics_jsonl=foldcp_metrics_jsonl,
+        input_json_paths=infer_jsons,
     )
     try:
         configs = runner.configs
@@ -644,7 +648,7 @@ def inference_jsons(
     "--use_template",
     type=bool,
     default=False,
-    help="Use templates (requires templatesPath in input JSON).",
+    help="Use explicit, search-hit, or automatically searched templates.",
 )
 @click.option(
     "--use_rna_msa",
@@ -890,11 +894,8 @@ def predict(
         )
         logger.info("=" * 50)
         logger.info(
-            "Using templates for inference. Template files should have "
-            ".hhr or .a3m extensions and be specified in the JSON file.\n"
-            "Example: /path/to/template.hhr or /path/to/template.a3m\n"
-            "Note: Inference will proceed with automatic template search "
-            "if none are provided and use_template is True."
+            "Using proteinChain.templates, templatesPath, or automatic "
+            "template search for inference."
         )
         logger.info("=" * 50)
 

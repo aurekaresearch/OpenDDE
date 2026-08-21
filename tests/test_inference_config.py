@@ -86,7 +86,7 @@ def test_get_default_runner_config_build_does_not_mutate_base_defaults(monkeypat
     from runner import batch_inference
 
     class DummyRunner:
-        def __init__(self, cfg, *, foldcp_config=None):
+        def __init__(self, cfg, *, foldcp_config=None, input_json_paths=None):
             self.configs = cfg
             self.foldcp_config = foldcp_config
 
@@ -272,7 +272,7 @@ def test_get_default_runner_passes_foldcp_config_once(monkeypatch):
     captured = {}
 
     class DummyRunner:
-        def __init__(self, cfg, *, foldcp_config=None):
+        def __init__(self, cfg, *, foldcp_config=None, input_json_paths=None):
             captured["foldcp"] = foldcp_config
             self.configs = cfg
             self.foldcp_config = foldcp_config
@@ -303,29 +303,21 @@ def test_foldcp_config_validation_is_independent_of_process_environment(monkeypa
     assert FoldCPConfig().validate().mode == "single"
 
 
-def test_get_default_runner_uses_shared_kalign_resolver(monkeypatch):
+def test_get_default_runner_preserves_kalign_path_for_runner(monkeypatch):
     from runner import batch_inference
 
-    calls = []
-
     class DummyRunner:
-        def __init__(self, cfg, *, foldcp_config=None):
+        def __init__(self, cfg, *, foldcp_config=None, input_json_paths=None):
             self.configs = cfg
 
     monkeypatch.setattr(batch_inference, "InferenceRunner", DummyRunner)
-    monkeypatch.setattr(
-        batch_inference.kalign,
-        "resolve_kalign_binary",
-        lambda binary_path: calls.append(binary_path) or "/tools/kalign",
-    )
 
     runner = batch_inference.get_default_runner(
         use_template=True,
         kalign_binary_path="custom-kalign",
     )
 
-    assert calls == ["custom-kalign"]
-    assert runner.configs.data.template.kalign_binary_path == "/tools/kalign"
+    assert runner.configs.data.template.kalign_binary_path == "custom-kalign"
 
 
 def test_download_inference_assets_single_process_downloads_directly(monkeypatch):

@@ -8,6 +8,58 @@ from opendde.distributed.foldcp.layout import FoldCP2DLayout
 from opendde.distributed.foldcp.pair_sharding import shard_pair_tensor
 
 
+@pytest.mark.parametrize(
+    ("mode", "size_dp", "size_cp"),
+    [
+        ("single", 1, 1),
+        ("single", 2, 1),
+        ("single", 3, 1),
+        ("single", 4, 1),
+        ("distributed", 1, 2),
+        ("distributed", 1, 3),
+        ("distributed", 1, 4),
+    ],
+)
+def test_supported_inference_topologies(mode, size_dp, size_cp):
+    config = FoldCPConfig.from_runtime_args(
+        mode=mode,
+        size_dp=size_dp,
+        size_cp=size_cp,
+    )
+
+    assert (config.size_dp, config.size_cp) == (size_dp, size_cp)
+
+
+def test_seed_parallel_launch_hint_uses_torchrun():
+    config = FoldCPConfig.from_runtime_args(mode="single", size_dp=4, size_cp=1)
+
+    assert config.launch_hint() == (
+        "torchrun --standalone --nproc_per_node 4 "
+        "-m runner.batch_inference pred --foldcp_mode single "
+        "--foldcp_size_dp 4 --foldcp_size_cp 1"
+    )
+    assert config.enabled is False
+
+
+@pytest.mark.parametrize(
+    ("mode", "size_dp", "size_cp", "message"),
+    [
+        ("single", 2, 2, "Hybrid seed-parallel and Fold-CP"),
+        ("distributed", 2, 2, "Hybrid seed-parallel and Fold-CP"),
+        ("single", 1, 2, "foldcp_mode='single' requires"),
+        ("distributed", 2, 1, "foldcp_mode='distributed' requires foldcp_size_dp=1"),
+        ("distributed", 1, 1, "foldcp_mode='distributed' requires foldcp_size_cp > 1"),
+    ],
+)
+def test_rejected_inference_topologies(mode, size_dp, size_cp, message):
+    with pytest.raises(ValueError, match=message):
+        FoldCPConfig.from_runtime_args(
+            mode=mode,
+            size_dp=size_dp,
+            size_cp=size_cp,
+        )
+
+
 @pytest.mark.parametrize("p", range(2, 9))
 def test_distributed_config_uses_one_by_p_for_any_cp_size(monkeypatch, p):
     """Catch reintroducing the perfect-square-only CP launch restriction."""

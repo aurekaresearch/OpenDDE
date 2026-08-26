@@ -156,16 +156,16 @@ class InferenceRunner(object):
             f"Distributed environment: world size: {DIST_WRAPPER.world_size}, "
             f"global rank: {DIST_WRAPPER.rank}, local rank: {DIST_WRAPPER.local_rank}"
         )
-        if self.foldcp_config.enabled:
-            expected_world_size = (
-                self.foldcp_config.size_dp * self.foldcp_config.size_cp
+        expected_world_size = self.foldcp_config.size_dp * self.foldcp_config.size_cp
+        if DIST_WRAPPER.world_size != expected_world_size:
+            raise RuntimeError(
+                "Inference topology requires "
+                f"WORLD_SIZE={expected_world_size} for "
+                f"foldcp_size_dp={self.foldcp_config.size_dp}, "
+                f"foldcp_size_cp={self.foldcp_config.size_cp}; got "
+                f"WORLD_SIZE={DIST_WRAPPER.world_size}. Example: "
+                f"{self.foldcp_config.launch_hint()}"
             )
-            if DIST_WRAPPER.world_size != expected_world_size:
-                raise RuntimeError(
-                    "Distributed Fold-CP must be launched with torchrun using "
-                    f"{expected_world_size} processes. Example: "
-                    f"{self.foldcp_config.launch_hint()}"
-                )
 
         self.device = select_torch_device(
             self.configs.device, local_rank=DIST_WRAPPER.local_rank
@@ -186,19 +186,19 @@ class InferenceRunner(object):
         if DIST_WRAPPER.world_size > 1:
             if not self.use_cuda:
                 raise RuntimeError(
-                    "Distributed Fold-CP inference requires NVIDIA CUDA; CPU "
+                    "Distributed inference requires NVIDIA CUDA; CPU "
                     "supports single-process inference only."
                 )
             if not dist.is_nccl_available():
                 raise RuntimeError(
-                    "Distributed Fold-CP inference requires the NCCL backend, "
+                    "Distributed inference requires the NCCL backend, "
                     "which is unavailable in this PyTorch build. Windows "
                     "distributed inference is not currently supported."
                 )
             if dist.is_initialized():
                 if dist.get_backend() != "nccl":
                     raise RuntimeError(
-                        "Distributed Fold-CP requires an NCCL process group."
+                        "Distributed inference requires an NCCL process group."
                     )
             else:
                 dist.init_process_group(
@@ -436,17 +436,7 @@ def update_inference_configs(configs: OpenDDEConfig, n_token: int) -> OpenDDECon
     return configs
 
 
-def infer_predict(runner: InferenceRunner, configs: Any) -> None:
-    """
-    Run the full inference process for the given runner and configurations.
-    Processes all samples in the dataloader for each specified seed.
-
-    Args:
-        runner (InferenceRunner): The initialized runner instance.
-        configs (Any): Inference configurations.
-    """
-    # Data loading
-    logger.info(f"Loading data from {configs.input_json_path}")
+def _resolve_local_inference_seeds(configs: Any) -> list[int]:
     with open(configs.input_json_path, "r", encoding="utf-8") as f:
         json_data = json.load(f)
 
@@ -468,6 +458,79 @@ def infer_predict(runner: InferenceRunner, configs: Any) -> None:
     else:
         seeds = [random.randint(1, 65536)]
         logger.info(f"No seeds provided; sampled random seed: {seeds}")
+    return seeds
+
+
+def _validate_seed_parallel_seeds(seeds: list[int], size_dp: int) -> None:
+    if size_dp <= 1:
+        return
+    if len(set(seeds)) != len(seeds):
+        raise ValueError(
+            "Seed-parallel inference requires unique seeds; "
+            f"got {seeds} for foldcp_size_dp={size_dp}."
+        )
+    if len(seeds) < size_dp:
+        raise ValueError(
+            "Seed-parallel inference requires at least one seed per lane; "
+            f"got {len(seeds)} seeds for foldcp_size_dp={size_dp}."
+        )
+
+
+def _seeds_for_rank(seeds: list[int], size_dp: int, rank: int) -> list[int]:
+    if size_dp <= 1:
+        return seeds
+    return seeds[rank::size_dp]
+
+
+def _resolve_inference_seeds(configs: Any, size_dp: int) -> list[int]:
+    """Resolve and validate seeds on rank 0, then share them with peers."""
+    if DIST_WRAPPER.world_size <= 1:
+        seeds = _resolve_local_inference_seeds(configs)
+        _validate_seed_parallel_seeds(seeds, size_dp)
+        return seeds
+
+    local_error: Exception | None = None
+    status: list[tuple[bool, list[int] | None, str] | None] = [None]
+    if DIST_WRAPPER.rank == 0:
+        try:
+            seeds = _resolve_local_inference_seeds(configs)
+            _validate_seed_parallel_seeds(seeds, size_dp)
+            status[0] = (True, seeds, "")
+        except Exception as exc:
+            local_error = exc
+            status[0] = (False, None, f"{type(exc).__name__}: {exc}")
+
+    dist.broadcast_object_list(status, src=0)
+    result = status[0]
+    if result is None:
+        raise RuntimeError("Rank 0 broadcast an invalid seed-resolution status.")
+
+    succeeded, seeds, error_message = result
+    if not succeeded:
+        error = RuntimeError(f"Seed resolution failed on rank 0: {error_message}")
+        if local_error is not None:
+            raise error from local_error
+        raise error
+    if not isinstance(seeds, list):
+        raise RuntimeError("Rank 0 broadcast invalid inference seeds.")
+    return seeds
+
+
+def infer_predict(runner: InferenceRunner, configs: Any) -> None:
+    """
+    Run the full inference process for the given runner and configurations.
+    Processes all samples in the dataloader for each specified seed.
+
+    Args:
+        runner (InferenceRunner): The initialized runner instance.
+        configs (Any): Inference configurations.
+    """
+    # Data loading
+    logger.info(f"Loading data from {configs.input_json_path}")
+    size_dp = runner.foldcp_config.size_dp
+    seeds = _resolve_inference_seeds(configs, size_dp)
+    seeds = _seeds_for_rank(seeds, size_dp, DIST_WRAPPER.rank)
+    logger.info(f"[Rank {DIST_WRAPPER.rank}] Assigned seeds: {seeds}")
 
     try:
         dataloader = get_inference_dataloader(configs=configs)

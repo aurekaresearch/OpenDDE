@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import List, Literal, Optional, Union
 
 import click
+import torch.distributed as dist
 import tqdm
 from Bio import SeqIO
 from rdkit import Chem
@@ -27,6 +28,7 @@ from opendde.data.inference.json_parser import lig_file_to_atom_info
 from opendde.data.tools import kalign
 from opendde.data.utils import pdb_to_cif
 from opendde.distributed.foldcp.config import FoldCPConfig
+from opendde.utils.distributed import DIST_WRAPPER
 from opendde.utils.logger import get_logger
 from opendde.utils.logging_config import init_logging
 from runner.cli import CONTEXT_SETTINGS, opendde_cli
@@ -40,6 +42,36 @@ from runner.template_search import update_template_info
 
 logger = get_logger(__name__)
 SUPPORTED_MODELS = tuple(model_configs.keys())
+
+
+def _preprocess_input_for_runner(input_json: str, **kwargs) -> str:
+    """Preprocess once on rank 0 and share the resulting input path."""
+    if DIST_WRAPPER.world_size <= 1:
+        return preprocess_input(input_json, **kwargs)
+
+    local_error: Exception | None = None
+    status: list[tuple[bool, str, str] | None] = [None]
+    if DIST_WRAPPER.rank == 0:
+        try:
+            status[0] = (True, preprocess_input(input_json, **kwargs), "")
+        except Exception as exc:
+            local_error = exc
+            status[0] = (False, "", f"{type(exc).__name__}: {exc}")
+
+    dist.broadcast_object_list(status, src=0)
+    result = status[0]
+    if result is None:
+        raise RuntimeError("Rank 0 broadcast an invalid preprocessing status.")
+
+    succeeded, effective_path, error_message = result
+    if not succeeded:
+        error = RuntimeError(f"Preprocessing failed on rank 0: {error_message}")
+        if local_error is not None:
+            raise error from local_error
+        raise error
+    if not effective_path:
+        raise RuntimeError("Rank 0 broadcast an empty preprocessed input path.")
+    return effective_path
 
 
 def preprocess_input(
@@ -312,8 +344,8 @@ def get_default_runner(
         use_rna_msa (bool): Whether to use RNA MSA.
         kalign_binary_path (Optional[str]): Path to kalign binary.
         use_tfg_guidance (bool): Whether to use TFG guidance.
-        foldcp_mode (str): Fold-CP execution mode.
-        foldcp_size_dp (int): Number of data-parallel ranks.
+        foldcp_mode (str): Single-card or distributed Fold-CP execution mode.
+        foldcp_size_dp (int): Number of independent seed lanes.
         foldcp_size_cp (int): Number of context-parallel ranks.
         foldcp_devices (str): Optional visible device list recorded in metrics.
         foldcp_metrics_jsonl (str): Optional JSONL path for benchmark records.
@@ -380,7 +412,7 @@ def get_default_runner(
         f"enable_tf32: {configs.enable_tf32}"
     )
     logger.info(
-        "Fold-CP mode: %s, size_dp=%s, size_cp=%s, mesh=%s, metrics_jsonl=%s",
+        "Inference topology: mode=%s, size_dp=%s, size_cp=%s, mesh=%s, metrics_jsonl=%s",
         foldcp_config.mode,
         foldcp_config.size_dp,
         foldcp_config.size_cp,
@@ -467,8 +499,8 @@ def inference_jsons(
         rfam_database_path (Optional[str]): Rfam database path.
         rna_central_database_path (Optional[str]): RNAcentral database path.
         nhmmer_n_cpu (Optional[int]): Number of CPUs for nhmmer.
-        foldcp_mode (str): Fold-CP execution mode.
-        foldcp_size_dp (int): Number of data-parallel ranks.
+        foldcp_mode (str): Single-card or distributed Fold-CP execution mode.
+        foldcp_size_dp (int): Number of independent seed lanes.
         foldcp_size_cp (int): Number of context-parallel ranks.
         foldcp_devices (str): Optional visible device list recorded in metrics.
         foldcp_metrics_jsonl (str): Optional JSONL path for benchmark records.
@@ -484,7 +516,7 @@ def inference_jsons(
         infer_jsons = [json_file]
     else:
         raise RuntimeError(f"Can not read a special file: {json_file}")
-    infer_jsons = [file for file in infer_jsons if file.endswith(".json")]
+    infer_jsons = sorted(file for file in infer_jsons if file.endswith(".json"))
     logger.info(f"Will infer with {len(infer_jsons)} jsons")
     if len(infer_jsons) == 0:
         return
@@ -522,7 +554,7 @@ def inference_jsons(
         configs = runner.configs
         for _, infer_json in enumerate(tqdm.tqdm(infer_jsons)):
             try:
-                configs["input_json_path"] = preprocess_input(
+                configs["input_json_path"] = _preprocess_input_for_runner(
                     infer_json,
                     out_dir=out_dir,
                     use_msa=use_msa,
@@ -542,6 +574,8 @@ def inference_jsons(
                 )
                 infer_predict(runner, configs)
             except Exception as exc:
+                if DIST_WRAPPER.world_size > 1:
+                    raise
                 infer_errors[infer_json] = str(exc)
         if len(infer_errors) > 0:
             logger.warning(f"Run inference failed: {infer_errors}")
@@ -669,13 +703,16 @@ def inference_jsons(
     "--foldcp_mode",
     type=click.Choice(["single", "distributed"]),
     default="single",
-    help="Fold-CP execution mode: original single-card path or distributed CP path.",
+    help=(
+        "Inference mode: normal single-card model path (including seed lanes) "
+        "or distributed Fold-CP path."
+    ),
 )
 @click.option(
     "--foldcp_size_dp",
     type=int,
     default=1,
-    help="Number of data-parallel ranks for Fold-CP.",
+    help="Number of independent seed lanes; values above 1 require P=1.",
 )
 @click.option(
     "--foldcp_size_cp",
@@ -850,8 +887,8 @@ def predict(
         rfam_database_path (Optional[str]): Rfam database path.
         rna_central_database_path (Optional[str]): RNAcentral database path.
         nhmmer_n_cpu (Optional[int]): Number of CPUs for nhmmer.
-        foldcp_mode (str): Fold-CP execution mode.
-        foldcp_size_dp (int): Number of data-parallel ranks.
+        foldcp_mode (str): Single-card or distributed Fold-CP execution mode.
+        foldcp_size_dp (int): Number of independent seed lanes.
         foldcp_size_cp (int): Number of context-parallel ranks.
         foldcp_devices (str): Optional visible device list recorded in metrics.
         foldcp_metrics_jsonl (str): Optional JSONL path for benchmark records.

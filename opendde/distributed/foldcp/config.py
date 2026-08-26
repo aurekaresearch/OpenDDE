@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Aureka AI Research
-"""Runtime flags for single-process or multi-GPU 1 x P Fold-CP inference."""
+"""Runtime flags for serial, seed-parallel, or 1 x P Fold-CP inference."""
 
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ def _as_int(value: Any, default: int) -> int:
 
 @dataclass(frozen=True)
 class FoldCPConfig:
-    """Validated Fold-CP launch configuration."""
+    """Validated inference topology configuration."""
 
     mode: FoldCPMode = "single"
     size_dp: int = 1
@@ -69,9 +69,17 @@ class FoldCPConfig:
             raise ValueError("foldcp_size_dp must be >= 1.")
         if self.size_cp < 1:
             raise ValueError("foldcp_size_cp must be >= 1.")
+        if self.size_dp > 1 and self.size_cp > 1:
+            raise ValueError(
+                "Hybrid seed-parallel and Fold-CP inference is not supported: "
+                f"foldcp_size_dp={self.size_dp}, foldcp_size_cp={self.size_cp}. "
+                "Use P = 1 or D = 1."
+            )
         if self.mode == "single" and self.size_cp != 1:
             raise ValueError("foldcp_mode='single' requires foldcp_size_cp=1.")
         if self.mode == "distributed":
+            if self.size_dp != 1:
+                raise ValueError("foldcp_mode='distributed' requires foldcp_size_dp=1.")
             if self.size_cp == 1:
                 raise ValueError(
                     "foldcp_mode='distributed' requires foldcp_size_cp > 1."
@@ -101,6 +109,12 @@ class FoldCPConfig:
                 f"torchrun --nproc_per_node {nproc} -m runner.batch_inference pred "
                 f"--foldcp_mode distributed --foldcp_size_dp {self.size_dp} "
                 f"--foldcp_size_cp {self.size_cp}"
+            )
+        if self.size_dp > 1:
+            return (
+                f"torchrun --standalone --nproc_per_node {self.size_dp} "
+                "-m runner.batch_inference pred --foldcp_mode single "
+                f"--foldcp_size_dp {self.size_dp} --foldcp_size_cp 1"
             )
         return (
             "python -m runner.batch_inference pred "

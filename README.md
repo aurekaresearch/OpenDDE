@@ -209,6 +209,25 @@ For production runs, enable the preprocessing features you need, for example
 require network access, HMMER/Kalign binaries, and large local search databases;
 see the inference guide for details.
 
+## Multi-GPU Seed-Parallel Inference
+
+Independent seeds can run concurrently on separate GPUs with the existing
+topology flags. `D=4, P=1` uses the normal single-card model path on four seed
+lanes:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node 4 \
+  -m runner.batch_inference pred \
+  -i input.json -o output_dp4 -n opendde_v1 \
+  --seeds 101,102,103,104 \
+  --foldcp_mode single \
+  --foldcp_size_dp 4 \
+  --foldcp_size_cp 1
+```
+
+Seed-parallel seeds must be unique, and their count must be at least `D`. Each
+seed is assigned to one rank and written once under the normal output layout.
+
 ## Multi-GPU Fold-CP Inference
 
 > [!IMPORTANT]

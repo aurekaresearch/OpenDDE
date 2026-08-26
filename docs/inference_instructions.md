@@ -241,7 +241,39 @@ Device auto-selection uses NVIDIA CUDA when available and otherwise CPU.
 cuEquivariance is selected only when its Linux CUDA packages import successfully;
 otherwise the model uses PyTorch triangle kernels.
 
-## Multi-GPU Fold-CP inference
+## Multi-GPU inference
+
+The existing topology flags support serial inference, independent seed lanes,
+or Fold-CP. Let `D=--foldcp_size_dp` and `P=--foldcp_size_cp`:
+
+| Mode | `foldcp_mode` | `D` | `P` | Required world size |
+| --- | --- | ---: | ---: | ---: |
+| Serial | `single` | 1 | 1 | 1 |
+| Seed parallel | `single` | >1 | 1 | `D` |
+| Fold-CP | `distributed` | 1 | >1 | `P` |
+| Hybrid | - | >1 | >1 | Rejected |
+
+`WORLD_SIZE` must equal `D * P`. Hybrid and mismatched-world-size launches fail
+instead of falling back to serial inference. Multi-GPU inference in this release
+is single-node and requires all ranks to share the input and output filesystem.
+
+### Seed parallel `D x 1`
+
+Seed parallelism runs the normal single-card model independently on each GPU.
+Rank `r` receives `seeds[r::D]`, so seeds must be unique and their count must be
+at least `D`. For example:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node 4 \
+  -m runner.batch_inference pred \
+  -i input.json -o output_dp4 -n opendde_v1 \
+  --seeds 101,102,103,104 \
+  --foldcp_mode single \
+  --foldcp_size_dp 4 \
+  --foldcp_size_cp 1
+```
+
+### Fold-CP `1 x P`
 
 > [!IMPORTANT]
 > Fold-CP inference does not currently support cuEquivariance (`cueq`) triangle
@@ -288,8 +320,8 @@ Runtime notes:
 - Optional `--foldcp_metrics_jsonl path/to/metrics.jsonl` records Fold-CP timing
   and memory metrics.
 
-For single-GPU inference, omit the Fold-CP flags or set
-`--foldcp_mode single --foldcp_size_cp 1`.
+For single-GPU inference, omit the topology flags or set
+`--foldcp_mode single --foldcp_size_dp 1 --foldcp_size_cp 1`.
 
 Use prepared features:
 
@@ -331,9 +363,9 @@ Outputs are written to:
 | `--use_template` | Use/generate template features. |
 | `--use_rna_msa` | Use/generate RNA MSA features. |
 | `--use_tfg_guidance` | Enable Training-Free Guidance. |
-| `--foldcp_mode` | `single` or `distributed`; use `distributed` with `torchrun` for multi-GPU Fold-CP inference. |
-| `--foldcp_size_dp` | Number of data-parallel ranks. Use `1` for the documented `1 x P` Fold-CP topology. |
-| `--foldcp_size_cp` | Number of context-parallel ranks in the `1 x P` mesh; must match the launched process count when `size_dp=1`. |
+| `--foldcp_mode` | Use `single` for serial or seed-parallel inference and `distributed` only for `1 x P` Fold-CP. |
+| `--foldcp_size_dp` | Number of independent seed lanes; values greater than one require `P=1`. |
+| `--foldcp_size_cp` | Number of Fold-CP ranks per seed; values greater than one require `D=1`. |
 | `--foldcp_devices` | Optional visible-device list recorded in Fold-CP metrics; actual GPU visibility is controlled by `CUDA_VISIBLE_DEVICES`. |
 | `--foldcp_metrics_jsonl` | Optional JSONL path for Fold-CP timing and memory metrics. |
 | `--dtype` | `bf16` or `fp32`. |

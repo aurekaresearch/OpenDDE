@@ -303,6 +303,386 @@ def test_foldcp_config_validation_is_independent_of_process_environment(monkeypa
     assert FoldCPConfig().validate().mode == "single"
 
 
+@pytest.mark.parametrize(
+    ("mode", "size_dp", "size_cp", "world_size"),
+    [
+        ("single", 1, 1, 1),
+        ("single", 2, 1, 2),
+        ("single", 3, 1, 3),
+        ("single", 4, 1, 4),
+        ("distributed", 1, 2, 2),
+        ("distributed", 1, 3, 3),
+        ("distributed", 1, 4, 4),
+    ],
+)
+def test_matching_world_size_reaches_device_selection(
+    monkeypatch, mode, size_dp, size_cp, world_size
+):
+    from opendde.distributed.foldcp.config import FoldCPConfig
+    from runner import inference
+
+    class DeviceSelectionReached(Exception):
+        pass
+
+    runner = object.__new__(inference.InferenceRunner)
+    runner.foldcp_config = FoldCPConfig.from_runtime_args(
+        mode=mode,
+        size_dp=size_dp,
+        size_cp=size_cp,
+    )
+    runner.configs = SimpleNamespace(device="auto")
+    runner.print = lambda _message: None
+    monkeypatch.setattr(
+        inference,
+        "DIST_WRAPPER",
+        SimpleNamespace(world_size=world_size, rank=0, local_rank=0),
+    )
+    monkeypatch.setattr(
+        inference,
+        "select_torch_device",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(DeviceSelectionReached),
+    )
+
+    with pytest.raises(DeviceSelectionReached):
+        runner.init_env()
+
+
+def test_world_size_mismatch_fails_before_device_or_model_selection(monkeypatch):
+    from opendde.distributed.foldcp.config import FoldCPConfig
+    from runner import inference
+
+    runner = object.__new__(inference.InferenceRunner)
+    runner.foldcp_config = FoldCPConfig.from_runtime_args(
+        mode="single", size_dp=4, size_cp=1
+    )
+    runner.configs = SimpleNamespace(device="auto")
+    runner.print = lambda _message: None
+    monkeypatch.setattr(
+        inference,
+        "DIST_WRAPPER",
+        SimpleNamespace(world_size=2, rank=0, local_rank=0),
+    )
+    monkeypatch.setattr(
+        inference,
+        "select_torch_device",
+        lambda *_args, **_kwargs: pytest.fail(
+            "world-size mismatch must fail before device or model selection"
+        ),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"WORLD_SIZE=4.*foldcp_size_dp=4.*foldcp_size_cp=1.*WORLD_SIZE=2",
+    ):
+        runner.init_env()
+
+
+def test_predict_help_describes_seed_lanes():
+    from click.testing import CliRunner
+
+    from runner import batch_inference
+
+    result = CliRunner().invoke(
+        batch_inference.predict,
+        ["--help"],
+        terminal_width=160,
+    )
+
+    assert result.exit_code == 0
+    assert "--foldcp_size_dp" in result.output
+    assert "Number of independent seed lanes" in result.output
+    assert "normal single-card model path (including seed lanes)" in result.output
+
+
+def test_seed_assignment_is_rank_strided_without_loss_or_duplication():
+    from runner.inference import _seeds_for_rank
+
+    seeds = [101, 102, 103, 104, 105, 106]
+    assignments = [_seeds_for_rank(seeds, 4, rank) for rank in range(4)]
+
+    assert assignments == [[101, 105], [102, 106], [103], [104]]
+    assert sorted(seed for lane in assignments for seed in lane) == seeds
+    assert _seeds_for_rank(seeds, 1, 3) == seeds
+
+
+def test_local_seed_resolution_preserves_precedence(monkeypatch, tmp_path):
+    from runner import inference
+
+    input_path = tmp_path / "input.json"
+    input_path.write_text(
+        '[{"modelSeeds": [11, 12]}, {"modelSeeds": [31, 32]}]',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(inference.random, "randint", lambda *_args: 41)
+
+    configs = SimpleNamespace(input_json_path=str(input_path), seeds=[21, 22])
+    assert inference._resolve_local_inference_seeds(configs) == [21, 22]
+
+    configs.seeds = []
+    assert inference._resolve_local_inference_seeds(configs) == [11, 12]
+
+    input_path.write_text('[{"name": "no-seeds"}]', encoding="utf-8")
+    assert inference._resolve_local_inference_seeds(configs) == [41]
+
+
+def test_rank_zero_resolves_and_broadcasts_seeds_once(monkeypatch, tmp_path):
+    from runner import inference
+
+    input_path = tmp_path / "input.json"
+    input_path.write_text('[{"modelSeeds": [101, 102]}]', encoding="utf-8")
+    broadcasts = []
+    monkeypatch.setattr(
+        inference,
+        "DIST_WRAPPER",
+        SimpleNamespace(world_size=2, rank=0, local_rank=0),
+    )
+    monkeypatch.setattr(
+        inference.dist,
+        "broadcast_object_list",
+        lambda status, src: broadcasts.append((list(status), src)),
+    )
+
+    seeds = inference._resolve_inference_seeds(
+        SimpleNamespace(input_json_path=str(input_path), seeds=[]),
+        size_dp=2,
+    )
+
+    assert seeds == [101, 102]
+    assert broadcasts == [([(True, [101, 102], "")], 0)]
+
+
+@pytest.mark.parametrize(
+    ("seeds", "message"),
+    [
+        ([101, 101], "requires unique seeds"),
+        ([101], "requires at least one seed per lane"),
+    ],
+)
+def test_rank_zero_broadcasts_seed_validation_failure(
+    monkeypatch, tmp_path, seeds, message
+):
+    from runner import inference
+
+    input_path = tmp_path / "input.json"
+    input_path.write_text('[{"name": "sample"}]', encoding="utf-8")
+    broadcasts = []
+    monkeypatch.setattr(
+        inference,
+        "DIST_WRAPPER",
+        SimpleNamespace(world_size=2, rank=0, local_rank=0),
+    )
+    monkeypatch.setattr(
+        inference.dist,
+        "broadcast_object_list",
+        lambda status, src: broadcasts.append((list(status), src)),
+    )
+
+    with pytest.raises(RuntimeError, match=message):
+        inference._resolve_inference_seeds(
+            SimpleNamespace(input_json_path=str(input_path), seeds=seeds),
+            size_dp=2,
+        )
+
+    assert broadcasts[0][0][0][0] is False
+    assert message in broadcasts[0][0][0][2]
+
+
+def test_nonzero_rank_receives_seeds_without_opening_input(monkeypatch):
+    from runner import inference
+
+    monkeypatch.setattr(
+        inference,
+        "DIST_WRAPPER",
+        SimpleNamespace(world_size=2, rank=1, local_rank=1),
+    )
+    monkeypatch.setattr(
+        inference,
+        "_resolve_local_inference_seeds",
+        lambda _configs: pytest.fail("nonzero rank must not resolve seeds"),
+    )
+
+    def receive(status, src):
+        assert src == 0
+        status[0] = (True, [101, 102], "")
+
+    monkeypatch.setattr(inference.dist, "broadcast_object_list", receive)
+
+    assert inference._resolve_inference_seeds(object(), size_dp=2) == [101, 102]
+
+
+def test_rank_zero_preprocesses_once_and_broadcasts_path(monkeypatch):
+    from runner import batch_inference
+
+    calls = []
+    broadcasts = []
+    monkeypatch.setattr(
+        batch_inference,
+        "DIST_WRAPPER",
+        SimpleNamespace(world_size=2, rank=0, local_rank=0),
+    )
+    monkeypatch.setattr(
+        batch_inference,
+        "preprocess_input",
+        lambda input_json, **_kwargs: calls.append(input_json) or "updated.json",
+    )
+    monkeypatch.setattr(
+        batch_inference.dist,
+        "broadcast_object_list",
+        lambda status, src: broadcasts.append((list(status), src)),
+    )
+
+    result = batch_inference._preprocess_input_for_runner("input.json")
+
+    assert result == "updated.json"
+    assert calls == ["input.json"]
+    assert broadcasts == [([(True, "updated.json", "")], 0)]
+
+
+def test_rank_zero_broadcasts_preprocessing_failure(monkeypatch):
+    from runner import batch_inference
+
+    broadcasts = []
+    monkeypatch.setattr(
+        batch_inference,
+        "DIST_WRAPPER",
+        SimpleNamespace(world_size=2, rank=0, local_rank=0),
+    )
+    monkeypatch.setattr(
+        batch_inference,
+        "preprocess_input",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            OSError("preprocessing unavailable")
+        ),
+    )
+    monkeypatch.setattr(
+        batch_inference.dist,
+        "broadcast_object_list",
+        lambda status, src: broadcasts.append((list(status), src)),
+    )
+
+    with pytest.raises(RuntimeError, match="preprocessing unavailable"):
+        batch_inference._preprocess_input_for_runner("input.json")
+
+    assert broadcasts == [([(False, "", "OSError: preprocessing unavailable")], 0)]
+
+
+def test_nonzero_rank_receives_preprocessing_failure(monkeypatch):
+    from runner import batch_inference
+
+    monkeypatch.setattr(
+        batch_inference,
+        "DIST_WRAPPER",
+        SimpleNamespace(world_size=2, rank=1, local_rank=1),
+    )
+    monkeypatch.setattr(
+        batch_inference,
+        "preprocess_input",
+        lambda *_args, **_kwargs: pytest.fail("nonzero rank must not preprocess"),
+    )
+
+    def receive(status, src):
+        assert src == 0
+        status[0] = (False, "", "OSError: preprocessing unavailable")
+
+    monkeypatch.setattr(batch_inference.dist, "broadcast_object_list", receive)
+
+    with pytest.raises(RuntimeError, match="preprocessing unavailable"):
+        batch_inference._preprocess_input_for_runner("input.json")
+
+
+def test_directory_inputs_are_processed_in_sorted_order(monkeypatch, tmp_path):
+    from runner import batch_inference
+
+    (tmp_path / "b.json").write_text("[]", encoding="utf-8")
+    (tmp_path / "a.json").write_text("[]", encoding="utf-8")
+    (tmp_path / "ignored.txt").write_text("", encoding="utf-8")
+    processed = []
+    inferred = []
+    closed = []
+    runner = SimpleNamespace(configs={}, close=lambda: closed.append(True))
+    monkeypatch.setattr(
+        batch_inference,
+        "DIST_WRAPPER",
+        SimpleNamespace(world_size=1, rank=0, local_rank=0),
+    )
+    monkeypatch.setattr(
+        batch_inference,
+        "get_default_runner",
+        lambda **_kwargs: runner,
+    )
+    monkeypatch.setattr(
+        batch_inference,
+        "_preprocess_input_for_runner",
+        lambda input_json, **_kwargs: processed.append(input_json) or input_json,
+    )
+    monkeypatch.setattr(
+        batch_inference,
+        "infer_predict",
+        lambda _runner, configs: inferred.append(configs["input_json_path"]),
+    )
+    monkeypatch.setattr(batch_inference.tqdm, "tqdm", lambda values: values)
+
+    batch_inference.inference_jsons(str(tmp_path))
+
+    expected = [str(tmp_path / "a.json"), str(tmp_path / "b.json")]
+    assert processed == expected
+    assert inferred == expected
+    assert closed == [True]
+
+
+def test_distributed_preprocessing_failure_escapes_and_closes_runner(
+    monkeypatch, tmp_path
+):
+    from runner import batch_inference
+
+    input_path = tmp_path / "input.json"
+    input_path.write_text("[]", encoding="utf-8")
+    closed = []
+    runner = SimpleNamespace(configs={}, close=lambda: closed.append(True))
+    monkeypatch.setattr(
+        batch_inference,
+        "DIST_WRAPPER",
+        SimpleNamespace(world_size=2, rank=0, local_rank=0),
+    )
+    monkeypatch.setattr(
+        batch_inference,
+        "get_default_runner",
+        lambda **_kwargs: runner,
+    )
+    monkeypatch.setattr(
+        batch_inference,
+        "_preprocess_input_for_runner",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("preprocessing failed")
+        ),
+    )
+    monkeypatch.setattr(batch_inference.tqdm, "tqdm", lambda values: values)
+
+    with pytest.raises(RuntimeError, match="preprocessing failed"):
+        batch_inference.inference_jsons(str(input_path))
+
+    assert closed == [True]
+
+
+def test_inference_dataloader_keeps_all_records_in_order(monkeypatch):
+    from torch.utils.data import SequentialSampler
+
+    from opendde.data.inference import infer_dataloader
+
+    records = ["first", "second"]
+    monkeypatch.setattr(
+        infer_dataloader,
+        "InferenceDataset",
+        lambda configs: records,
+    )
+    configs = SimpleNamespace(num_workers=0)
+
+    loaders = [infer_dataloader.get_inference_dataloader(configs) for _ in range(2)]
+
+    assert all(isinstance(loader.sampler, SequentialSampler) for loader in loaders)
+    assert [list(loader.sampler) for loader in loaders] == [[0, 1], [0, 1]]
+
+
 def test_get_default_runner_uses_shared_kalign_resolver(monkeypatch):
     from runner import batch_inference
 
@@ -605,9 +985,11 @@ def _patch_cuda_distributed_runner(monkeypatch, inference, *, initialized):
 
 
 def test_failed_runner_destroys_process_group_it_created(monkeypatch):
+    from opendde.distributed.foldcp.config import FoldCPConfig
     from runner import inference
 
     configs = build_inference_config(fill_required_with_null=True)
+    foldcp = FoldCPConfig.from_runtime_args(mode="distributed", size_dp=1, size_cp=2)
     calls = _patch_cuda_distributed_runner(monkeypatch, inference, initialized=False)
 
     def fail_init_basics(self):
@@ -616,7 +998,7 @@ def test_failed_runner_destroys_process_group_it_created(monkeypatch):
     monkeypatch.setattr(inference.InferenceRunner, "init_basics", fail_init_basics)
 
     with pytest.raises(RuntimeError, match="initialization failed"):
-        inference.InferenceRunner(configs)
+        inference.InferenceRunner(configs, foldcp_config=foldcp)
 
     assert calls == {
         "init": [("nccl", inference._DISTRIBUTED_STARTUP_TIMEOUT)],
@@ -625,9 +1007,11 @@ def test_failed_runner_destroys_process_group_it_created(monkeypatch):
 
 
 def test_failed_runner_preserves_preinitialized_process_group(monkeypatch):
+    from opendde.distributed.foldcp.config import FoldCPConfig
     from runner import inference
 
     configs = build_inference_config(fill_required_with_null=True)
+    foldcp = FoldCPConfig.from_runtime_args(mode="distributed", size_dp=1, size_cp=2)
     calls = _patch_cuda_distributed_runner(monkeypatch, inference, initialized=True)
 
     def fail_init_basics(self):
@@ -636,7 +1020,7 @@ def test_failed_runner_preserves_preinitialized_process_group(monkeypatch):
     monkeypatch.setattr(inference.InferenceRunner, "init_basics", fail_init_basics)
 
     with pytest.raises(RuntimeError, match="initialization failed"):
-        inference.InferenceRunner(configs)
+        inference.InferenceRunner(configs, foldcp_config=foldcp)
 
     assert calls == {"init": [], "destroy": 0}
 
@@ -763,6 +1147,152 @@ def test_main_closes_runner_when_inference_fails(monkeypatch):
     assert len(closed) == 1
 
 
+@pytest.mark.parametrize("seeds", [[101, 101], [101]])
+def test_invalid_seed_parallel_request_fails_before_dataloader_or_forward(
+    monkeypatch, tmp_path, seeds
+):
+    from runner import inference
+
+    input_path = tmp_path / "input.json"
+    input_path.write_text('[{"name": "sample"}]', encoding="utf-8")
+    monkeypatch.setattr(
+        inference,
+        "DIST_WRAPPER",
+        SimpleNamespace(world_size=1, rank=0, local_rank=0),
+    )
+    monkeypatch.setattr(
+        inference,
+        "get_inference_dataloader",
+        lambda **_kwargs: pytest.fail("invalid seeds must fail before data loading"),
+    )
+    runner = SimpleNamespace(
+        foldcp_config=SimpleNamespace(size_dp=2),
+        predict=lambda _data: pytest.fail("invalid seeds must fail before forward"),
+    )
+    configs = SimpleNamespace(input_json_path=str(input_path), seeds=seeds)
+
+    with pytest.raises(ValueError, match="Seed-parallel inference requires"):
+        inference.infer_predict(runner, configs)
+
+
+def test_seed_parallel_and_foldcp_output_ownership(monkeypatch, tmp_path):
+    from runner import inference
+
+    class OrderedLoader:
+        dataset = [object(), object()]
+
+        def __iter__(self):
+            for sample_index, sample_name in enumerate(("job-a", "job-b")):
+                data = {
+                    "sample_name": sample_name,
+                    "sample_index": sample_index,
+                    "N_asym": torch.tensor(1),
+                    "N_token": torch.tensor(1),
+                    "N_atom": torch.tensor(1),
+                    "N_msa": torch.tensor(1),
+                    "entity_poly_type": {},
+                    "input_feature_dict": {},
+                }
+                yield [(data, None, "")]
+
+    monkeypatch.setattr(
+        inference,
+        "get_inference_dataloader",
+        lambda **_kwargs: OrderedLoader(),
+    )
+    monkeypatch.setattr(
+        inference, "cleanup_device_memory", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(inference, "seed_everything", lambda **_kwargs: None)
+
+    def run_rank(rank, *, size_dp, foldcp_enabled, seeds):
+        predictions = []
+        dumps = []
+        monkeypatch.setattr(
+            inference,
+            "DIST_WRAPPER",
+            SimpleNamespace(world_size=2, rank=rank, local_rank=rank),
+        )
+        monkeypatch.setattr(
+            inference,
+            "_resolve_inference_seeds",
+            lambda _configs, _size_dp: list(seeds),
+        )
+
+        def predict(data):
+            predictions.append(
+                (
+                    data["sample_name"],
+                    int(data["input_feature_dict"]["inference_seed"]),
+                )
+            )
+            return {}
+
+        runner = SimpleNamespace(
+            device=torch.device("cpu"),
+            error_dir=str(tmp_path / f"errors-{rank}"),
+            foldcp_config=SimpleNamespace(
+                enabled=foldcp_enabled,
+                size_dp=size_dp,
+            ),
+            update_model_configs=lambda _configs: None,
+            predict=predict,
+            dumper=SimpleNamespace(
+                dump=lambda **kwargs: dumps.append((kwargs["pdb_id"], kwargs["seed"]))
+            ),
+        )
+        configs = SimpleNamespace(
+            input_json_path="input.json",
+            deterministic=False,
+            dump_dir=str(tmp_path),
+            skip_amp=SimpleNamespace(
+                confidence_head=False,
+                sample_diffusion=False,
+            ),
+        )
+
+        inference.infer_predict(runner, configs)
+        return predictions, dumps
+
+    dp_results = [
+        run_rank(
+            rank,
+            size_dp=2,
+            foldcp_enabled=False,
+            seeds=[101, 102, 103, 104],
+        )
+        for rank in range(2)
+    ]
+    assert dp_results[0][0] == [
+        ("job-a", 101),
+        ("job-b", 101),
+        ("job-a", 103),
+        ("job-b", 103),
+    ]
+    assert dp_results[1][0] == [
+        ("job-a", 102),
+        ("job-b", 102),
+        ("job-a", 104),
+        ("job-b", 104),
+    ]
+    assert dp_results[0][1] == dp_results[0][0]
+    assert dp_results[1][1] == dp_results[1][0]
+
+    cp_results = [
+        run_rank(rank, size_dp=1, foldcp_enabled=True, seeds=[101]) for rank in range(2)
+    ]
+    assert (
+        cp_results[0][0]
+        == cp_results[1][0]
+        == [
+            ("job-a", 101),
+            ("job-b", 101),
+        ]
+    )
+    assert cp_results[0][1] == cp_results[0][0]
+    assert cp_results[1][1] == []
+
+
 def test_infer_predict_releases_batch_before_seed_cleanup(monkeypatch, tmp_path):
     from runner import inference
 
@@ -814,7 +1344,7 @@ def test_infer_predict_releases_batch_before_seed_cleanup(monkeypatch, tmp_path)
     runner = SimpleNamespace(
         device=torch.device("cpu"),
         error_dir=str(tmp_path / "errors"),
-        foldcp_config=SimpleNamespace(enabled=False),
+        foldcp_config=SimpleNamespace(enabled=False, size_dp=1),
         update_model_configs=lambda _configs: None,
         predict=lambda _data: {},
         dumper=SimpleNamespace(dump=lambda **_kwargs: None),

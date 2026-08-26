@@ -4,7 +4,11 @@ User-facing changes to OpenDDE are documented here.
 
 ## [Unreleased]
 
-No changes yet.
+### Added
+
+- Added single-node seed-parallel `D x 1` inference using the existing Fold-CP
+  topology flags, while preserving serial and `1 x P` Fold-CP behavior and
+  rejecting hybrid `D > 1, P > 1` launches.
 
 ## [1.1.0] - 2026-08-16
 

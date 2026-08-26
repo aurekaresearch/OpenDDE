@@ -10,7 +10,7 @@ from typing import Any, cast
 
 import torch
 from biotite.structure import AtomArray
-from torch.utils.data import DataLoader, Dataset, DistributedSampler
+from torch.utils.data import DataLoader, Dataset
 
 from opendde.data.core import ccd
 from opendde.data.inference.json_to_feature import SampleDictToFeatures
@@ -18,7 +18,6 @@ from opendde.data.msa.msa_featurizer import InferenceMSAFeaturizer
 from opendde.data.template.template_featurizer import InferenceTemplateFeaturizer
 from opendde.data.template.template_utils import TemplateHitFeaturizer
 from opendde.data.utils import data_type_transform, make_dummy_feature
-from opendde.utils.distributed import DIST_WRAPPER
 from opendde.utils.torch_utils import collate_fn_identity, dict_to_tensor
 
 logger = logging.getLogger(__name__)
@@ -39,16 +38,10 @@ def get_inference_dataloader(configs: Any) -> DataLoader:
     inference_dataset = InferenceDataset(
         configs=configs,
     )
-    sampler = DistributedSampler(
-        dataset=inference_dataset,
-        num_replicas=DIST_WRAPPER.world_size,
-        rank=DIST_WRAPPER.rank,
-        shuffle=False,
-    )
     dataloader = DataLoader(
         dataset=inference_dataset,
         batch_size=1,
-        sampler=sampler,
+        shuffle=False,
         collate_fn=collate_fn_identity,
         num_workers=configs.num_workers,
     )

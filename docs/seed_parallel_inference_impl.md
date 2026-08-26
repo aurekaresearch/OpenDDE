@@ -1,6 +1,6 @@
 # Seed-Parallel Inference Implementation
 
-Status: Implementation and qualification in progress
+Status: Implemented and locally qualified
 Date: 2026-08-26
 Source: `docs/seed_parallel_inference_spec.md`
 
@@ -170,10 +170,83 @@ logs, caches, or machine-specific paths.
 
 ## Acceptance evidence
 
-Append final commands and results here only after the implementation commit has
-passed the automated checks and local matrix. Prior `D x 1` results measured
-rank sharding with scalar per-seed model calls and are not evidence for
-same-GPU batching.
+Implementation commit: `b0a5ddb`.
+
+Automated qualification passed with `335 passed, 4 deselected, 44 subtests
+passed` for the non-network suite. `ruff check .`, `ruff format --check .`, and
+`git diff --check` also passed. The focused model-stage test executes a real
+small `DiffusionModule` and `ConfidenceHead` with `B=2, N_sample=2` and compares
+both seed lanes with scalar calls.
+
+Local GPU qualification used BF16, deterministic algorithms, TF32 disabled,
+MSA enabled, one recycle, two diffusion steps, and one sample unless stated
+otherwise. End-to-end time includes process startup, model load, featurization,
+model execution, and output writing. Peak memory was sampled every 200 ms with
+`nvidia-smi`. The released checkpoint was 2,625,249,069 bytes with SHA-256
+`7b826620390afad877ee2babc6a4d0df81b94d3a0be030959853d6a7da0807cc`.
+
+The scalar time in this table runs the same number of seeds sequentially with
+`B=1`. `Max B` succeeded and the next explicit width OOMed; no run retried at a
+smaller width.
+
+| GPU | MSA case (`N_token/N_atom/N_msa`) | Max B | Next | B=1 time (s) | Batched time (s) | Speedup | B=1 / batched peak MiB |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| RTX 3090 24 GiB | 7R6R (`245/2529/703`) | 10 | 11 OOM | 48.382 | 42.725 | 1.132x | 6,138 / 23,208 |
+| RTX 3090 24 GiB | 5SAK (`437/3074/9667`) | 3 | 4 OOM | 51.854 | 49.732 | 1.043x | 12,414 / 21,408 |
+| RTX 3090 24 GiB | 7ST3 (`545/4281/12707`) | 2 | 3 OOM | 59.024 | 55.422 | 1.065x | 17,530 / 23,630 |
+| RTX 3090 24 GiB | 7PZB single copy (`300/2611/12424`) | 7 | 8 OOM | 55.550 | 54.588 | 1.018x | 7,470 / 23,432 |
+| RTX 3090 24 GiB | 9FM7 single copy (`322/2186/8856`) | 6 | 7 OOM | 48.137 | 53.557 | 0.899x | 7,722 / 23,748 |
+| RTX 4090 48 GiB | 7R6R (`245/2529/703`) | 21 | 22 OOM | 66.965 | 57.812 | 1.158x | 6,290 / 47,884 |
+| RTX 4090 48 GiB | 5SAK (`437/3074/9667`) | 7 | 8 OOM | 63.147 | 60.595 | 1.042x | 12,566 / 46,866 |
+| RTX 4090 48 GiB | 7ST3 (`545/4281/12707`) | 4 | 5 OOM | 59.662 | 71.813 | 0.831x | 17,682 / 46,320 |
+| RTX 4090 48 GiB | 7PZB single copy (`300/2611/12424`) | 13 | 14 OOM | 66.031 | 58.972 | 1.120x | 7,622 / 45,992 |
+| RTX 4090 48 GiB | 9FM7 single copy (`322/2186/8856`) | 14 | 15 OOM | 73.820 | 66.703 | 1.107x | 7,874 / 46,950 |
+
+The checked-in 7PZB and 9FM7 examples describe doubled assemblies. Their real
+single-copy protein/nucleic-acid or ligand assemblies were used so the required
+`B=2` control fits on a 24 GiB GPU; both retain their checked-in MSA features.
+The full doubled assemblies explicitly OOMed at `B=2` on the RTX 3090.
+
+A longer 7R6R control used ten recycles and 200 diffusion steps for the same two
+seeds:
+
+| GPU | B=1 / B=2 time (s) | Speedup | B=1 / B=2 peak MiB | B=1 / B=2 seeds/min |
+| --- | ---: | ---: | ---: | ---: |
+| RTX 3090 | 69.839 / 64.607 | 1.081x | 6,138 / 9,116 | 1.718 / 1.857 |
+| RTX 4090 | 58.003 / 50.534 | 1.148x | 6,290 / 9,268 | 2.069 / 2.375 |
+
+The unified sharding-plus-batching path produced exactly eight seed outputs for
+`D=4, P=1, B=2` and the expected rank-strided assignments. The same 7R6R test
+completed in 24.675 s for `D=2` (four seeds), 25.215 s for `D=3` (six seeds),
+and 25.750 s for `D=4` (eight seeds), at approximately 9.2 GiB per rank. A
+single-GPU `B=2` run with three seeds also completed its `[2, 1]` partial tail.
+
+The 7EOW antibody-antigen case used `N_sample=2` and the ABAG checkpoint,
+2,625,271,509 bytes with SHA-256
+`5cf37441ddef2a2f148b81dd4a218ad274f996fecaf17dec901ab6cf1351713d`.
+Four fixed seeds with `B=1` completed in 45.887, 33.958, 34.351, and 27.091 s
+for `D=1,2,3,4`, respectively; `D=4` peaked at 10,106/10,106/10,106/10,274
+MiB. On one RTX 4090, two seeds in one true batch completed in 30.032 s at
+44,934 MiB versus 29.691 s at 24,982 MiB for sequential `B=1`; `B=2` OOMed on
+the RTX 3090. This large case is memory-bound and does not benefit from local
+batching.
+
+Existing Fold-CP remained scalar in the seed dimension: `P=2,3,4`, `B=1`
+completed the small regression in 23.695, 24.283, and 24.804 s with one output
+and approximately 5.8-6.0 GiB per rank. The batched Fold-CP, hybrid topology,
+world-size, worker, nested-model-seed, and TFG guards all failed before model
+selection or loading as specified.
+
+Every successful comparison had the exact requested seed/sample cardinality,
+matching CIF schema and atom identity/order, and finite CIF and JSON values.
+Per-lane MSA permutations and diffusion random draws matched scalar streams in
+focused tests. End-to-end BF16 predictions were not bitwise equivalent: across
+the five maximum-width cases, maximum absolute coordinate deltas versus scalar
+runs ranged from 3.59 to 37.98 Angstrom on the RTX 4090 and 3.63 to 32.86
+Angstrom on the RTX 3090; maximum summary-confidence deltas ranged from 0.061 to
+0.663 and 0.074 to 0.671, respectively. These observed deltas are recorded, not
+accepted as a numerical tolerance; maximum-capacity widths are likewise not a
+throughput recommendation.
 
 ## Complexity inventory
 

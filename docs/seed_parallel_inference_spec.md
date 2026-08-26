@@ -1,6 +1,6 @@
 # Seed-Parallel Inference Specification
 
-Status: Implementation and qualification in progress
+Status: Implemented and locally qualified
 Date: 2026-08-26
 
 This specification adds tensor-batched seed inference on one GPU and composes

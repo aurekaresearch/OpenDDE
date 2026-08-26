@@ -842,11 +842,10 @@ class DiffusionConditioning(nn.Module):
         z_pair_trunk = z_trunk
         if self.compress_pair_z:
             z_pair_trunk = self._project_z_trunk(z_trunk)
+        relp = self.relpe(relp_feature)
+        relp = relp.expand(*z_pair_trunk.shape[:-1], relp.shape[-1])
         pair_z = torch.cat(
-            tensors=[
-                z_pair_trunk,
-                self.relpe(relp_feature),
-            ],
+            tensors=[z_pair_trunk, relp],
             dim=-1,
         )  # [..., N_tokens, N_tokens, 2*c_z_pair_diffusion]
         pair_z = self._project_pair_z(pair_z)

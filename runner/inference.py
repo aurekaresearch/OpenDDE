@@ -6,13 +6,15 @@ import os
 import random
 import time
 import traceback
-from collections.abc import Mapping, Sized
+from collections.abc import Iterator, Mapping, Sequence, Sized
 from contextlib import nullcontext
+from dataclasses import dataclass
 from datetime import timedelta
 from os.path import exists as opexists
 from os.path import join as opjoin
-from typing import Any, cast
+from typing import Any, Optional, cast
 
+import numpy as np
 import torch
 import torch.distributed as dist
 
@@ -34,6 +36,7 @@ from opendde.distributed.foldcp.metrics import (
     measure_foldcp_stage,
 )
 from opendde.model.opendde import OpenDDE
+from opendde.model.seed_batch import stack_seed_batch_features
 from opendde.model.triangular.layers import skip_random_init
 from opendde.utils.distributed import DIST_WRAPPER
 from opendde.utils.download import (
@@ -157,6 +160,33 @@ class InferenceRunner(object):
             f"global rank: {DIST_WRAPPER.rank}, local rank: {DIST_WRAPPER.local_rank}"
         )
         expected_world_size = self.foldcp_config.size_dp * self.foldcp_config.size_cp
+        seed_batch_size = getattr(self.configs, "seed_batch_size", 1)
+        if seed_batch_size < 1:
+            raise ValueError(f"seed_batch_size must be >= 1; got {seed_batch_size}.")
+        if self.foldcp_config.size_cp > 1 and seed_batch_size > 1:
+            raise ValueError(
+                "Seed batching is supported by the normal P=1 model path only; "
+                f"got foldcp_size_cp={self.foldcp_config.size_cp} and "
+                f"seed_batch_size={seed_batch_size}."
+            )
+        if getattr(self.configs, "num_workers", 0) > 0 and seed_batch_size > 1:
+            raise ValueError(
+                "Seed batching requires num_workers=0 so each seed's featurization "
+                "RNG stream can be preserved across input records."
+            )
+        model = getattr(self.configs, "model", None)
+        n_model_seed = getattr(model, "N_model_seed", 1)
+        if seed_batch_size > 1 and n_model_seed > 1:
+            raise ValueError(
+                "Seed batching requires model.N_model_seed=1; "
+                f"got model.N_model_seed={n_model_seed}."
+            )
+        sample_diffusion = getattr(self.configs, "sample_diffusion", None)
+        guidance = getattr(sample_diffusion, "guidance", {})
+        if seed_batch_size > 1 and bool(guidance.get("enable", False)):
+            raise ValueError(
+                "Seed batching cannot be combined with Training-Free Guidance."
+            )
         if DIST_WRAPPER.world_size != expected_world_size:
             raise RuntimeError(
                 "Inference topology requires "
@@ -338,7 +368,12 @@ class InferenceRunner(object):
         )
 
     @torch.no_grad()
-    def predict(self, data: Mapping[str, Mapping[str, Any]]) -> dict[str, torch.Tensor]:
+    def predict(
+        self,
+        data: Mapping[str, Mapping[str, Any]],
+        *,
+        msa_generators: Optional[Sequence[torch.Generator]] = None,
+    ) -> Any:
         """
         Run model prediction on the provided data.
 
@@ -382,9 +417,49 @@ class InferenceRunner(object):
                 label_full_dict=None,
                 label_dict=None,
                 mode="inference",
+                msa_generators=msa_generators,
             )
 
         return prediction
+
+    @torch.no_grad()
+    def predict_seed_batch(
+        self,
+        data_batch: Sequence[Mapping[str, Any]],
+        seeds: Sequence[int],
+        *,
+        msa_generators: Optional[Sequence[torch.Generator]] = None,
+    ) -> list[dict[str, Any]]:
+        """Run one model forward for a rank-local batch of independent seeds."""
+        if not data_batch or len(data_batch) != len(seeds):
+            raise ValueError(
+                "Seed-batched prediction requires one data record per seed; "
+                f"got {len(data_batch)} records and {len(seeds)} seeds."
+            )
+
+        sample_names = {str(data.get("sample_name", "unknown")) for data in data_batch}
+        if len(sample_names) != 1:
+            raise ValueError(
+                f"Seed-batched data must describe one sample; got {sorted(sample_names)}."
+            )
+
+        data = dict(data_batch[0])
+        data["input_feature_dict"] = stack_seed_batch_features(
+            [data["input_feature_dict"] for data in data_batch],
+            seeds,
+        )
+        predictions = self.predict(data, msa_generators=msa_generators)
+
+        if len(seeds) == 1 and isinstance(predictions, dict):
+            return [predictions]
+
+        if not isinstance(predictions, list) or len(predictions) != len(seeds):
+            raise RuntimeError(
+                "Seed-batched model output does not match the requested seeds: "
+                f"seeds={list(seeds)}, output_type={type(predictions).__name__}, "
+                f"output_count={len(predictions) if isinstance(predictions, list) else 'n/a'}."
+            )
+        return predictions
 
     def print(self, msg: str) -> None:
         """
@@ -461,15 +536,18 @@ def _resolve_local_inference_seeds(configs: Any) -> list[int]:
     return seeds
 
 
-def _validate_seed_parallel_seeds(seeds: list[int], size_dp: int) -> None:
-    if size_dp <= 1:
-        return
-    if len(set(seeds)) != len(seeds):
+def _validate_seed_parallel_seeds(
+    seeds: list[int], size_dp: int, seed_batch_size: int = 1
+) -> None:
+    if seed_batch_size < 1:
+        raise ValueError(f"seed_batch_size must be >= 1; got {seed_batch_size}.")
+    if (size_dp > 1 or seed_batch_size > 1) and len(set(seeds)) != len(seeds):
         raise ValueError(
-            "Seed-parallel inference requires unique seeds; "
-            f"got {seeds} for foldcp_size_dp={size_dp}."
+            "Seed-parallel inference requires unique seeds when sharding or batching; "
+            f"got {seeds} for foldcp_size_dp={size_dp}, "
+            f"seed_batch_size={seed_batch_size}."
         )
-    if len(seeds) < size_dp:
+    if size_dp > 1 and len(seeds) < size_dp:
         raise ValueError(
             "Seed-parallel inference requires at least one seed per lane; "
             f"got {len(seeds)} seeds for foldcp_size_dp={size_dp}."
@@ -482,11 +560,23 @@ def _seeds_for_rank(seeds: list[int], size_dp: int, rank: int) -> list[int]:
     return seeds[rank::size_dp]
 
 
-def _resolve_inference_seeds(configs: Any, size_dp: int) -> list[int]:
+def _seed_batches_for_rank(
+    seeds: list[int], size_dp: int, rank: int, seed_batch_size: int
+) -> list[list[int]]:
+    local_seeds = _seeds_for_rank(seeds, size_dp, rank)
+    return [
+        local_seeds[start : start + seed_batch_size]
+        for start in range(0, len(local_seeds), seed_batch_size)
+    ]
+
+
+def _resolve_inference_seeds(
+    configs: Any, size_dp: int, seed_batch_size: int = 1
+) -> list[int]:
     """Resolve and validate seeds on rank 0, then share them with peers."""
     if DIST_WRAPPER.world_size <= 1:
         seeds = _resolve_local_inference_seeds(configs)
-        _validate_seed_parallel_seeds(seeds, size_dp)
+        _validate_seed_parallel_seeds(seeds, size_dp, seed_batch_size)
         return seeds
 
     local_error: Exception | None = None
@@ -494,7 +584,7 @@ def _resolve_inference_seeds(configs: Any, size_dp: int) -> list[int]:
     if DIST_WRAPPER.rank == 0:
         try:
             seeds = _resolve_local_inference_seeds(configs)
-            _validate_seed_parallel_seeds(seeds, size_dp)
+            _validate_seed_parallel_seeds(seeds, size_dp, seed_batch_size)
             status[0] = (True, seeds, "")
         except Exception as exc:
             local_error = exc
@@ -516,6 +606,200 @@ def _resolve_inference_seeds(configs: Any, size_dp: int) -> list[int]:
     return seeds
 
 
+@dataclass
+class _SeedDataLane:
+    iterator: Iterator[Any]
+    python_state: object
+    numpy_state: tuple[Any, ...]
+    torch_state: torch.Tensor
+
+
+def _capture_featurization_random_state() -> tuple[
+    object, tuple[Any, ...], torch.Tensor
+]:
+    return random.getstate(), np.random.get_state(), torch.random.get_rng_state()
+
+
+def _restore_featurization_random_state(lane: _SeedDataLane) -> None:
+    random.setstate(lane.python_state)
+    np.random.set_state(lane.numpy_state)
+    torch.random.set_rng_state(lane.torch_state)
+
+
+def _seed_data_lanes(
+    dataloader: Any,
+    seeds: Sequence[int],
+    deterministic: bool,
+) -> list[_SeedDataLane]:
+    lanes = []
+    for seed in seeds:
+        seed_everything(seed=int(seed), deterministic=deterministic)
+        iterator = iter(dataloader)
+        python_state, numpy_state, torch_state = _capture_featurization_random_state()
+        lanes.append(_SeedDataLane(iterator, python_state, numpy_state, torch_state))
+    return lanes
+
+
+def _next_seed_data(lane: _SeedDataLane) -> Any:
+    _restore_featurization_random_state(lane)
+    batch = next(lane.iterator)
+    lane.python_state, lane.numpy_state, lane.torch_state = (
+        _capture_featurization_random_state()
+    )
+    return batch
+
+
+def _seed_batch_msa_generators(
+    lanes: Sequence[_SeedDataLane],
+    seeds: Sequence[int],
+    device: torch.device,
+) -> tuple[torch.Generator, ...]:
+    generators = []
+    for lane, seed in zip(lanes, seeds):
+        generator = torch.Generator(device=device)
+        if device.type == "cpu":
+            generator.set_state(lane.torch_state)
+        else:
+            generator.manual_seed(int(seed))
+        generators.append(generator)
+    return tuple(generators)
+
+
+def _sync_cpu_msa_generators(
+    lanes: Sequence[_SeedDataLane],
+    generators: Sequence[torch.Generator],
+    *,
+    before_model: bool,
+    device: torch.device,
+) -> None:
+    if device.type != "cpu":
+        return
+    for lane, generator in zip(lanes, generators):
+        if before_model:
+            generator.set_state(lane.torch_state)
+        else:
+            lane.torch_state = generator.get_state()
+
+
+def _infer_seed_batch_record(
+    runner: InferenceRunner,
+    configs: Any,
+    lanes: Sequence[_SeedDataLane],
+    seed_batch: Sequence[int],
+    msa_generators: Sequence[torch.Generator],
+    num_data: int,
+) -> None:
+    sample_name = "unknown"
+    model_batch_size = 0
+    try:
+        seed_records = [_next_seed_data(lane)[0] for lane in lanes]
+        sample_names = {record[0]["sample_name"] for record in seed_records}
+        if len(sample_names) != 1:
+            raise RuntimeError(
+                f"Seed data lanes produced different samples: {sorted(sample_names)}."
+            )
+        sample_name = next(iter(sample_names))
+
+        valid_indices = []
+        for index, (seed, record) in enumerate(zip(seed_batch, seed_records)):
+            _, _, data_error_message = record
+            if data_error_message:
+                logger.error(
+                    f"Data error for {sample_name} [seed:{seed}]: {data_error_message}"
+                )
+                with open(
+                    opjoin(runner.error_dir, f"{sample_name}.txt"),
+                    "a",
+                    encoding="utf-8",
+                ) as f:
+                    f.write(data_error_message)
+            else:
+                valid_indices.append(index)
+        if not valid_indices:
+            return
+
+        valid_seeds = [seed_batch[index] for index in valid_indices]
+        model_batch_size = len(valid_seeds)
+        valid_records = [seed_records[index] for index in valid_indices]
+        valid_data = [record[0] for record in valid_records]
+        valid_lanes = [lanes[index] for index in valid_indices]
+        valid_generators = [msa_generators[index] for index in valid_indices]
+        data = valid_data[0]
+        start_time = time.time()
+
+        logger.info(
+            f"[Rank {DIST_WRAPPER.rank} ({data['sample_index'] + 1}/{num_data})] "
+            f"{sample_name} [seeds:{valid_seeds}]: "
+            f"N_asym {data['N_asym'].item()}, N_token {data['N_token'].item()}, "
+            f"N_atom {data['N_atom'].item()}, N_msa {data['N_msa'].item()}"
+        )
+        new_configs = update_inference_configs(configs, data["N_token"].item())
+        runner.update_model_configs(new_configs)
+        _sync_cpu_msa_generators(
+            valid_lanes,
+            valid_generators,
+            before_model=True,
+            device=runner.device,
+        )
+        try:
+            predictions = runner.predict_seed_batch(
+                valid_data,
+                valid_seeds,
+                msa_generators=valid_generators,
+            )
+        finally:
+            _sync_cpu_msa_generators(
+                valid_lanes,
+                valid_generators,
+                before_model=False,
+                device=runner.device,
+            )
+
+        if not (runner.foldcp_config.enabled and DIST_WRAPPER.rank != 0):
+            for seed, record, prediction in zip(
+                valid_seeds, valid_records, predictions
+            ):
+                seed_data, atom_array, _ = record
+                runner.dumper.dump(
+                    group_name="",
+                    pdb_id=sample_name,
+                    seed=seed,
+                    pred_dict=prediction,
+                    atom_array=atom_array,
+                    entity_poly_type={
+                        key: value
+                        for key, value in seed_data["entity_poly_type"].items()
+                        if value != "non-polymer"
+                    },
+                )
+        logger.info(
+            f"[Rank {DIST_WRAPPER.rank}] {sample_name} "
+            f"[seeds:{valid_seeds}] succeeded. "
+            f"Model forward time: {time.time() - start_time:.2f}s. "
+            f"Results saved to {configs.dump_dir}"
+        )
+    except Exception as exc:
+        if isinstance(exc, torch.cuda.OutOfMemoryError) and model_batch_size > 1:
+            logger.exception(
+                "[Rank %s] %s seed batch %s ran out of CUDA memory.",
+                DIST_WRAPPER.rank,
+                sample_name,
+                list(seed_batch),
+            )
+            raise
+        error_message = (
+            f"[Rank {DIST_WRAPPER.rank}] {sample_name} failed: {exc}\n"
+            f"{traceback.format_exc()}"
+        )
+        logger.error(error_message)
+        with open(
+            opjoin(runner.error_dir, f"{sample_name}.txt"),
+            "a",
+            encoding="utf-8",
+        ) as f:
+            f.write(error_message)
+
+
 def infer_predict(runner: InferenceRunner, configs: Any) -> None:
     """
     Run the full inference process for the given runner and configurations.
@@ -528,9 +812,12 @@ def infer_predict(runner: InferenceRunner, configs: Any) -> None:
     # Data loading
     logger.info(f"Loading data from {configs.input_json_path}")
     size_dp = runner.foldcp_config.size_dp
-    seeds = _resolve_inference_seeds(configs, size_dp)
-    seeds = _seeds_for_rank(seeds, size_dp, DIST_WRAPPER.rank)
-    logger.info(f"[Rank {DIST_WRAPPER.rank}] Assigned seeds: {seeds}")
+    seed_batch_size = getattr(configs, "seed_batch_size", 1)
+    seeds = _resolve_inference_seeds(configs, size_dp, seed_batch_size)
+    seed_batches = _seed_batches_for_rank(
+        seeds, size_dp, DIST_WRAPPER.rank, seed_batch_size
+    )
+    logger.info(f"[Rank {DIST_WRAPPER.rank}] Assigned seed batches: {seed_batches}")
 
     try:
         dataloader = get_inference_dataloader(configs=configs)
@@ -546,88 +833,32 @@ def infer_predict(runner: InferenceRunner, configs: Any) -> None:
     num_data = len(cast(Sized, dataloader.dataset))
     t0_start = time.time()
     with disable_cudnn_benchmark(runner.device):
-        for seed in seeds:
-            seed_everything(seed=seed, deterministic=configs.deterministic)
+        for seed_batch in seed_batches:
             cleanup_device_memory(runner.device)
             t1_start = time.time()
-            for batch in dataloader:
-                sample_name = "unknown"
-                data = None
-                atom_array = None
-                prediction = None
+            lanes = _seed_data_lanes(
+                dataloader, seed_batch, deterministic=configs.deterministic
+            )
+            msa_generators = _seed_batch_msa_generators(
+                lanes, seed_batch, runner.device
+            )
+            for _ in range(num_data):
                 try:
-                    t2_start = time.time()
-                    data, atom_array, data_error_message = batch[0]
-                    sample_name = data["sample_name"]
-
-                    if len(data_error_message) > 0:
-                        logger.error(
-                            f"Data error for {sample_name}: {data_error_message}"
-                        )
-                        with open(
-                            opjoin(runner.error_dir, f"{sample_name}.txt"),
-                            "a",
-                            encoding="utf-8",
-                        ) as f:
-                            f.write(data_error_message)
-                        continue
-
-                    logger.info(
-                        f"[Rank {DIST_WRAPPER.rank} ({data['sample_index'] + 1}/{num_data})] "
-                        f"{sample_name} [seed:{seed}]: "
-                        f"N_asym {data['N_asym'].item()}, N_token {data['N_token'].item()}, "
-                        f"N_atom {data['N_atom'].item()}, N_msa {data['N_msa'].item()}"
+                    _infer_seed_batch_record(
+                        runner=runner,
+                        configs=configs,
+                        lanes=lanes,
+                        seed_batch=seed_batch,
+                        msa_generators=msa_generators,
+                        num_data=num_data,
                     )
-                    new_configs = update_inference_configs(
-                        configs, data["N_token"].item()
-                    )
-                    data["input_feature_dict"]["inference_seed"] = torch.tensor(
-                        int(seed),
-                        dtype=torch.long,
-                    )
-                    runner.update_model_configs(new_configs)
-                    prediction = runner.predict(data)
-                    if not (runner.foldcp_config.enabled and DIST_WRAPPER.rank != 0):
-                        runner.dumper.dump(
-                            group_name="",
-                            pdb_id=sample_name,
-                            seed=seed,
-                            pred_dict=prediction,
-                            atom_array=atom_array,
-                            entity_poly_type={
-                                k: v
-                                for k, v in data["entity_poly_type"].items()
-                                if v != "non-polymer"
-                            },
-                        )
-                    t2_end = time.time()
-                    logger.info(
-                        f"[Rank {DIST_WRAPPER.rank}] {sample_name} [seed:{seed}] succeeded. "
-                        f"Model forward time: {t2_end - t2_start:.2f}s. "
-                        f"Results saved to {configs.dump_dir}"
-                    )
-                except Exception as e:
-                    error_message = (
-                        f"[Rank {DIST_WRAPPER.rank}] {sample_name} failed: {e}\n"
-                        f"{traceback.format_exc()}"
-                    )
-                    logger.error(error_message)
-                    with open(
-                        opjoin(runner.error_dir, f"{sample_name}.txt"),
-                        "a",
-                        encoding="utf-8",
-                    ) as f:
-                        f.write(error_message)
                 finally:
-                    # `batch` also references the tensors moved to the device, so
-                    # drop it here to release them on every path, including the
-                    # unpacking above failing.
-                    del batch, data, atom_array, prediction
                     cleanup_device_memory(runner.device, collect_garbage=False)
             cleanup_device_memory(runner.device, synchronize=True)
             t1_end = time.time()
             logger.info(
-                f"[Rank {DIST_WRAPPER.rank}] Seed {seed} completed in {t1_end - t1_start:.2f}s."
+                f"[Rank {DIST_WRAPPER.rank}] Seed batch {seed_batch} completed in "
+                f"{t1_end - t1_start:.2f}s."
             )
     # Remove the error directory if it's empty
     if opexists(runner.error_dir):

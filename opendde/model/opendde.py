@@ -3,6 +3,7 @@
 import copy
 import os
 import time
+from collections.abc import Sequence
 from contextlib import nullcontext
 from typing import Any, Optional
 
@@ -45,6 +46,7 @@ from opendde.model.modules.pairformer import (
     TemplateEmbedder,
 )
 from opendde.model.modules.primitives import LinearNoBias
+from opendde.model.seed_batch import select_seed_batch_features
 from opendde.model.shape_complementarity import (
     build_shape_comp_pred_outputs,
     compute_shape_complementarity_fields,
@@ -57,6 +59,23 @@ from opendde.utils.logger import get_logger
 from opendde.utils.torch_utils import autocasting_disable_decorator
 
 logger = get_logger(__name__)
+
+
+def _seed_batch_generators(
+    input_feature_dict: dict[str, Any],
+) -> Optional[tuple[torch.Generator, ...]]:
+    inference_seed = input_feature_dict.get("inference_seed")
+    if not isinstance(inference_seed, torch.Tensor) or inference_seed.ndim == 0:
+        return None
+    if inference_seed.ndim != 1 or inference_seed.numel() == 0:
+        raise ValueError(
+            "inference_seed must be a non-empty one-dimensional seed batch; "
+            f"got shape {tuple(inference_seed.shape)}."
+        )
+    return tuple(
+        torch.Generator(device=inference_seed.device).manual_seed(int(seed))
+        for seed in inference_seed.detach().cpu().tolist()
+    )
 
 
 def update_input_feature_dict(input_feature_dict: dict[str, Any]) -> dict[str, Any]:
@@ -782,6 +801,7 @@ class OpenDDE(nn.Module):
         N_cycle: int,
         inplace_safe: bool = False,
         chunk_size: Optional[int] = None,
+        msa_generators: Optional[Sequence[torch.Generator]] = None,
     ) -> tuple[torch.Tensor, ...]:
         """
         The forward pass from the input to pairformer output
@@ -807,6 +827,7 @@ class OpenDDE(nn.Module):
             s_init=s_init,
             inplace_safe=inplace_safe,
             chunk_size=chunk_size,
+            msa_generators=msa_generators,
         )
         if foldcp_result is not None:
             return foldcp_result
@@ -854,6 +875,7 @@ class OpenDDE(nn.Module):
                         triangle_attention=self.configs.triangle_attention,
                         inplace_safe=inplace_safe,
                         chunk_size=chunk_size,
+                        generators=msa_generators,
                     )
                 else:
                     if self.template_embedder.n_blocks > 0:
@@ -874,6 +896,7 @@ class OpenDDE(nn.Module):
                         triangle_attention=self.configs.triangle_attention,
                         inplace_safe=inplace_safe,
                         chunk_size=chunk_size,
+                        generators=msa_generators,
                     )
                 s = s_init + self.linear_no_bias_s(self.layernorm_s(s))
                 s, z = self.pairformer_stack(
@@ -896,6 +919,7 @@ class OpenDDE(nn.Module):
         s_init: torch.Tensor,
         inplace_safe: bool = False,
         chunk_size: Optional[int] = None,
+        msa_generators: Optional[Sequence[torch.Generator]] = None,
     ) -> Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         mesh = self._maybe_foldcp_mesh()
         if mesh is None:
@@ -950,6 +974,7 @@ class OpenDDE(nn.Module):
                     triangle_attention=self.configs.triangle_attention,
                     inplace_safe=inplace_safe,
                     chunk_size=chunk_size,
+                    generators=msa_generators,
                 )
                 s = s_init + self.linear_no_bias_s(self.layernorm_s(s))
                 s, z_local, z_spec = distributed_pairformer_stack_single_bridge_update(
@@ -989,7 +1014,13 @@ class OpenDDE(nn.Module):
         sample_z_trunk = None if sample_pair_z is not None else z
         rollout_seed = input_feature_dict.get("inference_seed")
         if isinstance(rollout_seed, torch.Tensor):
-            rollout_seed = int(rollout_seed.detach().cpu().item())
+            if rollout_seed.ndim == 0:
+                rollout_seed = int(rollout_seed.detach().cpu().item())
+            elif rollout_seed.ndim != 1:
+                raise ValueError(
+                    "inference_seed must be a scalar or one-dimensional seed batch; "
+                    f"got shape {tuple(rollout_seed.shape)}."
+                )
         elif rollout_seed is not None:
             rollout_seed = int(rollout_seed)
 
@@ -1255,6 +1286,48 @@ class OpenDDE(nn.Module):
         )
         return pred_dict
 
+    def postprocess_seed_batch(
+        self,
+        *,
+        pred_dict: dict[str, Any],
+        input_feature_dict: dict[str, Any],
+        pair_input_feature_dict: dict[str, Any],
+        pair_z: torch.Tensor,
+        N_cycle: int,
+    ) -> list[dict[str, Any]]:
+        """Split the seed dimension before scalar confidence postprocessing."""
+        inference_seed = input_feature_dict.get("inference_seed")
+        if not isinstance(inference_seed, torch.Tensor) or inference_seed.ndim != 1:
+            raise ValueError("Seed-batched postprocessing requires a seed vector.")
+        batch_size = inference_seed.numel()
+        predictions = []
+        for seed_index in range(batch_size):
+            seed_prediction = {}
+            for name, value in pred_dict.items():
+                if not isinstance(value, torch.Tensor):
+                    seed_prediction[name] = value
+                    continue
+                if value.ndim == 0 or value.shape[0] != batch_size:
+                    raise ValueError(
+                        f"Batched prediction {name!r} has shape {tuple(value.shape)} "
+                        f"for seed batch size {batch_size}."
+                    )
+                seed_prediction[name] = value[seed_index]
+
+            self.run_post_confidence_outputs_stage(
+                pred_dict=seed_prediction,
+                input_feature_dict=select_seed_batch_features(
+                    input_feature_dict, seed_index, batch_size
+                ),
+                pair_input_feature_dict=select_seed_batch_features(
+                    pair_input_feature_dict, seed_index, batch_size
+                ),
+                pair_z=pair_z[seed_index],
+                N_cycle=N_cycle,
+            )
+            predictions.append(seed_prediction)
+        return predictions
+
     def run_confidence_head(self, *args: Any, **kwargs: Any) -> Any:
         """
         Runs the confidence head with optional automatic mixed precision (AMP) disabled.
@@ -1410,7 +1483,8 @@ class OpenDDE(nn.Module):
         inplace_safe: bool = True,
         chunk_size: Optional[int] = 4,
         N_model_seed: int = 1,
-    ) -> tuple[dict[str, torch.Tensor], dict[str, Any], dict[str, Any]]:
+        msa_generators: Optional[Sequence[torch.Generator]] = None,
+    ) -> tuple[Any, dict[str, Any], dict[str, Any]]:
         """
         Main inference loop, optionally evaluating multiple model seeds.
 
@@ -1423,6 +1497,14 @@ class OpenDDE(nn.Module):
         Returns:
             tuple[dict[str, torch.Tensor], dict[str, Any], dict[str, Any]]: Prediction, log, and time dictionaries.
         """
+        inference_seed = input_feature_dict.get("inference_seed")
+        is_seed_batch = (
+            isinstance(inference_seed, torch.Tensor) and inference_seed.ndim == 1
+        )
+        if N_model_seed > 1 and is_seed_batch:
+            raise ValueError(
+                "model.N_model_seed cannot be combined with seed-batched inference."
+            )
         if N_model_seed > 1:
             pred_dicts = []
             log_dicts = []
@@ -1433,6 +1515,7 @@ class OpenDDE(nn.Module):
                     N_cycle=N_cycle,
                     inplace_safe=inplace_safe,
                     chunk_size=chunk_size,
+                    msa_generators=msa_generators,
                 )
                 pred_dicts.append(pred_dict)
                 log_dicts.append(log_dict)
@@ -1472,6 +1555,7 @@ class OpenDDE(nn.Module):
                 N_cycle=N_cycle,
                 inplace_safe=inplace_safe,
                 chunk_size=chunk_size,
+                msa_generators=msa_generators,
             )
 
     def _get_dynamic_chunk_size(self, N_token: int) -> Optional[int]:
@@ -1507,7 +1591,8 @@ class OpenDDE(nn.Module):
         N_cycle: int,
         inplace_safe: bool = True,
         chunk_size: Optional[int] = 4,
-    ) -> tuple[dict[str, torch.Tensor], dict[str, Any], dict[str, Any]]:
+        msa_generators: Optional[Sequence[torch.Generator]] = None,
+    ) -> tuple[Any, dict[str, Any], dict[str, Any]]:
         """
         Main inference loop (single model seed) for the Alphafold3 model.
 
@@ -1535,6 +1620,7 @@ class OpenDDE(nn.Module):
                 N_cycle=N_cycle,
                 inplace_safe=inplace_safe,
                 chunk_size=chunk_size,
+                msa_generators=msa_generators,
             )
         if self._maybe_foldcp_mesh() is not None and s_inputs.is_cuda:
             torch.cuda.empty_cache()
@@ -1679,13 +1765,25 @@ class OpenDDE(nn.Module):
             return pred_dict, log_dict, time_tracker
 
         with self._foldcp_stage_context("opendde_post_confidence_outputs", N_token):
-            self.run_post_confidence_outputs_stage(
-                pred_dict=pred_dict,
-                input_feature_dict=input_feature_dict,
-                pair_input_feature_dict=pair_input_feature_dict,
-                pair_z=pair_z,
-                N_cycle=N_cycle,
-            )
+            inference_seed = input_feature_dict.get("inference_seed")
+            if not (
+                isinstance(inference_seed, torch.Tensor) and inference_seed.ndim == 1
+            ):
+                self.run_post_confidence_outputs_stage(
+                    pred_dict=pred_dict,
+                    input_feature_dict=input_feature_dict,
+                    pair_input_feature_dict=pair_input_feature_dict,
+                    pair_z=pair_z,
+                    N_cycle=N_cycle,
+                )
+            else:
+                pred_dict = self.postprocess_seed_batch(
+                    pred_dict=pred_dict,
+                    input_feature_dict=input_feature_dict,
+                    pair_input_feature_dict=pair_input_feature_dict,
+                    pair_z=pair_z,
+                    N_cycle=N_cycle,
+                )
 
         return pred_dict, log_dict, time_tracker
 
@@ -1696,7 +1794,8 @@ class OpenDDE(nn.Module):
         label_dict: Optional[dict[str, Any]] = None,
         mode: str = "inference",
         disable_inplace: bool = False,
-    ) -> tuple[dict[str, torch.Tensor], Optional[dict[str, Any]], dict[str, Any]]:
+        msa_generators: Optional[Sequence[torch.Generator]] = None,
+    ) -> tuple[Any, Optional[dict[str, Any]], dict[str, Any]]:
         """
         Forward pass for structure prediction.
 
@@ -1723,6 +1822,8 @@ class OpenDDE(nn.Module):
             lazy=lazy_relp,
         )
         input_feature_dict = update_input_feature_dict(input_feature_dict)
+        if msa_generators is None:
+            msa_generators = _seed_batch_generators(input_feature_dict)
 
         pred_dict, log_dict, time_tracker = self.main_inference_loop(
             input_feature_dict=input_feature_dict,
@@ -1730,6 +1831,7 @@ class OpenDDE(nn.Module):
             inplace_safe=inplace_safe,
             chunk_size=self.configs.infer_setting.chunk_size,
             N_model_seed=self.N_model_seed,
+            msa_generators=msa_generators,
         )
         log_dict.update({"time": time_tracker})
 

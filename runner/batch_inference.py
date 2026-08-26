@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import List, Literal, Optional, Union
 
 import click
+import torch
 import torch.distributed as dist
 import tqdm
 from Bio import SeqIO
@@ -317,6 +318,7 @@ def get_default_runner(
     foldcp_size_cp: int = 1,
     foldcp_devices: str = "",
     foldcp_metrics_jsonl: str = "",
+    seed_batch_size: int = 1,
     *,
     device: InferenceDevice = "auto",
 ) -> InferenceRunner:
@@ -325,6 +327,7 @@ def get_default_runner(
 
     Args:
         seeds (Optional[list]): List of inference seeds.
+        seed_batch_size (int): Maximum seeds per rank-local model batch.
         dump_dir (str): Output directory for results.
         n_cycle (int): Number of Pairformer cycles.
         n_step (int): Number of diffusion steps.
@@ -345,7 +348,7 @@ def get_default_runner(
         kalign_binary_path (Optional[str]): Path to kalign binary.
         use_tfg_guidance (bool): Whether to use TFG guidance.
         foldcp_mode (str): Single-card or distributed Fold-CP execution mode.
-        foldcp_size_dp (int): Number of independent seed lanes.
+        foldcp_size_dp (int): Number of seed-sharding ranks.
         foldcp_size_cp (int): Number of context-parallel ranks.
         foldcp_devices (str): Optional visible device list recorded in metrics.
         foldcp_metrics_jsonl (str): Optional JSONL path for benchmark records.
@@ -371,6 +374,7 @@ def get_default_runner(
     )
     if seeds is not None:
         configs.seeds = seeds
+    configs.seed_batch_size = seed_batch_size
     model_name = configs.model_name
     # the user input configs has the highest priority
     configs.dump_dir = dump_dir
@@ -412,10 +416,12 @@ def get_default_runner(
         f"enable_tf32: {configs.enable_tf32}"
     )
     logger.info(
-        "Inference topology: mode=%s, size_dp=%s, size_cp=%s, mesh=%s, metrics_jsonl=%s",
+        "Inference topology: mode=%s, size_dp=%s, size_cp=%s, "
+        "seed_batch_size=%s, mesh=%s, metrics_jsonl=%s",
         foldcp_config.mode,
         foldcp_config.size_dp,
         foldcp_config.size_cp,
+        configs.seed_batch_size,
         foldcp_config.cp_mesh_shape,
         foldcp_config.metrics_jsonl or "<disabled>",
     )
@@ -460,6 +466,7 @@ def inference_jsons(
     foldcp_size_cp: int = 1,
     foldcp_devices: str = "",
     foldcp_metrics_jsonl: str = "",
+    seed_batch_size: int = 1,
     *,
     device: InferenceDevice = "auto",
 ) -> None:
@@ -471,6 +478,7 @@ def inference_jsons(
         out_dir (str): Directory to save inference results.
         use_msa (bool): Whether to use MSA.
         seeds (Optional[list[int]]): List of inference seeds.
+        seed_batch_size (int): Maximum seeds per rank-local model batch.
         n_cycle (int): Number of cycles.
         n_step (int): Number of diffusion steps.
         n_sample (int): Number of samples.
@@ -500,7 +508,7 @@ def inference_jsons(
         rna_central_database_path (Optional[str]): RNAcentral database path.
         nhmmer_n_cpu (Optional[int]): Number of CPUs for nhmmer.
         foldcp_mode (str): Single-card or distributed Fold-CP execution mode.
-        foldcp_size_dp (int): Number of independent seed lanes.
+        foldcp_size_dp (int): Number of seed-sharding ranks.
         foldcp_size_cp (int): Number of context-parallel ranks.
         foldcp_devices (str): Optional visible device list recorded in metrics.
         foldcp_metrics_jsonl (str): Optional JSONL path for benchmark records.
@@ -524,6 +532,7 @@ def inference_jsons(
     infer_errors = {}
     runner = get_default_runner(
         seeds=seeds,
+        seed_batch_size=seed_batch_size,
         dump_dir=out_dir,
         n_cycle=n_cycle,
         n_step=n_step,
@@ -573,6 +582,8 @@ def inference_jsons(
                     nhmmer_n_cpu=nhmmer_n_cpu,
                 )
                 infer_predict(runner, configs)
+            except torch.cuda.OutOfMemoryError:
+                raise
             except Exception as exc:
                 if DIST_WRAPPER.world_size > 1:
                     raise
@@ -595,6 +606,13 @@ def inference_jsons(
     default=None,
     help="Seeds (comma-separated). Overrides JSON modelSeeds. "
     "If unset, uses modelSeeds from the input JSON, or a random seed when absent.",
+)
+@click.option(
+    "--seed_batch_size",
+    type=int,
+    default=1,
+    show_default=True,
+    help="Maximum seeds per rank-local model batch.",
 )
 @click.option("-c", "--cycle", type=int, default=10, help="Pairformer cycle number.")
 @click.option("-p", "--step", type=int, default=200, help="Diffusion steps.")
@@ -704,7 +722,7 @@ def inference_jsons(
     type=click.Choice(["single", "distributed"]),
     default="single",
     help=(
-        "Inference mode: normal single-card model path (including seed lanes) "
+        "Inference mode: normal model path (including seed batching/sharding) "
         "or distributed Fold-CP path."
     ),
 )
@@ -712,7 +730,7 @@ def inference_jsons(
     "--foldcp_size_dp",
     type=int,
     default=1,
-    help="Number of independent seed lanes; values above 1 require P=1.",
+    help="Number of seed-sharding ranks; values above 1 require P=1.",
 )
 @click.option(
     "--foldcp_size_cp",
@@ -811,6 +829,7 @@ def predict(
     input: str,
     out_dir: str,
     seeds: Optional[str],
+    seed_batch_size: int,
     cycle: int,
     step: int,
     sample: int,
@@ -856,6 +875,7 @@ def predict(
         out_dir (str): Output directory for results.
         seeds (Optional[str]): Comma-separated seeds; overrides JSON modelSeeds.
             When None, falls back to JSON modelSeeds or a random seed.
+        seed_batch_size (int): Maximum seeds per rank-local model batch.
         cycle (int): Number of cycles.
         step (int): Number of diffusion steps.
         sample (int): Number of samples.
@@ -888,7 +908,7 @@ def predict(
         rna_central_database_path (Optional[str]): RNAcentral database path.
         nhmmer_n_cpu (Optional[int]): Number of CPUs for nhmmer.
         foldcp_mode (str): Single-card or distributed Fold-CP execution mode.
-        foldcp_size_dp (int): Number of independent seed lanes.
+        foldcp_size_dp (int): Number of seed-sharding ranks.
         foldcp_size_cp (int): Number of context-parallel ranks.
         foldcp_devices (str): Optional visible device list recorded in metrics.
         foldcp_metrics_jsonl (str): Optional JSONL path for benchmark records.
@@ -957,6 +977,7 @@ def predict(
         out_dir,
         use_msa,
         seeds=seed_list,
+        seed_batch_size=seed_batch_size,
         n_cycle=cycle,
         n_step=step,
         n_sample=sample,

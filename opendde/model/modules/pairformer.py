@@ -2,6 +2,7 @@
 # Copyright (c) 2026 Aureka AI Research
 # pylint: disable=C0114
 import os
+from collections.abc import Sequence
 from functools import partial
 from typing import Any, Optional, Union
 
@@ -1625,6 +1626,7 @@ class MSAModule(nn.Module):
         input_feature_dict: dict[str, Any],
         s_inputs: torch.Tensor,
         z_token_dim: int,
+        generators: Optional[Sequence[torch.Generator]] = None,
     ) -> Optional[torch.Tensor]:
         # If n_blocks < 1, return z unchanged.
         if self.n_blocks < 1:
@@ -1640,6 +1642,7 @@ class MSAModule(nn.Module):
             num_msa=self.msa_depth,
             msa_mask=input_feature_dict.get("msa_mask"),
             gap_token=self.input_feature["msa"] - 1,
+            generators=generators,
         )
         # pylint: disable=E1102
         if z_token_dim > 2000:
@@ -1663,7 +1666,7 @@ class MSAModule(nn.Module):
         )
         del msa_feat
         msa_sample = self.linear_no_bias_m(msa_sample)
-        return msa_sample + self.linear_no_bias_s(s_inputs)
+        return msa_sample + self.linear_no_bias_s(s_inputs).unsqueeze(dim=-3)
 
     def forward_foldcp_local_pair(
         self,
@@ -1677,11 +1680,13 @@ class MSAModule(nn.Module):
         triangle_attention: str = "torch",
         inplace_safe: bool = False,
         chunk_size: Optional[int] = None,
+        generators: Optional[Sequence[torch.Generator]] = None,
     ) -> tuple[torch.Tensor, FoldCPPairShardSpec]:
         msa_sample = self._prepare_msa_sample(
             input_feature_dict=input_feature_dict,
             s_inputs=s_inputs,
             z_token_dim=z_spec.original_shape[z_spec.pair_dims[0]],
+            generators=generators,
         )
         if msa_sample is None:
             return z_local.contiguous(), z_spec
@@ -1709,6 +1714,7 @@ class MSAModule(nn.Module):
         triangle_attention: str = "torch",
         inplace_safe: bool = False,
         chunk_size: Optional[int] = None,
+        generators: Optional[Sequence[torch.Generator]] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -1737,6 +1743,7 @@ class MSAModule(nn.Module):
             input_feature_dict=input_feature_dict,
             s_inputs=s_inputs,
             z_token_dim=z.shape[-2],
+            generators=generators,
         )
         if msa_sample is None:
             return z
@@ -1856,11 +1863,11 @@ class TemplateEmbedder(nn.Module):
             # Compatible with the OpenDDE 0.5.0 model series
             return 0
         asym_id = input_feature_dict["asym_id"]
-        multichain_mask = (asym_id[:, None] == asym_id[None, :]).to(z.dtype)
+        multichain_mask = (asym_id[..., :, None] == asym_id[..., None, :]).to(z.dtype)
 
-        num_residues = z.shape[0]
+        num_residues = z.shape[-2]
         # determine whether the number of templates is the configured maximum value, otherwise error out
-        num_templates = input_feature_dict["template_aatype"].shape[0]
+        num_templates = input_feature_dict["template_aatype"].shape[-2]
         query_num_channels = z.shape[-1]
 
         if pair_mask is None:
@@ -1882,7 +1889,12 @@ class TemplateEmbedder(nn.Module):
             )
         u = u / (1e-7 + num_templates)
         u = self.linear_no_bias_u(self.relu(u))
-        assert u.shape == (num_residues, num_residues, query_num_channels)
+        assert u.shape == (
+            *z.shape[:-3],
+            num_residues,
+            num_residues,
+            query_num_channels,
+        )
         return u
 
     @staticmethod
@@ -2251,10 +2263,10 @@ class TemplateEmbedder(nn.Module):
         to_concat = []
 
         dgram = input_feature_dict["template_distogram"][
-            template_id
-        ]  # [N_token, N_token, 39]
+            ..., template_id, :, :, :
+        ]  # [..., N_token, N_token, 39]
         pseudo_beta_mask_2d = input_feature_dict["template_pseudo_beta_mask"][
-            template_id
+            ..., template_id, :, :
         ]
         dgram = dgram * multichain_mask[..., None] * pair_mask[..., None]
         pseudo_beta_mask_2d = (
@@ -2263,19 +2275,28 @@ class TemplateEmbedder(nn.Module):
         to_concat.append(dgram)
         to_concat.append(pseudo_beta_mask_2d.unsqueeze(-1))
 
-        aatype = input_feature_dict["template_aatype"][template_id]  # [N_token]
+        aatype = input_feature_dict["template_aatype"][
+            ..., template_id, :
+        ]  # [..., N_token]
         aatype = F.one_hot(aatype, num_classes=len(STD_RESIDUES_WITH_GAP))
-        to_concat.append(expand_at_dim(aatype, dim=-3, n=z.shape[0]))
-        to_concat.append(expand_at_dim(aatype, dim=-2, n=z.shape[0]))
+        template_pair_shape = (*dgram.shape[:-1], aatype.shape[-1])
+        to_concat.append(
+            expand_at_dim(aatype, dim=-3, n=z.shape[-2]).expand(template_pair_shape)
+        )
+        to_concat.append(
+            expand_at_dim(aatype, dim=-2, n=z.shape[-2]).expand(template_pair_shape)
+        )
 
-        unit_vector = input_feature_dict["template_unit_vector"][template_id]
+        unit_vector = input_feature_dict["template_unit_vector"][
+            ..., template_id, :, :, :
+        ]
         unit_vector = (
             unit_vector * multichain_mask[..., None] * pair_mask[..., None]
         )  # [N_token, N_token, 3]
         to_concat.append(unit_vector)
 
         backbone_mask_2d = input_feature_dict["template_backbone_frame_mask"][
-            template_id
+            ..., template_id, :, :
         ]
         backbone_mask_2d = backbone_mask_2d * multichain_mask * pair_mask
         to_concat.append(backbone_mask_2d.unsqueeze(-1))

@@ -344,6 +344,7 @@ class OpenDDEConfig(BaseConfig):
     # inference defaults / runtime selections
     model_name: str
     seeds: list[int]
+    seed_batch_size: int = 1
     dump_dir: str
     need_atom_confidence: bool
     sorted_by_ranking_score: bool

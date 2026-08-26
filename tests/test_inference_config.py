@@ -2,9 +2,11 @@
 # Copyright (c) 2026 Aureka AI Research
 import inspect
 import os
+import random
 import weakref
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -44,13 +46,17 @@ def test_build_inference_config_applies_model_specific_defaults():
     assert cfg.sample_diffusion.N_step == 200
     assert cfg.confidence.distogram.no_bins == 96
     assert cfg.need_atom_confidence is True
+    assert cfg.seed_batch_size == 1
 
 
-def test_legacy_config_dict_without_device_uses_schema_default():
+def test_legacy_config_dict_uses_new_schema_defaults():
     legacy_config = build_inference_config(fill_required_with_null=True).model_dump()
     legacy_config.pop("device")
+    legacy_config.pop("seed_batch_size")
 
-    assert OpenDDEConfig.model_validate(legacy_config).device == "auto"
+    config = OpenDDEConfig.model_validate(legacy_config)
+    assert config.device == "auto"
+    assert config.seed_batch_size == 1
 
 
 def test_build_inference_config_keeps_cli_overrides_highest_priority():
@@ -94,6 +100,7 @@ def test_get_default_runner_config_build_does_not_mutate_base_defaults(monkeypat
 
     runner = batch_inference.get_default_runner(
         seeds=[101],
+        seed_batch_size=2,
         n_cycle=2,
         n_step=3,
         n_sample=1,
@@ -109,6 +116,7 @@ def test_get_default_runner_config_build_does_not_mutate_base_defaults(monkeypat
     assert runner.configs.model.N_cycle == 2
     assert runner.configs.sample_diffusion.N_step == 3
     assert runner.configs.need_atom_confidence is True
+    assert runner.configs.seed_batch_size == 2
     assert configs_base["model"]["N_cycle"] == 10
     assert configs_base["confidence"]["distogram"]["no_bins"] == 96
 
@@ -377,7 +385,84 @@ def test_world_size_mismatch_fails_before_device_or_model_selection(monkeypatch)
         runner.init_env()
 
 
-def test_predict_help_describes_seed_lanes():
+@pytest.mark.parametrize(
+    ("seed_batch_size", "num_workers", "size_cp", "n_model_seed", "message"),
+    [
+        (0, 0, 1, 1, "seed_batch_size must be >= 1"),
+        (2, 0, 2, 1, "normal P=1 model path only"),
+        (2, 1, 1, 1, "requires num_workers=0"),
+        (2, 0, 1, 2, "requires model.N_model_seed=1"),
+    ],
+)
+def test_invalid_seed_batch_fails_before_device_selection(
+    monkeypatch, seed_batch_size, num_workers, size_cp, n_model_seed, message
+):
+    from opendde.distributed.foldcp.config import FoldCPConfig
+    from runner import inference
+
+    runner = object.__new__(inference.InferenceRunner)
+    runner.foldcp_config = FoldCPConfig.from_runtime_args(
+        mode="distributed" if size_cp > 1 else "single",
+        size_dp=1,
+        size_cp=size_cp,
+    )
+    runner.configs = SimpleNamespace(
+        device="auto",
+        seed_batch_size=seed_batch_size,
+        num_workers=num_workers,
+        model=SimpleNamespace(N_model_seed=n_model_seed),
+    )
+    runner.print = lambda _message: None
+    monkeypatch.setattr(
+        inference,
+        "DIST_WRAPPER",
+        SimpleNamespace(world_size=size_cp, rank=0, local_rank=0),
+    )
+    monkeypatch.setattr(
+        inference,
+        "select_torch_device",
+        lambda *_args, **_kwargs: pytest.fail(
+            "invalid seed batching must fail before device selection"
+        ),
+    )
+
+    with pytest.raises(ValueError, match=message):
+        runner.init_env()
+
+
+def test_seed_batch_rejects_tfg_before_device_selection(monkeypatch):
+    from opendde.distributed.foldcp.config import FoldCPConfig
+    from runner import inference
+
+    runner = object.__new__(inference.InferenceRunner)
+    runner.foldcp_config = FoldCPConfig.from_runtime_args(
+        mode="single", size_dp=1, size_cp=1
+    )
+    runner.configs = SimpleNamespace(
+        device="auto",
+        seed_batch_size=2,
+        num_workers=0,
+        sample_diffusion=SimpleNamespace(guidance={"enable": True}),
+    )
+    runner.print = lambda _message: None
+    monkeypatch.setattr(
+        inference,
+        "DIST_WRAPPER",
+        SimpleNamespace(world_size=1, rank=0, local_rank=0),
+    )
+    monkeypatch.setattr(
+        inference,
+        "select_torch_device",
+        lambda *_args, **_kwargs: pytest.fail(
+            "invalid seed batching must fail before device selection"
+        ),
+    )
+
+    with pytest.raises(ValueError, match="Training-Free Guidance"):
+        runner.init_env()
+
+
+def test_predict_help_describes_seed_batching_and_sharding():
     from click.testing import CliRunner
 
     from runner import batch_inference
@@ -389,13 +474,15 @@ def test_predict_help_describes_seed_lanes():
     )
 
     assert result.exit_code == 0
+    assert "--seed_batch_size" in result.output
+    assert "Maximum seeds per rank-local model batch" in result.output
     assert "--foldcp_size_dp" in result.output
-    assert "Number of independent seed lanes" in result.output
-    assert "normal single-card model path (including seed lanes)" in result.output
+    assert "Number of seed-sharding ranks" in result.output
+    assert "normal model path (including seed batching/sharding)" in result.output
 
 
 def test_seed_assignment_is_rank_strided_without_loss_or_duplication():
-    from runner.inference import _seeds_for_rank
+    from runner.inference import _seed_batches_for_rank, _seeds_for_rank
 
     seeds = [101, 102, 103, 104, 105, 106]
     assignments = [_seeds_for_rank(seeds, 4, rank) for rank in range(4)]
@@ -403,6 +490,17 @@ def test_seed_assignment_is_rank_strided_without_loss_or_duplication():
     assert assignments == [[101, 105], [102, 106], [103], [104]]
     assert sorted(seed for lane in assignments for seed in lane) == seeds
     assert _seeds_for_rank(seeds, 1, 3) == seeds
+
+    seeds = [101, 102, 103, 104, 105, 106, 107]
+    batches = [
+        _seed_batches_for_rank(seeds, 3, rank, seed_batch_size=2) for rank in range(3)
+    ]
+    assert batches == [
+        [[101, 104], [107]],
+        [[102, 105]],
+        [[103, 106]],
+    ]
+    assert sorted(seed for rank in batches for batch in rank for seed in batch) == seeds
 
 
 def test_local_seed_resolution_preserves_precedence(monkeypatch, tmp_path):
@@ -1205,8 +1303,9 @@ def test_seed_parallel_and_foldcp_output_ownership(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(inference, "seed_everything", lambda **_kwargs: None)
 
-    def run_rank(rank, *, size_dp, foldcp_enabled, seeds):
+    def run_rank(rank, *, size_dp, foldcp_enabled, seeds, seed_batch_size=1):
         predictions = []
+        forward_batches = []
         dumps = []
         monkeypatch.setattr(
             inference,
@@ -1216,17 +1315,15 @@ def test_seed_parallel_and_foldcp_output_ownership(monkeypatch, tmp_path):
         monkeypatch.setattr(
             inference,
             "_resolve_inference_seeds",
-            lambda _configs, _size_dp: list(seeds),
+            lambda _configs, _size_dp, _seed_batch_size=1: list(seeds),
         )
 
-        def predict(data):
-            predictions.append(
-                (
-                    data["sample_name"],
-                    int(data["input_feature_dict"]["inference_seed"]),
-                )
+        def predict_seed_batch(data_batch, batch_seeds, **_kwargs):
+            forward_batches.append((data_batch[0]["sample_name"], tuple(batch_seeds)))
+            predictions.extend(
+                (data_batch[0]["sample_name"], seed) for seed in batch_seeds
             )
-            return {}
+            return [{} for _ in batch_seeds]
 
         runner = SimpleNamespace(
             device=torch.device("cpu"),
@@ -1236,13 +1333,14 @@ def test_seed_parallel_and_foldcp_output_ownership(monkeypatch, tmp_path):
                 size_dp=size_dp,
             ),
             update_model_configs=lambda _configs: None,
-            predict=predict,
+            predict_seed_batch=predict_seed_batch,
             dumper=SimpleNamespace(
                 dump=lambda **kwargs: dumps.append((kwargs["pdb_id"], kwargs["seed"]))
             ),
         )
         configs = SimpleNamespace(
             input_json_path="input.json",
+            seed_batch_size=seed_batch_size,
             deterministic=False,
             dump_dir=str(tmp_path),
             skip_amp=SimpleNamespace(
@@ -1252,7 +1350,7 @@ def test_seed_parallel_and_foldcp_output_ownership(monkeypatch, tmp_path):
         )
 
         inference.infer_predict(runner, configs)
-        return predictions, dumps
+        return predictions, dumps, forward_batches
 
     dp_results = [
         run_rank(
@@ -1277,6 +1375,31 @@ def test_seed_parallel_and_foldcp_output_ownership(monkeypatch, tmp_path):
     ]
     assert dp_results[0][1] == dp_results[0][0]
     assert dp_results[1][1] == dp_results[1][0]
+
+    batched_results = [
+        run_rank(
+            rank,
+            size_dp=2,
+            foldcp_enabled=False,
+            seeds=[101, 102, 103, 104, 105, 106, 107],
+            seed_batch_size=2,
+        )
+        for rank in range(2)
+    ]
+    assert batched_results[0][2] == [
+        ("job-a", (101, 103)),
+        ("job-b", (101, 103)),
+        ("job-a", (105, 107)),
+        ("job-b", (105, 107)),
+    ]
+    assert batched_results[1][2] == [
+        ("job-a", (102, 104)),
+        ("job-b", (102, 104)),
+        ("job-a", (106,)),
+        ("job-b", (106,)),
+    ]
+    assert batched_results[0][1] == batched_results[0][0]
+    assert batched_results[1][1] == batched_results[1][0]
 
     cp_results = [
         run_rank(rank, size_dp=1, foldcp_enabled=True, seeds=[101]) for rank in range(2)
@@ -1346,12 +1469,13 @@ def test_infer_predict_releases_batch_before_seed_cleanup(monkeypatch, tmp_path)
         error_dir=str(tmp_path / "errors"),
         foldcp_config=SimpleNamespace(enabled=False, size_dp=1),
         update_model_configs=lambda _configs: None,
-        predict=lambda _data: {},
+        predict_seed_batch=lambda _data, seeds, **_kwargs: [{} for _ in seeds],
         dumper=SimpleNamespace(dump=lambda **_kwargs: None),
     )
     configs = SimpleNamespace(
         input_json_path=str(input_path),
         seeds=[1, 2],
+        seed_batch_size=1,
         deterministic=False,
         dump_dir=str(tmp_path),
         skip_amp=SimpleNamespace(confidence_head=False, sample_diffusion=False),
@@ -1379,3 +1503,207 @@ def test_infer_predict_releases_batch_before_seed_cleanup(monkeypatch, tmp_path)
         {"collect_garbage": False},
         {"synchronize": True},
     ]
+
+
+def test_seed_batch_preserves_each_seed_rng_stream_across_records():
+    from runner import inference
+
+    class RandomIterator:
+        def __init__(self):
+            self.index = 0
+            self.setup_draw = torch.rand(1)
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self.index == 2:
+                raise StopIteration
+            self.index += 1
+            return (
+                self.setup_draw.clone(),
+                random.random(),
+                np.random.random(),
+                torch.rand(2),
+            )
+
+    class RandomLoader:
+        def __iter__(self):
+            return RandomIterator()
+
+    seeds = [101, 202]
+    expected = {}
+    for seed in seeds:
+        inference.seed_everything(seed=seed, deterministic=False)
+        iterator = iter(RandomLoader())
+        expected[seed] = [
+            (next(iterator), torch.rand(3)),
+            (next(iterator), torch.rand(3)),
+        ]
+
+    lanes = inference._seed_data_lanes(RandomLoader(), seeds, deterministic=False)
+    generators = inference._seed_batch_msa_generators(lanes, seeds, torch.device("cpu"))
+    actual = {seed: [] for seed in seeds}
+    for _ in range(2):
+        features = [inference._next_seed_data(lane) for lane in lanes]
+        inference._sync_cpu_msa_generators(
+            lanes,
+            generators,
+            before_model=True,
+            device=torch.device("cpu"),
+        )
+        model_draws = [torch.rand(3, generator=generator) for generator in generators]
+        inference._sync_cpu_msa_generators(
+            lanes,
+            generators,
+            before_model=False,
+            device=torch.device("cpu"),
+        )
+        for seed, feature, model_draw in zip(seeds, features, model_draws):
+            actual[seed].append((feature, model_draw))
+
+    for seed in seeds:
+        for actual_record, expected_record in zip(actual[seed], expected[seed]):
+            actual_features, actual_model_draw = actual_record
+            expected_features, expected_model_draw = expected_record
+            torch.testing.assert_close(
+                actual_features[0], expected_features[0], rtol=0, atol=0
+            )
+            assert actual_features[1:3] == expected_features[1:3]
+            torch.testing.assert_close(
+                actual_features[3], expected_features[3], rtol=0, atol=0
+            )
+            torch.testing.assert_close(
+                actual_model_draw, expected_model_draw, rtol=0, atol=0
+            )
+
+
+@pytest.mark.parametrize(
+    ("seeds", "seed_batch_size", "error_lanes", "forward_seeds", "fatal"),
+    [
+        ([101, 202], 2, 0, (101, 202), True),
+        ([101], 1, 0, (101,), False),
+        ([101, 202], 2, 1, (202,), False),
+    ],
+)
+def test_only_seed_batch_oom_is_fatal_and_not_retried(
+    monkeypatch,
+    tmp_path,
+    seeds,
+    seed_batch_size,
+    error_lanes,
+    forward_seeds,
+    fatal,
+):
+    from runner import inference
+
+    class OneRecordLoader:
+        dataset = [object()]
+
+        def __init__(self):
+            self.lane = 0
+
+        def __iter__(self):
+            data = {
+                "sample_name": "sample",
+                "sample_index": 0,
+                "N_asym": torch.tensor(1),
+                "N_token": torch.tensor(1),
+                "N_atom": torch.tensor(1),
+                "N_msa": torch.tensor(1),
+                "entity_poly_type": {},
+                "input_feature_dict": {},
+            }
+            data_error = "test data error" if self.lane < error_lanes else ""
+            self.lane += 1
+            return iter([[(data, None, data_error)]])
+
+    input_path = tmp_path / "input.json"
+    input_path.write_text('[{"name": "sample"}]', encoding="utf-8")
+    calls = []
+    dumps = []
+    cleanup_calls = []
+
+    def predict_seed_batch(_data, seeds, **_kwargs):
+        calls.append(tuple(seeds))
+        raise torch.cuda.OutOfMemoryError("test OOM")
+
+    error_dir = tmp_path / "errors"
+    error_dir.mkdir()
+    runner = SimpleNamespace(
+        device=torch.device("cpu"),
+        error_dir=str(error_dir),
+        foldcp_config=SimpleNamespace(enabled=False, size_dp=1),
+        update_model_configs=lambda _configs: None,
+        predict_seed_batch=predict_seed_batch,
+        dumper=SimpleNamespace(dump=lambda **kwargs: dumps.append(kwargs)),
+    )
+    configs = SimpleNamespace(
+        input_json_path=str(input_path),
+        seeds=seeds,
+        seed_batch_size=seed_batch_size,
+        deterministic=False,
+        dump_dir=str(tmp_path),
+    )
+    monkeypatch.setattr(
+        inference, "get_inference_dataloader", lambda **_kwargs: OneRecordLoader()
+    )
+    monkeypatch.setattr(
+        inference,
+        "cleanup_device_memory",
+        lambda *_args, **kwargs: cleanup_calls.append(kwargs),
+    )
+    monkeypatch.setattr(
+        inference, "update_inference_configs", lambda configs, _n_token: configs
+    )
+    monkeypatch.setattr(
+        inference,
+        "DIST_WRAPPER",
+        SimpleNamespace(world_size=1, rank=0, local_rank=0),
+    )
+
+    if fatal:
+        with pytest.raises(torch.cuda.OutOfMemoryError, match="test OOM"):
+            inference.infer_predict(runner, configs)
+    else:
+        inference.infer_predict(runner, configs)
+
+    assert calls == [forward_seeds]
+    assert dumps == []
+    assert cleanup_calls == (
+        [{}, {"collect_garbage": False}]
+        if fatal
+        else [{}, {"collect_garbage": False}, {"synchronize": True}]
+    )
+    assert (error_dir / "sample.txt").exists() is not fatal
+
+
+def test_single_process_batch_oom_escapes_and_closes_runner(monkeypatch, tmp_path):
+    from runner import batch_inference
+
+    input_path = tmp_path / "input.json"
+    input_path.write_text("[]", encoding="utf-8")
+    closed = []
+    runner = SimpleNamespace(configs={}, close=lambda: closed.append(True))
+    monkeypatch.setattr(
+        batch_inference,
+        "DIST_WRAPPER",
+        SimpleNamespace(world_size=1, rank=0, local_rank=0),
+    )
+    monkeypatch.setattr(batch_inference, "get_default_runner", lambda **_kwargs: runner)
+    monkeypatch.setattr(
+        batch_inference,
+        "_preprocess_input_for_runner",
+        lambda input_json, **_kwargs: input_json,
+    )
+    monkeypatch.setattr(
+        batch_inference,
+        "infer_predict",
+        lambda *_args: (_ for _ in ()).throw(torch.cuda.OutOfMemoryError("test OOM")),
+    )
+    monkeypatch.setattr(batch_inference.tqdm, "tqdm", lambda values: values)
+
+    with pytest.raises(torch.cuda.OutOfMemoryError, match="test OOM"):
+        batch_inference.inference_jsons(str(input_path), seed_batch_size=2)
+
+    assert closed == [True]

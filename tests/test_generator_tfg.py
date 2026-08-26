@@ -17,6 +17,7 @@
 """Generator-level Training-Free Guidance regression tests."""
 
 import numpy as np
+import pytest
 import torch
 
 from opendde.model.generator import InferenceNoiseScheduler, sample_diffusion
@@ -152,3 +153,80 @@ def test_tfg_guidance_forwards_pair_z_spec_to_denoiser():
     assert out.shape == (1, 6, 3)
     assert seen_specs
     assert all(spec is sentinel for spec in seen_specs)
+
+
+def test_seed_batched_diffusion_matches_independent_scalar_streams():
+    seeds = [101, 202]
+    scalar_inputs = _inputs(n_step=2)
+    batched_inputs = {
+        **scalar_inputs,
+        "s_inputs": torch.stack([scalar_inputs["s_inputs"]] * len(seeds)),
+        "s_trunk": torch.stack([scalar_inputs["s_trunk"]] * len(seeds)),
+        "z_trunk": torch.stack([scalar_inputs["z_trunk"]] * len(seeds)),
+    }
+
+    actual = sample_diffusion(
+        N_sample=2,
+        rollout_seed=seeds,
+        **batched_inputs,
+    )
+    expected = torch.stack(
+        [
+            sample_diffusion(
+                N_sample=2,
+                rollout_seed=seed,
+                **scalar_inputs,
+            )
+            for seed in seeds
+        ]
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_seed_batched_diffusion_rejects_tfg():
+    scalar_inputs = _inputs(n_step=1)
+    batched_inputs = {
+        **scalar_inputs,
+        "s_inputs": torch.stack([scalar_inputs["s_inputs"]] * 2),
+        "s_trunk": torch.stack([scalar_inputs["s_trunk"]] * 2),
+        "z_trunk": torch.stack([scalar_inputs["z_trunk"]] * 2),
+    }
+
+    with pytest.raises(ValueError, match="does not support seed batching"):
+        sample_diffusion(
+            N_sample=1,
+            rollout_seed=[101, 202],
+            guidance_configs=_tfg_cfg(),
+            **batched_inputs,
+        )
+
+
+def test_seed_batched_diffusion_rejects_seed_count_mismatch():
+    scalar_inputs = _inputs(n_step=1)
+    batched_inputs = {
+        **scalar_inputs,
+        "s_inputs": torch.stack([scalar_inputs["s_inputs"]] * 2),
+        "s_trunk": torch.stack([scalar_inputs["s_trunk"]] * 2),
+        "z_trunk": torch.stack([scalar_inputs["z_trunk"]] * 2),
+    }
+
+    with pytest.raises(ValueError, match="batch_shape"):
+        sample_diffusion(
+            N_sample=1,
+            rollout_seed=[101],
+            **batched_inputs,
+        )
+
+
+def test_scalar_tensor_rollout_seed_matches_integer_seed():
+    inputs = _inputs(n_step=1)
+
+    expected = sample_diffusion(N_sample=1, rollout_seed=101, **inputs)
+    actual = sample_diffusion(
+        N_sample=1,
+        rollout_seed=torch.tensor(101),
+        **inputs,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)

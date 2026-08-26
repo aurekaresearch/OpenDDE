@@ -1,94 +1,132 @@
 # Seed-Parallel Inference Specification
 
-Status: Implemented
-Date: 2026-08-25
+Status: Implementation and qualification in progress
+Date: 2026-08-26
 
-This specification adds seed-level data parallelism to the existing inference
-runner without changing model computation, seed meaning, output files, or the
-current `1 x P` Fold-CP path.
+This specification adds tensor-batched seed inference on one GPU and composes
+it with the existing multi-GPU seed sharding. Single- and multi-GPU execution
+use the same rank-local seed-batch path; additional GPUs only change which
+seeds each rank owns.
 
 ## Goal
 
-Allow explicit inference seeds to run concurrently on separate GPUs under
-`torchrun`. Reuse the existing `--foldcp_size_dp` and `--foldcp_size_cp`
-topology flags rather than adding another parallelism interface.
+Run independent inference seeds concurrently within one model forward while
+preserving each seed's features, random stream, samples, and output files.
 
-This version supports single-node `torchrun --standalone`; all ranks share the
-same checkout, runtime assets, input paths, and output filesystem.
+Reuse the existing Fold-CP topology flags for process placement and add one
+orthogonal batch-width control:
 
-The default `D=1, P=1` execution must remain the existing serial path, where:
+- `D` is `--foldcp_size_dp`, the number of seed-sharding ranks;
+- `P` is `--foldcp_size_cp`, the number of Fold-CP ranks cooperating on one
+  model execution; and
+- `B` is `--seed_batch_size`, the maximum number of seeds in one rank-local
+  model batch.
 
-- `D` is `--foldcp_size_dp`, the number of independent seed lanes; and
-- `P` is `--foldcp_size_cp`, the number of Fold-CP ranks used by one seed.
+`B` defaults to `1`, so existing commands retain their prior memory profile.
+It does not change `WORLD_SIZE` or `--sample` (`N_sample`).
 
 ## Public interface
 
-No new CLI flag, config key, input field, or output field is added.
+The new CLI/config option is:
 
-Seed-parallel inference uses the existing single-card model path with one
-process per GPU:
+```text
+--seed_batch_size INTEGER  Maximum seeds per rank-local model batch. [default: 1]
+```
+
+For example, two seeds can share one GPU:
+
+```bash
+opendde pred \
+  -i input.json -o output_b2 -n opendde_v1 \
+  --seeds 101,102 \
+  --seed_batch_size 2
+```
+
+The same option composes with multi-GPU seed sharding. This command assigns
+two seeds to each of four ranks:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
 torchrun --standalone --nproc_per_node 4 \
   -m runner.batch_inference pred \
-  -i input.json -o output_dp4 -n opendde_v1 \
-  --seeds 101,102,103,104 \
-  --use_msa false --use_template false --use_rna_msa false \
+  -i input.json -o output_d4_b2 -n opendde_v1 \
+  --seeds 101,102,103,104,105,106,107,108 \
+  --seed_batch_size 2 \
   --foldcp_mode single --foldcp_size_dp 4 --foldcp_size_cp 1
 ```
 
-`--foldcp_mode single` means that each seed lane uses the normal single-card
-model path. It does not require `WORLD_SIZE=1` when `D > 1`.
-
-## Supported topologies
+## Supported execution modes
 
 `WORLD_SIZE` must equal `D * P`.
 
-| Mode | `D` | `P` | Behavior |
-| --- | ---: | ---: | --- |
-| Serial | 1 | 1 | Existing single-process inference |
-| Seed parallel | >1 | 1 | One independent seed lane per GPU |
-| Fold-CP | 1 | >1 | Existing `1 x P` context-parallel inference |
-| Hybrid | >1 | >1 | Rejected in this version |
+| Mode | `D` | `P` | `B` | Behavior |
+| --- | ---: | ---: | ---: | --- |
+| Scalar single GPU | 1 | 1 | 1 | One seed per model call |
+| Batched single GPU | 1 | 1 | >1 | Up to `B` seeds per model call |
+| Sharded seed batches | >1 | 1 | >=1 | Rank-local batches after seed sharding |
+| Fold-CP | 1 | >1 | 1 | Existing context-parallel inference |
+| Batched Fold-CP | any | >1 | >1 | Rejected |
+| Hybrid `D x P` | >1 | >1 | any | Rejected |
 
-Hybrid seed parallelism plus Fold-CP is out of scope because current model and
-output ownership are global-rank-oriented. Supporting it would require changes
-inside the Fold-CP model/process-mesh path and would make this PR materially
-larger.
+`--foldcp_mode single` selects the normal model path for both one and multiple
+seed-sharding ranks. Same-GPU batching requires `P=1`; this version does not add
+a seed batch dimension to Fold-CP.
 
-## Execution semantics
+## Scheduling semantics
 
 Seed precedence remains unchanged: command-line `--seeds`, then the input
 job's `modelSeeds`, then one generated seed.
 
-For seed-parallel `D x 1` execution:
+For each preprocessed input:
 
-1. For each preprocessed input JSON, rank 0 resolves and validates the ordered
-   seed list once and shares it with all ranks. Existing precedence and the
-   first top-level record's `modelSeeds` behavior remain unchanged.
-2. Seeds must be unique and their count must be at least `D`; invalid requests
-   fail before model inference.
-3. Rank `r` receives `seeds[r::D]`. Every requested seed is assigned exactly
-   once and order is stable within each lane.
-4. Every rank consumes every input job in the same deterministic order. Input
-   records are not sharded by `DistributedSampler`.
-5. Shared input preprocessing runs once on rank 0 and shares the resulting path
-   or failure with all ranks. A preprocessing or seed-validation failure
-   terminates every rank and returns a nonzero command result; existing
-   per-job prediction-error handling remains unchanged.
-6. Each rank retains the existing per-seed sequence: seed global RNG state,
-   featurize, run the model, rank samples, and dump results.
-7. Each rank writes only its assigned seed directories.
+1. Resolve the ordered seed list once and share it with all ranks.
+2. Rank `r` receives `seeds[r::D]`.
+3. Each rank partitions that ordered slice into consecutive chunks of at most
+   `B` seeds.
+4. Every chunk, including a smaller final chunk, follows the same rank-local
+   feature, model, postprocessing, and output path.
+5. Every requested seed is assigned exactly once. Multiple ranks change only
+   ownership, not the batching implementation.
 
-For existing `1 x P` Fold-CP execution, all ranks continue to consume the same
-jobs and seeds, and global rank 0 remains the only output writer. No model,
-kernel, checkpoint, or numerical path changes are required for seed parallelism.
+For example, with seeds `101-107`, `D=2`, and `B=2`:
 
-Directory inputs must be sorted before distributed iteration so every rank
-processes files in the same order.
+```text
+rank 0: [101, 103], [105, 107]
+rank 1: [102, 104], [106]
+```
 
-## Output and determinism contract
+Every rank enumerates and consumes input jobs in the same deterministic order.
+In a multi-rank run, rank 0 preprocesses each input once and broadcasts the
+resulting shared path or failure; single-process preprocessing remains local.
+Each rank writes only its assigned seed directories.
+
+## Model and random-stream contract
+
+Seed-dependent features are constructed independently and stacked on a leading
+seed dimension. The normal model path carries tensors shaped conceptually as:
+
+```text
+[B_seed, N_sample, ...]
+```
+
+`B_seed` is the current rank-local chunk size and may be smaller than the
+configured `B`. `N_sample` remains the number of diffusion samples within each
+seed; seed batching does not reinterpret or replace it.
+
+MSA sampling, reference-position augmentation, and diffusion noise must retain
+independent per-seed random streams. Training-Free Guidance with `B>1` is
+rejected. Scalar postprocessing and dumping split the leading seed dimension and
+continue to receive one seed at a time, preserving existing output schemas and
+ranking behavior.
+
+Per-seed random draws must not depend on the other seeds in a batch. End-to-end
+predictions are not required to be bitwise identical across batch widths:
+batch-shaped kernels can use different floating-point launch geometry, and
+small BF16 differences can amplify through iterative diffusion. Qualification
+must report those numerical deltas rather than treating them as RNG-stream
+mixing.
+
+## Output and compatibility contract
 
 The output layout remains:
 
@@ -96,43 +134,46 @@ The output layout remains:
 <out_dir>/<job_name>/seed_<seed>/predictions/
 ```
 
-Seed-parallel width is an execution setting only. It must not change:
+Changing `D` or `B` must not change:
 
-- seed precedence or seed values;
-- `--sample` cardinality within each seed;
+- seed precedence or values;
+- `--sample` cardinality within a seed;
 - output filenames, schemas, ranking, or atom ordering; or
-- the result associated with a `(job, seed, sample)` tuple.
+- the independent random stream associated with a `(job, seed, sample)` tuple.
 
-Completion and log ordering may differ because lanes finish independently.
-The implementation must log the global rank and assigned seeds sufficiently to
-audit ownership. It must not claim a performance gain without a controlled
-benchmark.
+Completion and log ordering may differ. Logs must identify rank ownership and
+the seeds in each batch sufficiently to audit execution.
 
 ## Validation and errors
 
-Configuration must fail before model loading when:
+Configuration must fail before model inference when:
 
+- `B < 1`;
 - `WORLD_SIZE != D * P`;
 - `D > 1` and `P > 1`;
-- `--foldcp_mode distributed` does not have `D=1, P>1`;
+- `B > 1` and `P > 1`;
+- `B > 1` and inference data loading uses `num_workers != 0`;
+- `B > 1` and `model.N_model_seed != 1`;
+- `B > 1` and Training-Free Guidance is enabled;
+- `--foldcp_mode distributed` does not have `D=1, P>1`; or
 - `--foldcp_mode single` does not have `P=1`.
 
-After each input's seeds are resolved, but before its first model forward, the
-command must fail when seed-parallel execution receives duplicate seeds or
-fewer seeds than lanes.
+Seeds must be unique when either `D > 1` or `B > 1`. A multi-rank request must
+contain at least `D` seeds. Errors must identify the conflicting values and
+must never silently drop, duplicate, or overwrite a seed.
 
-Errors must identify the conflicting values and the supported topology. A
-request must never silently fall back to serial execution or silently drop,
-duplicate, or overwrite a seed.
+The runner must not catch a CUDA OOM and silently reduce `B`, retry seeds one at
+a time, or select a batch size automatically. Users choose a width that fits
+their input and device.
 
 ## Documentation requirements
 
-The implementation PR must update only the existing public owners:
+The implementation PR updates the existing public owners:
 
-- `README.md` with one concise seed-parallel example;
-- `docs/inference_instructions.md` with topology and flag semantics;
-- `docs/foldcp_e2e_baseline.md` with reproducible `D x 1`, `1 x P`, and invalid
-  hybrid validation commands; and
+- `README.md` with concise single- and multi-GPU examples;
+- `docs/inference_instructions.md` with `D`, `P`, and `B` semantics;
+- `docs/foldcp_e2e_baseline.md` with reproducible comparison and guard commands;
+  and
 - `CHANGELOG.md` under `[Unreleased]`.
 
 Do not add a second run guide or rename the Fold-CP guide.
@@ -141,45 +182,41 @@ Do not add a second run guide or rename the Fold-CP guide.
 
 Automated tests must cover:
 
-- supported and rejected topology validation;
-- exact world-size validation before model loading;
-- rank-to-seed assignment, including uneven tails;
-- rank-0 seed resolution and preprocessing propagation;
-- multi-record inputs appearing in the same order on every rank;
-- exactly-once `(job, seed)` execution and output ownership;
-- unchanged serial `D=1, P=1` behavior; and
-- unchanged existing `1 x P` Fold-CP behavior.
+- `B` validation and CLI/config propagation;
+- exact rank-to-seed assignment followed by batching, including uneven tails;
+- supported and rejected `D`, `P`, `B`, and world-size combinations;
+- independent, persistent per-seed random streams;
+- batched feature and model tensor shapes with `N_sample > 1`;
+- scalar-versus-batched random-stream and small-model-stage equivalence for
+  individual seeds;
+- per-seed postprocessing and exactly-once output ownership;
+- unchanged `B=1` single- and multi-rank behavior; and
+- unchanged existing `1 x P`, `B=1` Fold-CP behavior.
 
-The implementation must also be qualified locally on the available four-GPU
-host using world sizes 1, 2, 3, and 4. The matrix must include serial,
-seed-parallel, Fold-CP, mismatched-world-size, and rejected-hybrid cases. Use the
-same small checked-in input, released checkpoint, seeds, dtype, kernels, cycle,
-step, and sample settings for matched comparisons.
-
-For successful runs, verify seed directories, sample counts, CIF schema, atom
-ordering, finite values, coordinates, and summary-confidence outputs against
-the matching serial result with an explicit dtype-appropriate tolerance. Record
-the exact commit, commands, environment, GPU mapping, raw timing, peak memory,
-and numerical deltas. The heterogeneous four-GPU host provides correctness
-evidence only, not a portable speed claim.
+Qualification must exercise world sizes 1, 2, 3, and 4, scalar and batched
+single-GPU execution, batched multi-GPU seed sharding, a partial final batch,
+Fold-CP with `B=1`, and every new guard. Successful comparisons must record the
+exact commit, command, GPU mapping, dtype, timing, peak GPU memory, output
+cardinality, and numerical deltas from matching scalar runs.
 
 ## Non-goals
 
-- Same-GPU tensor batching of multiple seeds.
+- Seed batching combined with Fold-CP (`P > 1`).
 - Hybrid `D x P` execution with both dimensions greater than one.
-- Automatic batch sizing, OOM retries, scheduling, or performance policy.
-- Changes to `N_sample`, checkpoints, kernels, model code, output schemas, or
-  input JSON.
+- Automatic batch sizing, OOM retries, or performance policy.
+- Changes to checkpoint or input/output schemas.
 - Predictify, Cloud runner, container, or deployment changes.
-- Multi-node execution or filesystems that are not shared by all local ranks.
+- Multi-node execution or filesystems not shared by all ranks.
 
 ## Acceptance criteria
 
-- The supported topology table is enforced exactly.
+- Single- and multi-GPU seed execution share one rank-local batch path.
 - Every requested `(job, seed)` runs and is written exactly once.
-- Serial and existing Fold-CP behavior remain compatible.
-- Focused tests and the non-network test suite pass.
-- The complete local world-size 1-4 GPU matrix exits without hangs and records
-  numerical-alignment evidence.
+- Per-seed random streams remain aligned when placed in a batch; BF16
+  end-to-end deltas are recorded explicitly.
+- `N_sample` remains independent of seed batch width.
+- Existing `B=1` and Fold-CP behavior remain compatible.
+- Focused tests and the non-network suite pass.
+- The local one-to-four-GPU matrix exits without hangs and records timing,
+  memory, output, and numerical-alignment evidence.
 - Documentation and CLI help describe the implemented behavior consistently.
-- The implementation diff contains no unrelated refactor or new abstraction.

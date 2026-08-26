@@ -13,6 +13,7 @@ inference_configs: dict[str, Any] = {
     "model_name": DEFAULT_MODEL_NAME,  # inference model selection
     # Empty = "unset"; resolved at run time to CLI > JSON modelSeeds > random seed.
     "seeds": ListValue([], dtype=int),
+    "seed_batch_size": 1,
     "dump_dir": "./output",
     "need_atom_confidence": True,
     "sorted_by_ranking_score": True,

@@ -6,9 +6,9 @@ User-facing changes to OpenDDE are documented here.
 
 ### Added
 
-- Added single-node seed-parallel `D x 1` inference using the existing Fold-CP
-  topology flags, while preserving serial and `1 x P` Fold-CP behavior and
-  rejecting hybrid `D > 1, P > 1` launches.
+- Added `--seed_batch_size` for tensor-batched independent seeds on one GPU.
+  The same rank-local batching path composes with single-node `D x 1` seed
+  sharding; `1 x P` Fold-CP remains available with seed batch size 1.
 
 ## [1.1.0] - 2026-08-16
 

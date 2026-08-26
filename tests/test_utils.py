@@ -197,6 +197,60 @@ class TestUtils(unittest.TestCase):
         self.assertEqual(sampled["msa"].shape[0], 2)
         self.assertTrue(torch.all(sampled["msa"].ne(gap_token).any(dim=-1)))
 
+    def test_seed_batched_msa_sampling_matches_independent_streams(self):
+        gap_token = 31
+        msa = torch.tensor(
+            [
+                [0, 1, 2],
+                [3, 4, 5],
+                [6, 7, 8],
+                [9, 10, 11],
+                [gap_token, gap_token, gap_token],
+            ]
+        )
+        scalar_features = [
+            {
+                "msa": msa.clone(),
+                "has_deletion": torch.zeros(5, 3),
+                "deletion_value": torch.zeros(5, 3),
+            }
+            for _ in range(2)
+        ]
+        batched_features = {
+            name: torch.stack([features[name] for features in scalar_features])
+            for name in scalar_features[0]
+        }
+        batched_generators = [
+            torch.Generator().manual_seed(seed) for seed in (101, 202)
+        ]
+        scalar_generators = [torch.Generator().manual_seed(seed) for seed in (101, 202)]
+
+        for _ in range(2):
+            actual = subsample_msa_feature_dict_valid_first(
+                feat_dict=batched_features,
+                dim_dict={name: -2 for name in batched_features},
+                num_msa=3,
+                gap_token=gap_token,
+                generators=batched_generators,
+            )
+            expected = [
+                subsample_msa_feature_dict_valid_first(
+                    feat_dict=features,
+                    dim_dict={name: -2 for name in features},
+                    num_msa=3,
+                    gap_token=gap_token,
+                    generators=[generator],
+                )
+                for features, generator in zip(scalar_features, scalar_generators)
+            ]
+            for name in actual:
+                torch.testing.assert_close(
+                    actual[name],
+                    torch.stack([features[name] for features in expected]),
+                    rtol=0,
+                    atol=0,
+                )
+
     def tearDown(self):
         elapsed_time = time.time() - self._start_time
         print(f"Test {self.id()} took {elapsed_time:.6f}s")

@@ -209,24 +209,38 @@ For production runs, enable the preprocessing features you need, for example
 require network access, HMMER/Kalign binaries, and large local search databases;
 see the inference guide for details.
 
-## Multi-GPU Seed-Parallel Inference
+## Seed-Batched Inference
 
-Independent seeds can run concurrently on separate GPUs with the existing
-topology flags. `D=4, P=1` uses the normal single-card model path on four seed
-lanes:
+Independent seeds can share one model call on a GPU. `--seed_batch_size`
+defaults to `1`; set it to the maximum number of seeds to run together:
+
+```bash
+opendde pred \
+  -i input.json -o output_b2 -n opendde_v1 \
+  --seeds 101,102 \
+  --seed_batch_size 2
+```
+
+The same rank-local batching path works with multi-GPU seed sharding. `D=4`,
+`P=1`, and `B=2` assign seeds by rank first, then batch up to two seeds per GPU:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node 4 \
   -m runner.batch_inference pred \
-  -i input.json -o output_dp4 -n opendde_v1 \
-  --seeds 101,102,103,104 \
+  -i input.json -o output_d4_b2 -n opendde_v1 \
+  --seeds 101,102,103,104,105,106,107,108 \
+  --seed_batch_size 2 \
   --foldcp_mode single \
   --foldcp_size_dp 4 \
   --foldcp_size_cp 1
 ```
 
-Seed-parallel seeds must be unique, and their count must be at least `D`. Each
-seed is assigned to one rank and written once under the normal output layout.
+Rank `r` receives `seeds[r::D]`, then runs ordered chunks of at most `B`; a
+smaller final chunk is allowed. Seeds must be unique when `D>1` or `B>1`, and
+multi-rank runs need at least `D` seeds. Seed batching requires `P=1`,
+`num_workers=0`, `model.N_model_seed=1`, and Training-Free Guidance disabled.
+OpenDDE does not automatically reduce `B` or retry after OOM.
+Each seed is still written once under the normal output layout.
 
 ## Multi-GPU Fold-CP Inference
 

@@ -241,37 +241,65 @@ Device auto-selection uses NVIDIA CUDA when available and otherwise CPU.
 cuEquivariance is selected only when its Linux CUDA packages import successfully;
 otherwise the model uses PyTorch triangle kernels.
 
-## Multi-GPU inference
+## Seed batching and multi-GPU inference
 
-The existing topology flags support serial inference, independent seed lanes,
-or Fold-CP. Let `D=--foldcp_size_dp` and `P=--foldcp_size_cp`:
+Let `D=--foldcp_size_dp`, `P=--foldcp_size_cp`, and
+`B=--seed_batch_size`. `D` and `P` define process placement; `B` is the maximum
+number of seeds in one rank-local model batch and defaults to `1`.
 
-| Mode | `foldcp_mode` | `D` | `P` | Required world size |
-| --- | --- | ---: | ---: | ---: |
-| Serial | `single` | 1 | 1 | 1 |
-| Seed parallel | `single` | >1 | 1 | `D` |
-| Fold-CP | `distributed` | 1 | >1 | `P` |
-| Hybrid | - | >1 | >1 | Rejected |
+| Mode | `foldcp_mode` | `D` | `P` | `B` | Required world size |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Scalar single GPU | `single` | 1 | 1 | 1 | 1 |
+| Batched single GPU | `single` | 1 | 1 | >1 | 1 |
+| Sharded seed batches | `single` | >1 | 1 | >=1 | `D` |
+| Fold-CP | `distributed` | 1 | >1 | 1 | `P` |
+| Batched Fold-CP | - | any | >1 | >1 | Rejected |
+| Hybrid | - | >1 | >1 | any | Rejected |
 
 `WORLD_SIZE` must equal `D * P`. Hybrid and mismatched-world-size launches fail
 instead of falling back to serial inference. Multi-GPU inference in this release
 is single-node and requires all ranks to share the input and output filesystem.
 
-### Seed parallel `D x 1`
+### Rank-local seed batches
 
-Seed parallelism runs the normal single-card model independently on each GPU.
-Rank `r` receives `seeds[r::D]`, so seeds must be unique and their count must be
-at least `D`. For example:
+On one GPU, set `D=1, P=1` and choose `B>1`:
+
+```bash
+opendde pred \
+  -i input.json -o output_b2 -n opendde_v1 \
+  --seeds 101,102 \
+  --seed_batch_size 2
+```
+
+Multi-GPU execution uses the same path after assigning rank `r` the ordered
+slice `seeds[r::D]`. Each rank chunks that slice into groups of at most `B`, so
+a smaller final batch is valid. For example, four GPUs with two seeds per GPU
+use:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node 4 \
   -m runner.batch_inference pred \
-  -i input.json -o output_dp4 -n opendde_v1 \
-  --seeds 101,102,103,104 \
+  -i input.json -o output_d4_b2 -n opendde_v1 \
+  --seeds 101,102,103,104,105,106,107,108 \
+  --seed_batch_size 2 \
   --foldcp_mode single \
   --foldcp_size_dp 4 \
   --foldcp_size_cp 1
 ```
+
+Seed batches use a leading model dimension separate from `--sample`: model
+tensors are shaped conceptually as `[B_seed, N_sample, ...]`. Outputs are split
+after model inference and remain one directory per seed. Seeds must be unique
+when either `D>1` or `B>1`, and multi-rank runs require at least `D` seeds.
+Per-seed random streams remain independent, but BF16 predictions need not be
+bitwise identical across batch widths because batched kernels can use different
+floating-point launch geometry.
+
+`B>1` requires `P=1`, `num_workers=0`, `model.N_model_seed=1`, and Training-Free
+Guidance disabled.
+OpenDDE does not choose a width, automatically reduce it, or retry seeds
+serially after an OOM; select a batch size that fits the input and GPU. `B=1`
+preserves the previous tensor shapes and memory profile.
 
 ### Fold-CP `1 x P`
 
@@ -321,7 +349,8 @@ Runtime notes:
   and memory metrics.
 
 For single-GPU inference, omit the topology flags or set
-`--foldcp_mode single --foldcp_size_dp 1 --foldcp_size_cp 1`.
+`--foldcp_mode single --foldcp_size_dp 1 --foldcp_size_cp 1`. Fold-CP requires
+the default `--seed_batch_size 1`.
 
 Use prepared features:
 
@@ -341,6 +370,8 @@ OpenDDE includes default-off Training-Free Guidance (TFG) for protein-ligand
 runs. TFG refines each sampled trajectory with geometry potentials while keeping
 the requested `--sample` count unchanged.
 
+`model.N_model_seed>1` and TFG currently require `--seed_batch_size 1`.
+
 ```bash
 opendde pred -i examples/input.json -o ./output -n opendde_v1 \
   --use_tfg_guidance true
@@ -359,12 +390,13 @@ Outputs are written to:
 | `-n`, `--model_name` | Model name. Currently `opendde_v1`. |
 | `--load_checkpoint_path` | Explicit checkpoint path. |
 | `--seeds` | Comma-separated seeds, e.g. `101,102`. Overrides the job's `modelSeeds`; if unset, `modelSeeds` are used, or a random seed when both are absent. |
+| `--seed_batch_size` | Maximum seeds in one rank-local model batch. Defaults to `1`; values greater than one require `P=1`, `num_workers=0`, `model.N_model_seed=1`, and TFG disabled. |
 | `--use_msa` | Use/generate protein MSA features. |
 | `--use_template` | Use/generate template features. |
 | `--use_rna_msa` | Use/generate RNA MSA features. |
 | `--use_tfg_guidance` | Enable Training-Free Guidance. |
 | `--foldcp_mode` | Use `single` for serial or seed-parallel inference and `distributed` only for `1 x P` Fold-CP. |
-| `--foldcp_size_dp` | Number of independent seed lanes; values greater than one require `P=1`. |
+| `--foldcp_size_dp` | Number of seed-sharding ranks; values greater than one require `P=1`. |
 | `--foldcp_size_cp` | Number of Fold-CP ranks per seed; values greater than one require `D=1`. |
 | `--foldcp_devices` | Optional visible-device list recorded in Fold-CP metrics; actual GPU visibility is controlled by `CUDA_VISIBLE_DEVICES`. |
 | `--foldcp_metrics_jsonl` | Optional JSONL path for Fold-CP timing and memory metrics. |

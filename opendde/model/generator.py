@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Aureka AI Research
+from collections.abc import Sequence
 from typing import Any, Callable, Optional
 
 import numpy as np
@@ -8,6 +9,7 @@ import torch
 from opendde.model.utils import centre_random_augmentation
 from opendde.tfg import TFGEngine, parse_tfg_config
 from opendde.utils.logger import get_logger
+from opendde.utils.random import TorchGenerator, randn_with_generators
 
 logger = get_logger(__name__)
 
@@ -89,7 +91,7 @@ def sample_diffusion(
     inplace_safe: bool = False,
     attn_chunk_size: Optional[int] = None,
     enable_efficient_fusion: bool = False,
-    rollout_seed: Optional[int] = None,
+    rollout_seed: Optional[int | Sequence[int] | torch.Tensor] = None,
     guidance_configs: Optional[dict[str, Any]] = None,
     pair_z_spec: Any = None,
     atom_window_spec: Any = None,
@@ -136,13 +138,40 @@ def sample_diffusion(
     batch_shape = s_inputs.shape[:-2]
     device = s_inputs.device
     dtype = s_inputs.dtype
-    torch_generator = None
-    numpy_rng = None
+    torch_generator: TorchGenerator = None
+    numpy_rng: Optional[np.random.Generator | tuple[np.random.Generator, ...]] = None
     if rollout_seed is not None:
-        torch_generator = torch.Generator(device=device)
-        torch_generator.manual_seed(int(rollout_seed))
-        numpy_rng = np.random.default_rng(int(rollout_seed))
+        if isinstance(rollout_seed, torch.Tensor):
+            if rollout_seed.ndim == 0:
+                rollout_seeds = [int(rollout_seed.detach().cpu().item())]
+            else:
+                rollout_seeds = [
+                    int(seed) for seed in rollout_seed.detach().cpu().tolist()
+                ]
+        elif isinstance(rollout_seed, Sequence):
+            rollout_seeds = [int(seed) for seed in rollout_seed]
+        else:
+            rollout_seeds = [int(rollout_seed)]
+
+        if len(rollout_seeds) == 1 and not batch_shape:
+            torch_generator = torch.Generator(device=device).manual_seed(
+                rollout_seeds[0]
+            )
+            numpy_rng = np.random.default_rng(rollout_seeds[0])
+        else:
+            if batch_shape != (len(rollout_seeds),):
+                raise ValueError(
+                    "Seed-batched diffusion requires one leading batch dimension; "
+                    f"got batch_shape={batch_shape} for {len(rollout_seeds)} seeds."
+                )
+            torch_generator = tuple(
+                torch.Generator(device=device).manual_seed(seed)
+                for seed in rollout_seeds
+            )
+            numpy_rng = tuple(np.random.default_rng(seed) for seed in rollout_seeds)
     tfg_cfg = parse_tfg_config(guidance_configs)
+    if tfg_cfg.enable and isinstance(torch_generator, Sequence):
+        raise ValueError("Training-Free Guidance does not support seed batching.")
     if tfg_cfg.enable:
         logger.info("Training-free guidance is enabled.")
         tfg = TFGEngine(tfg_cfg, device=device, dtype=dtype)
@@ -152,8 +181,8 @@ def sample_diffusion(
     def _chunk_sample_diffusion(chunk_n_sample, inplace_safe):
         # init noise
         # [..., chunk_n_sample, N_atom, 3]
-        x_l = noise_schedule[0] * torch.randn(
-            size=(*batch_shape, chunk_n_sample, N_atom, 3),
+        x_l = noise_schedule[0] * randn_with_generators(
+            (*batch_shape, chunk_n_sample, N_atom, 3),
             device=device,
             dtype=dtype,
             generator=torch_generator,
@@ -163,27 +192,47 @@ def sample_diffusion(
             zip(noise_schedule[:-1], noise_schedule[1:])
         ):
             # [..., chunk_n_sample, N_atom, 3]
-            x_l = (
-                centre_random_augmentation(
-                    x_input_coords=x_l,
-                    N_sample=1,
-                    torch_generator=torch_generator,
-                    numpy_rng=numpy_rng,
+            if isinstance(torch_generator, Sequence):
+                assert isinstance(numpy_rng, tuple)
+                x_l = torch.stack(
+                    [
+                        centre_random_augmentation(
+                            x_input_coords=x_l[lane],
+                            N_sample=1,
+                            torch_generator=lane_generator,
+                            numpy_rng=numpy_rng[lane],
+                        ).squeeze(dim=-3)
+                        for lane, lane_generator in enumerate(torch_generator)
+                    ],
+                    dim=0,
+                ).to(dtype)
+            else:
+                x_l = (
+                    centre_random_augmentation(
+                        x_input_coords=x_l,
+                        N_sample=1,
+                        torch_generator=torch_generator,
+                        numpy_rng=numpy_rng,
+                    )
+                    .squeeze(dim=-3)
+                    .to(dtype)
                 )
-                .squeeze(dim=-3)
-                .to(dtype)
-            )
             # Denoise with a predictor-corrector sampler
             # 1. Add noise to move x_{c_tau_last} to x_{t_hat}
             gamma = float(gamma0) if c_tau > gamma_min else 0
             t_hat = c_tau_last * (gamma + 1)
 
             delta_noise_level = torch.sqrt(t_hat**2 - c_tau_last**2)
-            x_noisy = x_l + noise_scale_lambda * delta_noise_level * torch.randn(
-                size=x_l.shape,
-                device=device,
-                dtype=dtype,
-                generator=torch_generator,
+            x_noisy = (
+                x_l
+                + noise_scale_lambda
+                * delta_noise_level
+                * randn_with_generators(
+                    x_l.shape,
+                    device=device,
+                    dtype=dtype,
+                    generator=torch_generator,
+                )
             )
             # 2. Denoise from x_{t_hat} to x_{c_tau}
             # Euler step only

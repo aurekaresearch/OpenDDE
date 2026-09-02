@@ -1793,6 +1793,28 @@ class OpenDDE(nn.Module):
         # For token counts larger than the largest threshold, use smallest chunk_size
         return 32  # extreme case for very large proteins
 
+    def _resolve_pairformer_chunk_size(
+        self,
+        n_token: int,
+        chunk_size: Optional[int],
+        *,
+        dynamic_chunk_size: bool,
+    ) -> Optional[int]:
+        """Resolve the Pairformer attention chunk size for ``n_token`` tokens.
+
+        With dynamic chunking enabled (the default), the threshold table picks
+        the chunk and the N-squared score budget then bounds it so large
+        inputs cannot allocate an oversized attention temporary. An explicitly
+        configured fixed ``infer_setting.chunk_size`` with dynamic chunking
+        disabled is honoured as given.
+        """
+        if not dynamic_chunk_size:
+            return chunk_size
+        return self._bound_pairformer_chunk_size(
+            n_token,
+            self._get_dynamic_chunk_size(n_token),
+        )
+
     @staticmethod
     def _bound_pairformer_chunk_size(
         n_token: int,
@@ -1834,10 +1856,11 @@ class OpenDDE(nn.Module):
             hasattr(self.configs.infer_setting, "dynamic_chunk_size")
             and self.configs.infer_setting.dynamic_chunk_size
         )
-        if dynamic_chunk_size:
-            chunk_size = self._get_dynamic_chunk_size(N_token)
-        chunk_size = self._bound_pairformer_chunk_size(N_token, chunk_size)
-        # If dynamic chunking is disabled, chunk_size keeps its original value from the function parameter
+        chunk_size = self._resolve_pairformer_chunk_size(
+            N_token,
+            chunk_size,
+            dynamic_chunk_size=dynamic_chunk_size,
+        )
 
         log_dict = {}
         pred_dict = {}
@@ -1849,9 +1872,12 @@ class OpenDDE(nn.Module):
                 inplace_safe=inplace_safe,
                 chunk_size=chunk_size,
             )
-        if s_inputs.is_cuda:
+        foldcp_mesh = self._maybe_foldcp_mesh()
+        if foldcp_mesh is not None and s_inputs.is_cuda:
+            # Single-device inference never flushed the allocator here; keep
+            # that behaviour and only synchronize the Fold-CP cleanup.
             self._run_foldcp_local_action_synchronized(
-                self._maybe_foldcp_mesh(),
+                foldcp_mesh,
                 torch.cuda.empty_cache,
                 description="Fold-CP post-trunk allocator cleanup",
             )
@@ -1861,12 +1887,13 @@ class OpenDDE(nn.Module):
         structural_refiner_chunk_size = structural_chunk_size
         if self.enable_structural_token_expansion:
             n_structural_token = input_feature_dict["parent_residue_idx"].shape[-1]
-            if dynamic_chunk_size:
-                structural_chunk_size = self._get_dynamic_chunk_size(n_structural_token)
-            structural_refiner_chunk_size = self._bound_pairformer_chunk_size(
+            structural_refiner_chunk_size = self._resolve_pairformer_chunk_size(
                 n_structural_token,
                 structural_chunk_size,
+                dynamic_chunk_size=dynamic_chunk_size,
             )
+            if dynamic_chunk_size:
+                structural_chunk_size = structural_refiner_chunk_size
         with self._foldcp_stage_context("opendde_structural_token_expansion", N_token):
             with foldcp_triatt_canonical_batch_scope(False):
                 input_feature_dict, s_inputs, s, z = self.expand_to_structural_tokens(
@@ -2062,8 +2089,7 @@ class OpenDDE(nn.Module):
             torch.backends.cuda.matmul.allow_tf32,
         )
         with _tf32_runtime_scope(enable_tf32):
-            return OpenDDE._forward_impl(
-                self,
+            return self._forward_impl(
                 input_feature_dict=input_feature_dict,
                 label_full_dict=label_full_dict,
                 label_dict=label_dict,

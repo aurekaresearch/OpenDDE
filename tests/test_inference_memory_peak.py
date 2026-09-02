@@ -1,5 +1,6 @@
 import ast
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 
@@ -51,3 +52,41 @@ def test_opendde_class_does_not_silently_override_duplicate_methods():
     ]
 
     assert len(methods) == len(set(methods))
+
+
+class _ChunkPolicyStub:
+    """Minimal stand-in exposing the config fields chunk resolution reads."""
+
+    configs = SimpleNamespace(
+        infer_setting=SimpleNamespace(
+            chunk_size=256,
+            chunk_size_thresholds={"1024": -1, "1536": 512, "2048": 256, "2560": 128},
+        )
+    )
+
+    _get_dynamic_chunk_size = OpenDDE._get_dynamic_chunk_size
+    _bound_pairformer_chunk_size = staticmethod(OpenDDE._bound_pairformer_chunk_size)
+    _resolve_pairformer_chunk_size = OpenDDE._resolve_pairformer_chunk_size
+
+
+def test_explicit_fixed_chunk_size_is_not_overridden_by_the_bound():
+    model = _ChunkPolicyStub()
+
+    assert (
+        model._resolve_pairformer_chunk_size(2048, 256, dynamic_chunk_size=False) == 256
+    )
+    assert (
+        model._resolve_pairformer_chunk_size(3000, None, dynamic_chunk_size=False)
+        is None
+    )
+
+
+def test_dynamic_chunk_size_is_bounded_by_the_score_budget():
+    model = _ChunkPolicyStub()
+
+    # Threshold table says unchunked at N=1024; the budget bounds it to 256.
+    assert model._resolve_pairformer_chunk_size(1024, 4, dynamic_chunk_size=True) == 256
+    # Threshold table says 512 at N=1536; the budget bounds it to 128.
+    assert model._resolve_pairformer_chunk_size(1536, 4, dynamic_chunk_size=True) == 128
+    # Small inputs stay unchunked.
+    assert model._resolve_pairformer_chunk_size(200, 4, dynamic_chunk_size=True) is None

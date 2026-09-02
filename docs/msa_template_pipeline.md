@@ -44,7 +44,9 @@ opendde mt -i examples/input.json -o ./output
 opendde prep -i examples/input.json -o ./output
 ```
 
-Updated JSON files are written next to the input JSON.
+Generated JSON files are written under `<out_dir>/.opendde_preprocessed/<input-hash>/` rather than next to the
+input JSON, so read-only input directories work; the command returns and
+logs the generated path.
 
 ## Protein MSA
 

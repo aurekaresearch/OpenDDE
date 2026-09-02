@@ -737,6 +737,11 @@ class StructuralTokenExpander(nn.Module):
             role=role,
             parent=parent,
         )
+        if n_struct < 1:
+            raise ValueError(
+                "Structural pair context requires at least one structural token; "
+                f"got {n_struct}."
+            )
         retain_autograd_chunks = torch.is_grad_enabled()
         z_chunks = [] if retain_autograd_chunks else None
         attn_bias_chunks = [] if retain_autograd_chunks else None

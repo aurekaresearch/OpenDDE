@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Aureka AI Research
+import os
+import stat
 from pathlib import Path
 
 import numpy as np
@@ -137,3 +139,26 @@ def test_structure_serialization_does_not_annotate_caller_atom_array(
     assert "b_factor" not in atom_array.get_annotation_categories()
     assert written[0] is not atom_array
     np.testing.assert_array_equal(written[0].b_factor, np.array([87.65]))
+
+
+def test_dump_predictions_directory_keeps_umask_permissions(tmp_path, monkeypatch):
+    dumper = DataDumper(str(tmp_path))
+    dump_dir = tmp_path / "job" / "seed_1"
+    dump_dir.mkdir(parents=True)
+    _patch_minimal_writers(monkeypatch, dumper)
+
+    previous_umask = os.umask(0o022)
+    try:
+        dumper.dump_predictions(
+            pred_dict=_minimal_prediction(),
+            dump_dir=str(dump_dir),
+            pdb_id="job",
+            atom_array=None,
+            entity_poly_type={},
+            seed=1,
+        )
+    finally:
+        os.umask(previous_umask)
+
+    mode = stat.S_IMODE((dump_dir / "predictions").stat().st_mode)
+    assert mode == 0o755

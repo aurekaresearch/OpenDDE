@@ -778,7 +778,9 @@ def distributed_confidence_pair_logits(
             mesh,
         )
         if offload_transpose_source:
-            output_device = z_pair_local.device
+            # The reciprocal tile must come back to the compute device; keep the
+            # caller's ``output_device`` for the final logits stream.
+            transpose_output_device = z_pair_local.device
             z_pair_cpu = run_group_rank_action_synchronized(
                 z_pair_local.cpu,
                 group=mesh.group_2d,
@@ -797,7 +799,7 @@ def distributed_confidence_pair_logits(
             z_pair_t_local = _transpose_pair_tile_collective(
                 z_pair_cpu,
                 mesh,
-                output_device=output_device,
+                output_device=transpose_output_device,
             )
             updated_pair = run_group_rank_action_synchronized(
                 lambda: (

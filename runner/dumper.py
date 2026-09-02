@@ -53,6 +53,14 @@ def get_clean_full_confidence(full_confidence_dict: dict) -> dict:
     }
 
 
+def _umask_directory_mode() -> int:
+    """Return the directory mode ``os.makedirs`` would have produced."""
+
+    current_umask = os.umask(0)
+    os.umask(current_umask)
+    return 0o777 & ~current_umask
+
+
 def _remove_output_path(path: str) -> None:
     """Remove one file/symlink/tree without following a destination symlink."""
 
@@ -149,6 +157,9 @@ class DataDumper:
         os.makedirs(dump_dir, exist_ok=True)
         prediction_save_dir = os.path.join(dump_dir, "predictions")
         staging_dir = tempfile.mkdtemp(prefix=".predictions-staging-", dir=dump_dir)
+        # ``mkdtemp`` creates a private (0700) directory; the published
+        # ``predictions/`` directory must keep the caller's umask-derived mode.
+        os.chmod(staging_dir, _umask_directory_mode())
 
         try:
             # Dump structure

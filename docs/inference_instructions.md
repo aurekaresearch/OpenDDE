@@ -210,7 +210,9 @@ Notes:
   present in the JSON.
 - Template and RNA-MSA search use local databases under
   `$OPENDDE_ROOT_DIR/search_database/`.
-- Updated JSON files are written next to the input JSON.
+- Generated JSON files are written under
+  `<out_dir>/.opendde_preprocessed/<input-hash>/` rather than next to the
+  input JSON, so read-only input directories work.
 
 Details: [msa_template_pipeline.md](./msa_template_pipeline.md).
 

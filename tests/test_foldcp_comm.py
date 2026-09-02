@@ -2762,6 +2762,9 @@ def test_forward_input_preparation_failure_stops_before_model_collectives():
         N_model_seed=1,
         configs=SimpleNamespace(infer_setting=SimpleNamespace(chunk_size=4)),
     )
+    module._forward_impl = lambda **kwargs: opendde.OpenDDE._forward_impl(
+        module, **kwargs
+    )
 
     with pytest.raises(RuntimeError, match="remote input preparation OOM"):
         opendde.OpenDDE.forward(module, input_feature_dict={})
@@ -2778,7 +2781,9 @@ def test_post_trunk_cleanup_failure_stops_before_structural_collectives():
         configs=SimpleNamespace(
             infer_setting=SimpleNamespace(dynamic_chunk_size=False),
         ),
-        _bound_pairformer_chunk_size=lambda _n_token, chunk_size: chunk_size,
+        _resolve_pairformer_chunk_size=(
+            lambda _n_token, chunk_size, dynamic_chunk_size: chunk_size
+        ),
         _foldcp_stage_context=lambda *_args: nullcontext(),
         get_pairformer_output=lambda **_kwargs: (
             fake_cuda_tensor,
@@ -8979,3 +8984,60 @@ def test_detach_rank_local_error_traceback_releases_chained_error_payload():
     assert str(retained_error.__cause__) == "inner CUDA OOM"
     assert payload_reference is not None
     assert payload_reference() is None
+
+
+def test_confidence_offload_keeps_requested_pde_output_device(monkeypatch):
+    from opendde.distributed.foldcp import confidence
+
+    mesh = SimpleNamespace(group_2d=object())
+    source = torch.zeros(1, 1, 1)
+    transpose_devices = []
+    stream_devices = []
+    monkeypatch.setattr(
+        confidence,
+        "_confidence_should_offload_transpose_source",
+        lambda *args, **kwargs: True,
+    )
+    monkeypatch.setattr(
+        confidence,
+        "run_group_rank_action_synchronized",
+        lambda action, *args, **kwargs: action(),
+    )
+
+    def transpose(z_pair_cpu, _mesh, output_device=None):
+        transpose_devices.append(output_device)
+        return torch.zeros_like(z_pair_cpu)
+
+    monkeypatch.setattr(confidence, "_transpose_pair_tile_collective", transpose)
+    monkeypatch.setattr(
+        confidence, "_add_cpu_pair_source_in_place", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+
+    def stream(**kwargs):
+        stream_devices.append(kwargs["output_device"])
+        return torch.zeros(1)
+
+    monkeypatch.setattr(confidence, "_stream_pair_logits_to_rank0", stream)
+
+    # A device distinct from the CPU source so a leaked transpose device shows.
+    requested = torch.device("meta")
+    _, pde_pred = confidence.distributed_confidence_pair_logits(
+        z_pair_local=source,
+        z_pair_spec=SimpleNamespace(),
+        mesh=mesh,
+        pae_ln=SimpleNamespace(),
+        pae_linear=SimpleNamespace(),
+        pde_ln=SimpleNamespace(),
+        pde_linear=SimpleNamespace(),
+        compute_pae=False,
+        compute_pde=True,
+        gather_to_rank0_only=True,
+        output_device=requested,
+    )
+
+    assert pde_pred is not None
+    # The reciprocal tile returns to the compute device ...
+    assert transpose_devices == [source.device]
+    # ... but the final PDE logits still honour the caller's request.
+    assert stream_devices == [requested]

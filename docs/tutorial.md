@@ -120,11 +120,13 @@ For an input without MSA/template paths:
 opendde prep -i examples/example_without_msa.json -o ./output
 ```
 
-This writes an updated JSON next to the input. Predict from that updated JSON:
+This writes the updated JSON under
+`./output/.opendde_preprocessed/<input-hash>/example_without_msa-final-updated.json`
+and logs its path. Predict from that updated JSON:
 
 ```bash
 opendde pred \
-  -i examples/example_without_msa-final-updated.json \
+  -i ./output/.opendde_preprocessed/<input-hash>/example_without_msa-final-updated.json \
   -o ./output \
   -n opendde_v1 \
   --use_msa true \

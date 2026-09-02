@@ -27,8 +27,8 @@ inference_configs: dict[str, Any] = {
     "msa_pair_as_unpair": True,
     "use_template": False,
     "use_rna_msa": False,
-    # Fold-CP migration switch.  "single" keeps the original single-card path;
-    # "distributed" enables the future 2D context-parallel path.
+    # "single" keeps the original single-card path. "distributed" enables the
+    # maintained one-dimensional 1 x P context-parallel path.
     "foldcp_mode": "single",
     "foldcp_size_dp": 1,
     "foldcp_size_cp": 1,

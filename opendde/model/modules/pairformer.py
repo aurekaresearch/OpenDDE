@@ -12,6 +12,10 @@ import torch.nn.functional as F
 
 from opendde.data.constants import STD_RESIDUES_WITH_GAP
 from opendde.distributed.foldcp.config import FoldCPConfig
+from opendde.distributed.foldcp.comm import (
+    detach_rank_local_error_traceback,
+    run_group_rank_action_synchronized,
+)
 from opendde.distributed.foldcp.mesh import FoldCPProcessMesh
 from opendde.distributed.foldcp.launch import (
     foldcp_linear_with_source_launch_shape,
@@ -60,6 +64,86 @@ from opendde.utils.torch_utils import disabled_autocast
 
 
 _TEMPLATE_REPLICATED_SERIAL_MAX_PAIR_ELEMENTS = 2_100_000
+
+
+def _prepare_foldcp_pair_only_inputs(
+    z: torch.Tensor,
+    pair_mask: Optional[torch.Tensor],
+    mesh: FoldCPProcessMesh,
+) -> tuple[torch.Tensor, FoldCPPairShardSpec, Optional[torch.Tensor]]:
+    """Shard pair-only inputs before any rank can enter a CP collective."""
+
+    def _prepare():
+        z_local, z_spec = shard_pair_tensor(z, mesh, pair_dims=(-3, -2))
+        if pair_mask is None:
+            mask_local = None
+        else:
+            mask_local, _ = shard_pair_tensor(
+                pair_mask,
+                mesh,
+                pair_dims=(-2, -1),
+            )
+        return z_local, z_spec, mask_local
+
+    prepared = run_group_rank_action_synchronized(
+        _prepare,
+        group=mesh.group_2d,
+        description="Fold-CP pair-only input preparation",
+    )
+    if prepared is None:  # pragma: no cover - action runs on every rank
+        raise RuntimeError("Fold-CP pair-only inputs were not prepared.")
+    return prepared
+
+
+def _reshard_replicated_template_pair(
+    v_full: torch.Tensor,
+    z_spec: FoldCPPairShardSpec,
+    mesh: FoldCPProcessMesh,
+) -> torch.Tensor:
+    """Return a replicated template result to its 1xP ownership safely."""
+
+    def _reshard() -> torch.Tensor:
+        v_local, v_spec = shard_pair_tensor(
+            v_full,
+            mesh,
+            pair_dims=z_spec.pair_dims,
+        )
+        if v_spec.row_range != z_spec.row_range or (
+            v_spec.col_range != z_spec.col_range
+        ):
+            raise RuntimeError(
+                "replicated template Pairformer changed Fold-CP shard ownership."
+            )
+        return v_local
+
+    result = run_group_rank_action_synchronized(
+        _reshard,
+        group=mesh.group_2d,
+        description="replicated Fold-CP template pair resharding",
+    )
+    if result is None:  # pragma: no cover - action runs on every rank
+        raise RuntimeError("Replicated Fold-CP template pair was not resharded.")
+    return result
+
+
+def _prepare_replicated_template_mask_spec(
+    z_spec: FoldCPPairShardSpec,
+    mesh: FoldCPProcessMesh,
+) -> FoldCPPairShardSpec:
+    """Build the mask ownership before the next replicated-template gather."""
+
+    result = run_group_rank_action_synchronized(
+        lambda: make_pair_shard_spec(
+            tuple(z_spec.original_shape[:-1]),
+            mesh,
+            pair_dims=z_spec.pair_dims,
+        ),
+        group=mesh.group_2d,
+        description="replicated Fold-CP template mask-spec preparation",
+    )
+    if result is None:  # pragma: no cover
+        raise RuntimeError("Replicated Fold-CP template mask has no spec.")
+    return result
 
 
 def _template_replicated_serial_max_pair_elements() -> int:
@@ -167,20 +251,14 @@ class PairformerBlock(nn.Module):
         if not dist.is_available() or not dist.is_initialized():
             return None
 
-        foldcp = FoldCPConfig.from_runtime_args(
-            mode="distributed",
-            size_dp=int(os.environ.get("OPENDDE_FOLDCP_SIZE_DP", "1")),
-            size_cp=int(os.environ.get("OPENDDE_FOLDCP_SIZE_CP", "4")),
-            devices=os.environ.get("OPENDDE_FOLDCP_DEVICES", ""),
-            metrics_jsonl=os.environ.get("OPENDDE_FOLDCP_METRICS_JSONL", ""),
-        )
+        foldcp = FoldCPConfig.from_environment()
         mesh = FoldCPProcessMesh.create(foldcp)
-        z_local, z_spec = shard_pair_tensor(z, mesh, pair_dims=(-3, -2))
+        z_local, z_spec, mask_local = _prepare_foldcp_pair_only_inputs(
+            z,
+            pair_mask,
+            mesh,
+        )
         del z
-        if pair_mask is None:
-            mask_local = None
-        else:
-            mask_local, _ = shard_pair_tensor(pair_mask, mesh, pair_dims=(-2, -1))
         z_local = distributed_pairformer_block_pair_update(
             self,
             z_local,
@@ -390,13 +468,7 @@ class PairformerStack(nn.Module):
         if not dist.is_available() or not dist.is_initialized():
             return None
 
-        foldcp = FoldCPConfig.from_runtime_args(
-            mode="distributed",
-            size_dp=int(os.environ.get("OPENDDE_FOLDCP_SIZE_DP", "1")),
-            size_cp=int(os.environ.get("OPENDDE_FOLDCP_SIZE_CP", "4")),
-            devices=os.environ.get("OPENDDE_FOLDCP_DEVICES", ""),
-            metrics_jsonl=os.environ.get("OPENDDE_FOLDCP_METRICS_JSONL", ""),
-        )
+        foldcp = FoldCPConfig.from_environment()
         mesh = FoldCPProcessMesh.create(foldcp)
         if self.blocks and getattr(self.blocks[0], "c_s", 0) != 0:
             if s is None:
@@ -412,11 +484,11 @@ class PairformerStack(nn.Module):
             )
         if s is not None:
             return None
-        z_local, z_spec = shard_pair_tensor(z, mesh, pair_dims=(-3, -2))
-        if pair_mask is None:
-            mask_local = None
-        else:
-            mask_local, _ = shard_pair_tensor(pair_mask, mesh, pair_dims=(-2, -1))
+        z_local, z_spec, mask_local = _prepare_foldcp_pair_only_inputs(
+            z,
+            pair_mask,
+            mesh,
+        )
         z_local = distributed_pairformer_stack_pair_update(
             self,
             z_local,
@@ -640,12 +712,6 @@ class MSAPairWeightedAveraging(nn.Module):
         if m.ndim != 3 or z_local.ndim != 3:
             return None
 
-        m_norm = self.layernorm_m(m)
-        v = self.linear_no_bias_mv(m_norm)
-        v = v.reshape(*v.shape[:-1], self.n_heads, self.c)
-        g = torch.sigmoid(self.linear_no_bias_mg(m_norm))
-        g = g.reshape(*g.shape[:-1], self.n_heads, self.c)
-
         row_dim, col_dim = z_pair_spec.pair_dims
         n_token = z_pair_spec.original_shape[row_dim]
         row_start, row_end = z_pair_spec.row_range
@@ -655,37 +721,54 @@ class MSAPairWeightedAveraging(nn.Module):
             0, min(col_end, z_pair_spec.original_shape[col_dim]) - col_start
         )
 
-        if torch.are_deterministic_algorithms_enabled():
-            z_norm_local = foldcp_module_with_canonical_launch_chunks(
-                self.layernorm_z, z_local
-            )
-            # The serial projection sees the complete N x N source grid in one
-            # Linear call.  Reproduce that launch geometry and retain only this
-            # rank's slab; fixed-size local chunks can select another BF16 GEMM
-            # kernel once N crosses a launch boundary (for example N=1025).
-            pair_logits_local = foldcp_pair_row_slab_linear_with_source_grid_launch(
-                self.linear_no_bias_z,
-                z_norm_local,
-                original_n=n_token,
-                row_start=row_start,
-                col_start=col_start,
-                valid_rows=valid_rows,
-                valid_cols=valid_cols,
-            )
-        else:
-            z_norm_local = foldcp_module_with_source_launch_shape(
-                self.layernorm_z,
-                z_local,
-                source_rows=n_token * n_token,
-            )
-            pair_logits_local = self._linear_no_bias_z_source_launch(
-                z_norm_local,
-                original_n=n_token,
-                row_start=row_start,
-                col_start=col_start,
-                valid_rows=valid_rows,
-                valid_cols=valid_cols,
-            )
+        def _prepare_weighted_average_inputs():
+            m_norm = self.layernorm_m(m)
+            local_v = self.linear_no_bias_mv(m_norm)
+            local_v = local_v.reshape(*local_v.shape[:-1], self.n_heads, self.c)
+            local_g = torch.sigmoid(self.linear_no_bias_mg(m_norm))
+            local_g = local_g.reshape(*local_g.shape[:-1], self.n_heads, self.c)
+
+            if torch.are_deterministic_algorithms_enabled():
+                z_norm_local = foldcp_module_with_canonical_launch_chunks(
+                    self.layernorm_z, z_local
+                )
+                # The serial projection sees the complete N x N source grid in one
+                # Linear call.  Reproduce that launch geometry and retain only this
+                # rank's slab; fixed-size local chunks can select another BF16 GEMM
+                # kernel once N crosses a launch boundary (for example N=1025).
+                local_logits = foldcp_pair_row_slab_linear_with_source_grid_launch(
+                    self.linear_no_bias_z,
+                    z_norm_local,
+                    original_n=n_token,
+                    row_start=row_start,
+                    col_start=col_start,
+                    valid_rows=valid_rows,
+                    valid_cols=valid_cols,
+                )
+            else:
+                z_norm_local = foldcp_module_with_source_launch_shape(
+                    self.layernorm_z,
+                    z_local,
+                    source_rows=n_token * n_token,
+                )
+                local_logits = self._linear_no_bias_z_source_launch(
+                    z_norm_local,
+                    original_n=n_token,
+                    row_start=row_start,
+                    col_start=col_start,
+                    valid_rows=valid_rows,
+                    valid_cols=valid_cols,
+                )
+            return local_v, local_g, local_logits
+
+        prepared = run_group_rank_action_synchronized(
+            _prepare_weighted_average_inputs,
+            group=mesh.group_2d,
+            description="Fold-CP MSA weighted-average input projection",
+        )
+        if prepared is None:  # pragma: no cover
+            raise RuntimeError("Fold-CP MSA projections returned no tensors.")
+        v, g, pair_logits_local = prepared
         local_wv = distributed_msa_pair_weighted_average_with_full_value(
             pair_logits_local.unsqueeze(0),
             v.unsqueeze(0),
@@ -698,9 +781,20 @@ class MSAPairWeightedAveraging(nn.Module):
             token_dim=2,
             original_tokens=n_token,
         ).squeeze(0)
-        o = g * wv
-        o = o.reshape(*o.shape[:-2], self.n_heads * self.c)
-        return self.linear_no_bias_out(o)
+
+        def _project_weighted_average_output():
+            local_o = g * wv
+            local_o = local_o.reshape(*local_o.shape[:-2], self.n_heads * self.c)
+            return self.linear_no_bias_out(local_o)
+
+        result = run_group_rank_action_synchronized(
+            _project_weighted_average_output,
+            group=mesh.group_2d,
+            description="Fold-CP MSA weighted-average output projection",
+        )
+        if result is None:  # pragma: no cover
+            raise RuntimeError("Fold-CP MSA output projection returned no tensor.")
+        return result
 
     def forward(
         self,
@@ -842,8 +936,20 @@ class MSAStack(nn.Module):
                     raise ValueError(
                         "Fold-CP MSAStack currently expects m=[S,N,C] and z_local=[T,T,C]."
                     )
-            m[start:end, :, :] += msa_update
-            m[start:end, :, :] += self.transition_m(m[start:end, :, :])
+            if foldcp_mesh is None:
+                m[start:end, :, :] += msa_update
+                m[start:end, :, :] += self.transition_m(m[start:end, :, :])
+            else:
+
+                def _apply_msa_chunk_update() -> None:
+                    m[start:end, :, :] += msa_update
+                    m[start:end, :, :] += self.transition_m(m[start:end, :, :])
+
+                run_group_rank_action_synchronized(
+                    _apply_msa_chunk_update,
+                    group=foldcp_mesh.group_2d,
+                    description="Fold-CP MSA chunk update",
+                )
         return m
 
 
@@ -971,17 +1077,80 @@ class MSABlock(nn.Module):
         mesh: FoldCPProcessMesh,
     ) -> torch.Tensor:
         ring = mesh.ring_comm()
-        mask_ready = ring.comm_2d_trans.exchange(mask_local)
-        mask_ready = ring.comm_row_init.exchange(mask_ready)
-        mask_b_ready = ring.comm_col_init.exchange(mask_local)
         batch, _, n_local = mask_local.shape
-        norm = mask_local.new_zeros((batch, n_local, n_local))
-        for step in range(ring.layout.shape[1]):
-            norm = norm + torch.einsum("bsi,bsj->bij", mask_ready, mask_b_ready)
-            if step < ring.layout.shape[1] - 1:
-                mask_ready = ring.comm_row.exchange(mask_ready)
-                mask_b_ready = ring.comm_col.exchange(mask_b_ready)
-        return norm
+        side = int(ring.layout.shape[1])
+        recv_count = min(2, max(0, side - 1))
+
+        def _allocate_norm_ring():
+            source = mask_local.contiguous()
+            return (
+                source,
+                source.new_zeros((batch, n_local, n_local)),
+                torch.empty_like(source),
+                torch.empty_like(source),
+                torch.empty_like(source),
+                tuple(torch.empty_like(source) for _ in range(recv_count)),
+                tuple(torch.empty_like(source) for _ in range(recv_count)),
+            )
+
+        buffers = run_group_rank_action_synchronized(
+            _allocate_norm_ring,
+            group=mesh.group_2d,
+            description="OPM normalization ring allocation",
+        )
+        if buffers is None:  # pragma: no cover
+            raise RuntimeError("OPM normalization ring returned no buffers.")
+        (
+            mask_source,
+            norm,
+            transpose_recv,
+            row_init_recv,
+            col_init_recv,
+            row_recv_buffers,
+            col_recv_buffers,
+        ) = buffers
+        mask_ready = ring.comm_2d_trans.exchange(
+            mask_source,
+            to_recv=transpose_recv,
+        )
+        mask_ready = ring.comm_row_init.exchange(
+            mask_ready,
+            to_recv=row_init_recv,
+        )
+        mask_b_ready = ring.comm_col_init.exchange(
+            mask_source,
+            to_recv=col_init_recv,
+        )
+        compute_error: Exception | None = None
+        for step in range(side):
+            if compute_error is None:
+                try:
+                    norm.add_(torch.einsum("bsi,bsj->bij", mask_ready, mask_b_ready))
+                except Exception as exc:
+                    compute_error = detach_rank_local_error_traceback(exc)
+            if step + 1 < side:
+                mask_ready = ring.comm_row.exchange(
+                    mask_ready,
+                    to_recv=row_recv_buffers[step % recv_count],
+                )
+                mask_b_ready = ring.comm_col.exchange(
+                    mask_b_ready,
+                    to_recv=col_recv_buffers[step % recv_count],
+                )
+
+        def _finish_norm_ring() -> torch.Tensor:
+            if compute_error is not None:
+                raise compute_error
+            return norm
+
+        result = run_group_rank_action_synchronized(
+            _finish_norm_ring,
+            group=mesh.group_2d,
+            description="OPM normalization ring computation",
+        )
+        if result is None:  # pragma: no cover
+            raise RuntimeError("OPM normalization ring returned no result.")
+        return result
 
     def _foldcp_add_opm_to_local_pair_no_grad(
         self,
@@ -993,21 +1162,74 @@ class MSABlock(nn.Module):
     ) -> torch.Tensor:
         opm = self.outer_product_mean_msa
         ring = mesh.ring_comm()
-        mask_local = mask_local.to(dtype=a_local.dtype)
-        a_local = a_local * mask_local.unsqueeze(-1)
-        b_local = b_local * mask_local.unsqueeze(-1)
+
+        def _prepare_masked_inputs():
+            prepared_mask = mask_local.to(dtype=a_local.dtype)
+            return (
+                prepared_mask,
+                a_local * prepared_mask.unsqueeze(-1),
+                b_local * prepared_mask.unsqueeze(-1),
+            )
+
+        prepared_inputs = run_group_rank_action_synchronized(
+            _prepare_masked_inputs,
+            group=mesh.group_2d,
+            description="OPM masked-input preparation",
+        )
+        if prepared_inputs is None:  # pragma: no cover
+            raise RuntimeError("OPM masked-input preparation returned no inputs.")
+        mask_local, a_local, b_local = prepared_inputs
 
         norm = self._foldcp_opm_norm(mask_local, mesh)
-        denom = norm[..., None] + opm.eps
+        side = int(ring.layout.shape[1])
+        recv_count = min(2, max(0, side - 1))
         squeeze_pair_batch = z_local.ndim == 3
-        if squeeze_pair_batch:
-            z_local = z_local.unsqueeze(0)
-        z_local = z_local.to(dtype=a_local.dtype)
-        z_local *= denom
 
-        a_ready = ring.comm_2d_trans.exchange(a_local)
-        a_ready = ring.comm_row_init.exchange(a_ready)
-        b_ready = ring.comm_col_init.exchange(b_local)
+        def _allocate_opm_ring():
+            denom = norm[..., None] + opm.eps
+            z_work = z_local.unsqueeze(0) if squeeze_pair_batch else z_local
+            z_work = z_work.to(dtype=a_local.dtype)
+            z_work *= denom
+            a_source = a_local.contiguous()
+            b_source = b_local.contiguous()
+            return (
+                denom,
+                z_work,
+                a_source,
+                b_source,
+                torch.empty_like(a_source),
+                torch.empty_like(a_source),
+                torch.empty_like(b_source),
+                tuple(torch.empty_like(a_source) for _ in range(recv_count)),
+                tuple(torch.empty_like(b_source) for _ in range(recv_count)),
+            )
+
+        buffers = run_group_rank_action_synchronized(
+            _allocate_opm_ring,
+            group=mesh.group_2d,
+            description="OPM update ring allocation",
+        )
+        if buffers is None:  # pragma: no cover
+            raise RuntimeError("OPM update ring returned no buffers.")
+        (
+            denom,
+            z_local,
+            a_source,
+            b_source,
+            a_transpose_recv,
+            a_init_recv,
+            b_init_recv,
+            a_recv_buffers,
+            b_recv_buffers,
+        ) = buffers
+        prepared_inputs = mask_local = norm = None
+
+        a_ready = ring.comm_2d_trans.exchange(
+            a_source,
+            to_recv=a_transpose_recv,
+        )
+        a_ready = ring.comm_row_init.exchange(a_ready, to_recv=a_init_recv)
+        b_ready = ring.comm_col_init.exchange(b_source, to_recv=b_init_recv)
 
         _, _, _, c_hidden = a_local.shape
         channel_chunk = int(os.environ.get("OPENDDE_FOLDCP_OPM_CHANNEL_CHUNK", "4"))
@@ -1015,42 +1237,69 @@ class MSABlock(nn.Module):
             channel_chunk = c_hidden
 
         weight = opm.linear_out.weight
-        for step in range(ring.layout.shape[1]):
-            for channel_start in range(0, c_hidden, channel_chunk):
-                channel_end = min(channel_start + channel_chunk, c_hidden)
-                outer_chunk = torch.einsum(
-                    "bsic,bsjd->bijcd",
-                    a_ready[..., channel_start:channel_end],
-                    b_ready,
+        compute_error: Exception | None = None
+        for step in range(side):
+            if compute_error is None:
+                try:
+                    for channel_start in range(0, c_hidden, channel_chunk):
+                        outer_chunk = weight_slice = None
+                        try:
+                            channel_end = min(channel_start + channel_chunk, c_hidden)
+                            outer_chunk = torch.einsum(
+                                "bsic,bsjd->bijcd",
+                                a_ready[..., channel_start:channel_end],
+                                b_ready,
+                            )
+                            outer_chunk = outer_chunk.reshape(
+                                outer_chunk.shape[:-2] + (-1,)
+                            )
+                            weight_slice = weight[
+                                :,
+                                channel_start * c_hidden : channel_end * c_hidden,
+                            ]
+                            if outer_chunk.dtype is torch.bfloat16:
+                                with disabled_autocast():
+                                    z_local += F.linear(
+                                        outer_chunk,
+                                        weight_slice.to(dtype=outer_chunk.dtype),
+                                        None,
+                                    )
+                            else:
+                                z_local += F.linear(
+                                    outer_chunk,
+                                    weight_slice.to(dtype=outer_chunk.dtype),
+                                    None,
+                                )
+                        finally:
+                            del outer_chunk, weight_slice
+                except Exception as exc:
+                    compute_error = detach_rank_local_error_traceback(exc)
+            if step + 1 < side:
+                a_ready = ring.comm_row.exchange(
+                    a_ready,
+                    to_recv=a_recv_buffers[step % recv_count],
                 )
-                outer_chunk = outer_chunk.reshape(outer_chunk.shape[:-2] + (-1,))
-                weight_slice = weight[
-                    :,
-                    channel_start * c_hidden : channel_end * c_hidden,
-                ]
-                if outer_chunk.dtype is torch.bfloat16:
-                    with disabled_autocast():
-                        z_local += F.linear(
-                            outer_chunk,
-                            weight_slice.to(dtype=outer_chunk.dtype),
-                            None,
-                        )
-                else:
-                    z_local += F.linear(
-                        outer_chunk,
-                        weight_slice.to(dtype=outer_chunk.dtype),
-                        None,
-                    )
-            if step < ring.layout.shape[1] - 1:
-                a_ready = ring.comm_row.exchange(a_ready)
-                b_ready = ring.comm_col.exchange(b_ready)
+                b_ready = ring.comm_col.exchange(
+                    b_ready,
+                    to_recv=b_recv_buffers[step % recv_count],
+                )
 
-        if opm.linear_out.bias is not None:
-            z_local += opm.linear_out.bias.to(dtype=z_local.dtype)
-        z_local /= denom
-        if squeeze_pair_batch:
-            z_local = z_local.squeeze(0)
-        return z_local
+        def _finish_opm_ring() -> torch.Tensor:
+            if compute_error is not None:
+                raise compute_error
+            if opm.linear_out.bias is not None:
+                z_local.add_(opm.linear_out.bias.to(dtype=z_local.dtype))
+            z_local.div_(denom)
+            return z_local.squeeze(0) if squeeze_pair_batch else z_local
+
+        result = run_group_rank_action_synchronized(
+            _finish_opm_ring,
+            group=mesh.group_2d,
+            description="OPM update ring computation",
+        )
+        if result is None:  # pragma: no cover
+            raise RuntimeError("OPM update ring returned no result.")
+        return result
 
     def _maybe_foldcp_mesh(self) -> Optional[FoldCPProcessMesh]:
         if os.environ.get("OPENDDE_FOLDCP_MODE", "single") != "distributed":
@@ -1058,13 +1307,7 @@ class MSABlock(nn.Module):
         if not dist.is_available() or not dist.is_initialized():
             return None
 
-        foldcp = FoldCPConfig.from_runtime_args(
-            mode="distributed",
-            size_dp=int(os.environ.get("OPENDDE_FOLDCP_SIZE_DP", "1")),
-            size_cp=int(os.environ.get("OPENDDE_FOLDCP_SIZE_CP", "4")),
-            devices=os.environ.get("OPENDDE_FOLDCP_DEVICES", ""),
-            metrics_jsonl=os.environ.get("OPENDDE_FOLDCP_METRICS_JSONL", ""),
-        )
+        foldcp = FoldCPConfig.from_environment()
         return FoldCPProcessMesh.create(foldcp)
 
     def _outer_product_mean_tile_update(
@@ -1139,8 +1382,10 @@ class MSABlock(nn.Module):
         chunk_size: Optional[int] = None,
     ) -> torch.Tensor:
         if mesh.layout.shape[0] == 1 and mesh.layout.shape[1] > 1:
-            # The deterministic serial path defines OPM numerics with a 2 x 2
-            # canonical grid.  A direct 1 x P einsum changes the bf16 CUDA
+            # The deterministic serial path defines OPM numerics with a fixed
+            # four-block arithmetic schedule.  This is not a communication
+            # topology: runtime ownership and communication remain 1 x P for
+            # every P.  A direct 1 x P einsum changes the bf16 CUDA
             # reduction shape (most visibly at P=8), even though ownership is
             # mathematically equivalent.  Evaluate only canonical blocks that
             # intersect this rank's 1-D column slab, then copy their overlap
@@ -1204,7 +1449,11 @@ class MSABlock(nn.Module):
         m: torch.Tensor,
         chunk_size: Optional[int] = None,
     ) -> torch.Tensor:
-        """Assemble the full OPM update using the canonical CP4 2x2 tiling."""
+        """Assemble the full OPM update with the fixed parity block schedule.
+
+        The block schedule preserves the established floating-point reduction
+        order; it does not create or depend on a multi-row process topology.
+        """
 
         grid_shape = (2, 2)
         n_token = m.shape[-2]
@@ -1289,33 +1538,59 @@ class MSABlock(nn.Module):
         use_inplace_denom = not torch.are_deterministic_algorithms_enabled()
         one_dimensional_cp = mesh.layout.shape[0] == 1
         if torch.is_grad_enabled() or not use_inplace_denom or one_dimensional_cp:
-            local_update = self._foldcp_outer_product_mean_local_update(
-                m,
-                mesh,
-                chunk_size=chunk_size,
+
+            def _compute_and_add_local_opm() -> torch.Tensor:
+                local_update = self._foldcp_outer_product_mean_local_update(
+                    m,
+                    mesh,
+                    chunk_size=chunk_size,
+                )
+                return z_local + local_update
+
+            updated_z = run_group_rank_action_synchronized(
+                _compute_and_add_local_opm,
+                group=mesh.group_2d,
+                description="Fold-CP local OPM computation",
             )
-            z_local = z_local + local_update
+            if updated_z is None:  # pragma: no cover
+                raise RuntimeError("Fold-CP local OPM returned no pair update.")
+            z_local = updated_z
         else:
-            leading_shape = m.shape[:-3]
-            m_work = m.float() if is_fp16_enabled() else m
-            m_flat = m_work.reshape((-1,) + m_work.shape[-3:])
-            mask_flat = m_flat.new_ones(m_flat.shape[:-1])
-            m_local, _ = shard_msa_tensor_for_opm(
-                m_flat,
-                mesh,
-                seq_dim=1,
-                token_dim=2,
+
+            def _prepare_2d_opm_inputs():
+                leading_shape = m.shape[:-3]
+                m_work = m.float() if is_fp16_enabled() else m
+                m_flat = m_work.reshape((-1,) + m_work.shape[-3:])
+                mask_flat = m_flat.new_ones(m_flat.shape[:-1])
+                m_local, _ = shard_msa_tensor_for_opm(
+                    m_flat,
+                    mesh,
+                    seq_dim=1,
+                    token_dim=2,
+                )
+                mask_local_opm, _ = shard_msa_tensor_for_opm(
+                    mask_flat,
+                    mesh,
+                    seq_dim=1,
+                    token_dim=2,
+                )
+                opm = self.outer_product_mean_msa
+                local_ln = opm.layer_norm(m_local)
+                return (
+                    leading_shape,
+                    opm.linear_1(local_ln),
+                    opm.linear_2(local_ln),
+                    mask_local_opm,
+                )
+
+            prepared = run_group_rank_action_synchronized(
+                _prepare_2d_opm_inputs,
+                group=mesh.group_2d,
+                description="2D Fold-CP OPM input projection",
             )
-            mask_local_opm, _ = shard_msa_tensor_for_opm(
-                mask_flat,
-                mesh,
-                seq_dim=1,
-                token_dim=2,
-            )
-            opm = self.outer_product_mean_msa
-            local_ln = opm.layer_norm(m_local)
-            a_local = opm.linear_1(local_ln)
-            b_local = opm.linear_2(local_ln)
+            if prepared is None:  # pragma: no cover
+                raise RuntimeError("2D Fold-CP OPM inputs were not prepared.")
+            leading_shape, a_local, b_local, mask_local_opm = prepared
             z_local = self._foldcp_add_opm_to_local_pair_no_grad(
                 a_local,
                 b_local,
@@ -1324,7 +1599,14 @@ class MSABlock(nn.Module):
                 mesh,
             )
             if leading_shape:
-                z_local = z_local.reshape(leading_shape + z_local.shape[-3:])
+                reshaped = run_group_rank_action_synchronized(
+                    lambda: z_local.reshape(leading_shape + z_local.shape[-3:]),
+                    group=mesh.group_2d,
+                    description="2D Fold-CP OPM output reshape",
+                )
+                if reshaped is None:  # pragma: no cover
+                    raise RuntimeError("2D Fold-CP OPM reshape returned no tensor.")
+                z_local = reshaped
         z_local = distributed_pairformer_block_pair_update(
             self.pair_stack,
             z_local,
@@ -1402,11 +1684,10 @@ class MSABlock(nn.Module):
             m = self.msa_stack(m, z)
             foldcp_z = None
         else:
-            z_local, z_spec = shard_pair_tensor(z, mesh, pair_dims=(-3, -2))
-            mask_local = (
-                None
-                if pair_mask is None
-                else shard_pair_tensor(pair_mask, mesh, pair_dims=(-2, -1))[0]
+            z_local, z_spec, mask_local = _prepare_foldcp_pair_only_inputs(
+                z,
+                pair_mask,
+                mesh,
             )
             m, z_local = self.forward_foldcp_local(
                 m=m,
@@ -1570,13 +1851,7 @@ class MSAModule(nn.Module):
         if torch.is_grad_enabled():
             return None
 
-        foldcp = FoldCPConfig.from_runtime_args(
-            mode="distributed",
-            size_dp=int(os.environ.get("OPENDDE_FOLDCP_SIZE_DP", "1")),
-            size_cp=int(os.environ.get("OPENDDE_FOLDCP_SIZE_CP", "4")),
-            devices=os.environ.get("OPENDDE_FOLDCP_DEVICES", ""),
-            metrics_jsonl=os.environ.get("OPENDDE_FOLDCP_METRICS_JSONL", ""),
-        )
+        foldcp = FoldCPConfig.from_environment()
         return FoldCPProcessMesh.create(foldcp)
 
     def _maybe_forward_foldcp_blocks(
@@ -1594,16 +1869,28 @@ class MSAModule(nn.Module):
         if mesh is None:
             return None
 
-        if z_is_local:
-            if z_spec is None:
-                raise ValueError("z_spec is required when z_is_local=True.")
-            z_local = z.contiguous()
-        else:
-            z_local, z_spec = shard_pair_tensor(z, mesh, pair_dims=(-3, -2))
-        if pair_mask is None:
-            mask_local = None
-        else:
-            mask_local, _ = shard_pair_tensor(pair_mask, mesh, pair_dims=(-2, -1))
+        def _prepare_foldcp_msa_inputs():
+            if z_is_local:
+                if z_spec is None:
+                    raise ValueError("z_spec is required when z_is_local=True.")
+                local_z = z.contiguous()
+                local_spec = z_spec
+            else:
+                local_z, local_spec = shard_pair_tensor(z, mesh, pair_dims=(-3, -2))
+            if pair_mask is None:
+                local_mask = None
+            else:
+                local_mask, _ = shard_pair_tensor(pair_mask, mesh, pair_dims=(-2, -1))
+            return local_z, local_spec, local_mask
+
+        prepared = run_group_rank_action_synchronized(
+            _prepare_foldcp_msa_inputs,
+            group=mesh.group_2d,
+            description="Fold-CP MSA block input preparation",
+        )
+        if prepared is None:  # pragma: no cover
+            raise RuntimeError("Fold-CP MSA block inputs were not prepared.")
+        z_local, z_spec, mask_local = prepared
 
         m: Optional[torch.Tensor] = msa_sample
         for block in self.blocks:
@@ -1618,7 +1905,14 @@ class MSAModule(nn.Module):
                 chunk_size=chunk_size,
             )
         if return_local_pair:
-            return z_local.contiguous(), z_spec
+            finalized = run_group_rank_action_synchronized(
+                lambda: (z_local.contiguous(), z_spec),
+                group=mesh.group_2d,
+                description="Fold-CP MSA local pair finalization",
+            )
+            if finalized is None:  # pragma: no cover
+                raise RuntimeError("Fold-CP MSA local pair was not finalized.")
+            return finalized
         return gather_pair_tensor(z_local, z_spec, mesh.group_2d)
 
     def _prepare_msa_sample(
@@ -1679,13 +1973,24 @@ class MSAModule(nn.Module):
         inplace_safe: bool = False,
         chunk_size: Optional[int] = None,
     ) -> tuple[torch.Tensor, FoldCPPairShardSpec]:
-        msa_sample = self._prepare_msa_sample(
-            input_feature_dict=input_feature_dict,
-            s_inputs=s_inputs,
-            z_token_dim=z_spec.original_shape[z_spec.pair_dims[0]],
+        msa_sample = run_group_rank_action_synchronized(
+            lambda: self._prepare_msa_sample(
+                input_feature_dict=input_feature_dict,
+                s_inputs=s_inputs,
+                z_token_dim=z_spec.original_shape[z_spec.pair_dims[0]],
+            ),
+            group=mesh.group_2d,
+            description="Fold-CP MSA sample preparation",
         )
         if msa_sample is None:
-            return z_local.contiguous(), z_spec
+            finalized = run_group_rank_action_synchronized(
+                lambda: (z_local.contiguous(), z_spec),
+                group=mesh.group_2d,
+                description="Fold-CP empty MSA local pair finalization",
+            )
+            if finalized is None:  # pragma: no cover
+                raise RuntimeError("Fold-CP empty MSA pair was not finalized.")
+            return finalized
         result = self._maybe_forward_foldcp_blocks(
             msa_sample=msa_sample,
             z=z_local,
@@ -2063,24 +2368,38 @@ class TemplateEmbedder(nn.Module):
             return None, z_spec
 
         num_templates = input_feature_dict["template_aatype"].shape[0]
-        pair_mask_local = (
-            self._local_valid_pair_mask(z_spec=z_spec, reference=z_local)
-            if pair_mask is None
-            else shard_pair_tensor(pair_mask, mesh, pair_dims=(-2, -1))[0]
-        )
-        multichain_mask_local = self._local_pair_mask_from_asym_id(
-            asym_id=input_feature_dict["asym_id"],
-            z_spec=z_spec,
-            reference=z_local,
-        )
 
-        if torch.are_deterministic_algorithms_enabled():
-            z_norm_local = foldcp_module_with_canonical_launch_chunks(
-                self.layernorm_z, z_local
+        def _initialize_template_state():
+            local_pair_mask = (
+                self._local_valid_pair_mask(z_spec=z_spec, reference=z_local)
+                if pair_mask is None
+                else shard_pair_tensor(pair_mask, mesh, pair_dims=(-2, -1))[0]
             )
-        else:
-            z_norm_local = self.layernorm_z(z_local)
-        u_local = z_local.new_zeros(*z_spec.local_shape[:-1], self.c)
+            local_multichain_mask = self._local_pair_mask_from_asym_id(
+                asym_id=input_feature_dict["asym_id"],
+                z_spec=z_spec,
+                reference=z_local,
+            )
+            if torch.are_deterministic_algorithms_enabled():
+                local_z_norm = foldcp_module_with_canonical_launch_chunks(
+                    self.layernorm_z, z_local
+                )
+            else:
+                local_z_norm = self.layernorm_z(z_local)
+            local_u = z_local.new_zeros(*z_spec.local_shape[:-1], self.c)
+            return local_pair_mask, local_multichain_mask, local_z_norm, local_u
+
+        initialized = run_group_rank_action_synchronized(
+            _initialize_template_state,
+            group=mesh.group_2d,
+            description="Fold-CP template initialization",
+        )
+        if initialized is None:  # pragma: no cover
+            raise RuntimeError("Fold-CP template initialization returned no state.")
+        pair_mask_local, multichain_mask_local, z_norm_local, u_local = initialized
+        # The tuple would otherwise keep the initial zero accumulator alive
+        # after the first template replaces `u_local`.
+        del initialized
         for template_id in range(num_templates):
             v_local = self.single_template_forward_foldcp_local(
                 template_id=template_id,
@@ -2095,19 +2414,39 @@ class TemplateEmbedder(nn.Module):
                 triangle_multiplicative=triangle_multiplicative,
                 inplace_safe=inplace_safe,
             )
-            u_local = u_local + v_local
-        u_local = u_local / (1e-7 + num_templates)
-        u_local = self.relu(u_local)
-        if torch.are_deterministic_algorithms_enabled():
-            u_local = self._linear_no_bias_source_stride_tile(
-                self.linear_no_bias_u,
-                u_local,
-                z_spec,
-                exact_source_grid=True,
+            accumulated = run_group_rank_action_synchronized(
+                lambda u_local=u_local, v_local=v_local: u_local + v_local,
+                group=mesh.group_2d,
+                description="Fold-CP template accumulation",
             )
-        else:
-            u_local = self.linear_no_bias_u(u_local)
-        return u_local.contiguous(), z_spec
+            if accumulated is None:  # pragma: no cover
+                raise RuntimeError("Fold-CP template accumulation returned no tensor.")
+            u_local = accumulated
+            # Do not overlap a completed template pair result with the next
+            # template's full local pair output.
+            del accumulated, v_local
+
+        def _finalize_template_output():
+            local_u = self.relu(u_local / (1e-7 + num_templates))
+            if torch.are_deterministic_algorithms_enabled():
+                local_u = self._linear_no_bias_source_stride_tile(
+                    self.linear_no_bias_u,
+                    local_u,
+                    z_spec,
+                    exact_source_grid=True,
+                )
+            else:
+                local_u = self.linear_no_bias_u(local_u)
+            return local_u.contiguous()
+
+        finalized = run_group_rank_action_synchronized(
+            _finalize_template_output,
+            group=mesh.group_2d,
+            description="Fold-CP template output projection",
+        )
+        if finalized is None:  # pragma: no cover
+            raise RuntimeError("Fold-CP template output projection returned no tensor.")
+        return finalized, z_spec
 
     def single_template_forward_foldcp_local(
         self,
@@ -2123,67 +2462,78 @@ class TemplateEmbedder(nn.Module):
         triangle_multiplicative: str = "torch",
         inplace_safe: bool = False,
     ) -> torch.Tensor:
-        dgram = self._shard_template_pair_feature(
-            input_feature_dict["template_distogram"][template_id],
-            mesh,
-        )
-        pseudo_beta_mask_2d = self._shard_template_pair_feature(
-            input_feature_dict["template_pseudo_beta_mask"][template_id],
-            mesh,
-        )
-        dgram = dgram * multichain_mask_local[..., None] * pair_mask_local[..., None]
-        pseudo_beta_mask_2d = (
-            pseudo_beta_mask_2d * multichain_mask_local * pair_mask_local
-        )
-
-        aatype_col, aatype_row = self._local_restype_pair_features(
-            input_feature_dict["template_aatype"][template_id],
-            z_spec=z_spec,
-            reference=z_local,
-        )
-
-        unit_vector = self._shard_template_pair_feature(
-            input_feature_dict["template_unit_vector"][template_id],
-            mesh,
-        )
-        unit_vector = (
-            unit_vector * multichain_mask_local[..., None] * pair_mask_local[..., None]
-        )
-
-        backbone_mask_2d = self._shard_template_pair_feature(
-            input_feature_dict["template_backbone_frame_mask"][template_id],
-            mesh,
-        )
-        backbone_mask_2d = backbone_mask_2d * multichain_mask_local * pair_mask_local
-
-        at = torch.concat(
-            [
-                dgram,
-                pseudo_beta_mask_2d.unsqueeze(-1),
-                aatype_col,
-                aatype_row,
-                unit_vector,
-                backbone_mask_2d.unsqueeze(-1),
-            ],
-            dim=-1,
-        )
-        if torch.are_deterministic_algorithms_enabled():
-            v_local = self._linear_no_bias_source_stride_tile(
-                self.linear_no_bias_z,
-                z_local,
-                z_spec,
-                exact_source_grid=True,
-            ) + self._linear_no_bias_source_stride_tile(
-                self.linear_no_bias_a,
-                at,
-                z_spec,
-                exact_source_grid=True,
+        def _prepare_template_pair():
+            dgram = self._shard_template_pair_feature(
+                input_feature_dict["template_distogram"][template_id],
+                mesh,
             )
-        else:
-            v_local = self._linear_no_bias_z_source_stride_tile(
+            pseudo_beta_mask_2d = self._shard_template_pair_feature(
+                input_feature_dict["template_pseudo_beta_mask"][template_id],
+                mesh,
+            )
+            dgram = (
+                dgram * multichain_mask_local[..., None] * pair_mask_local[..., None]
+            )
+            pseudo_beta_mask_2d = (
+                pseudo_beta_mask_2d * multichain_mask_local * pair_mask_local
+            )
+
+            aatype_col, aatype_row = self._local_restype_pair_features(
+                input_feature_dict["template_aatype"][template_id],
+                z_spec=z_spec,
+                reference=z_local,
+            )
+            unit_vector = self._shard_template_pair_feature(
+                input_feature_dict["template_unit_vector"][template_id],
+                mesh,
+            )
+            unit_vector = (
+                unit_vector
+                * multichain_mask_local[..., None]
+                * pair_mask_local[..., None]
+            )
+            backbone_mask_2d = self._shard_template_pair_feature(
+                input_feature_dict["template_backbone_frame_mask"][template_id],
+                mesh,
+            )
+            backbone_mask_2d = (
+                backbone_mask_2d * multichain_mask_local * pair_mask_local
+            )
+            at = torch.concat(
+                [
+                    dgram,
+                    pseudo_beta_mask_2d.unsqueeze(-1),
+                    aatype_col,
+                    aatype_row,
+                    unit_vector,
+                    backbone_mask_2d.unsqueeze(-1),
+                ],
+                dim=-1,
+            )
+            if torch.are_deterministic_algorithms_enabled():
+                return self._linear_no_bias_source_stride_tile(
+                    self.linear_no_bias_z,
+                    z_local,
+                    z_spec,
+                    exact_source_grid=True,
+                ) + self._linear_no_bias_source_stride_tile(
+                    self.linear_no_bias_a,
+                    at,
+                    z_spec,
+                    exact_source_grid=True,
+                )
+            return self._linear_no_bias_z_source_stride_tile(
                 z_local,
                 z_spec,
             ) + self._linear_no_bias_a_source_stride_tile(at, z_spec)
+
+        v_local = run_group_rank_action_synchronized(
+            _prepare_template_pair,
+            group=mesh.group_2d,
+            description="Fold-CP template pair preparation",
+        )
+        if v_local is None:  # pragma: no cover
+            raise RuntimeError("Fold-CP template pair preparation returned no tensor.")
         use_replicated_serial = (
             z_local.dtype == torch.bfloat16
             and not torch.is_grad_enabled()
@@ -2192,36 +2542,34 @@ class TemplateEmbedder(nn.Module):
         )
         if use_replicated_serial:
             v_full = gather_pair_tensor_like(v_local, z_spec, mesh.group_2d)
-            mask_spec = make_pair_shard_spec(
-                tuple(z_spec.original_shape[:-1]),
-                mesh,
-                pair_dims=z_spec.pair_dims,
-            )
+            mask_spec = _prepare_replicated_template_mask_spec(z_spec, mesh)
             pair_mask_full = gather_pair_tensor(
                 pair_mask_local,
                 mask_spec,
                 mesh.group_2d,
             )
-            _, v_full = self.pairformer_stack.forward_source(
-                s=None,
-                z=v_full,
-                pair_mask=pair_mask_full,
-                triangle_multiplicative=triangle_multiplicative,
-                triangle_attention=triangle_attention,
-                inplace_safe=inplace_safe,
-                chunk_size=chunk_size,
+            replicated_result = run_group_rank_action_synchronized(
+                lambda: self.pairformer_stack.forward_source(
+                    s=None,
+                    z=v_full,
+                    pair_mask=pair_mask_full,
+                    triangle_multiplicative=triangle_multiplicative,
+                    triangle_attention=triangle_attention,
+                    inplace_safe=inplace_safe,
+                    chunk_size=chunk_size,
+                )[1],
+                group=mesh.group_2d,
+                description="replicated Fold-CP template Pairformer",
             )
-            v_local, v_spec = shard_pair_tensor(
+            if replicated_result is None:  # pragma: no cover
+                raise RuntimeError("Replicated Fold-CP template returned no tensor.")
+            v_full = replicated_result
+            v_local = _reshard_replicated_template_pair(
                 v_full,
+                z_spec,
                 mesh,
-                pair_dims=z_spec.pair_dims,
             )
-            if v_spec.row_range != z_spec.row_range or (
-                v_spec.col_range != z_spec.col_range
-            ):
-                raise RuntimeError(
-                    "replicated template Pairformer changed Fold-CP shard ownership."
-                )
+            del v_full, pair_mask_full
         else:
             v_local = distributed_pairformer_stack_pair_update(
                 self.pairformer_stack,
@@ -2231,9 +2579,22 @@ class TemplateEmbedder(nn.Module):
                 z_spec,
                 chunk_size,
             )
-        if torch.are_deterministic_algorithms_enabled():
-            return foldcp_module_with_canonical_launch_chunks(self.layernorm_v, v_local)
-        return self.layernorm_v(v_local)
+
+        def _normalize_template_pair():
+            if torch.are_deterministic_algorithms_enabled():
+                return foldcp_module_with_canonical_launch_chunks(
+                    self.layernorm_v, v_local
+                )
+            return self.layernorm_v(v_local)
+
+        normalized = run_group_rank_action_synchronized(
+            _normalize_template_pair,
+            group=mesh.group_2d,
+            description="Fold-CP template output normalization",
+        )
+        if normalized is None:  # pragma: no cover
+            raise RuntimeError("Fold-CP template normalization returned no tensor.")
+        return normalized
 
     def single_template_forward(
         self,

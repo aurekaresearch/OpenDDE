@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Aureka AI Research
 import os
+import shutil
+import tempfile
+import uuid
 from pathlib import Path
 from typing import List, Optional
 
@@ -8,9 +11,12 @@ import numpy as np
 import torch
 from biotite.structure import AtomArray
 
+from opendde.data.inference.input_validation import (
+    validate_inference_seed,
+    validate_sample_name,
+)
 from opendde.data.utils import save_structure_cif
 from opendde.utils.file_io import save_json
-from opendde.utils.torch_utils import round_values
 
 
 def get_clean_full_confidence(full_confidence_dict: dict) -> dict:
@@ -24,13 +30,36 @@ def get_clean_full_confidence(full_confidence_dict: dict) -> dict:
     Returns:
         dict: The cleaned and formatted dictionary.
     """
-    # Remove atom_coordinate
-    full_confidence_dict.pop("atom_coordinate", None)
-    # Remove atom_is_polymer
-    full_confidence_dict.pop("atom_is_polymer", None)
-    # Keep two decimal places
-    full_confidence_dict = round_values(full_confidence_dict)
-    return full_confidence_dict
+
+    def _rounded_copy(value):
+        if isinstance(value, torch.Tensor):
+            if value.dtype == torch.bfloat16:
+                value = value.float()
+            return np.round(value.detach().cpu().numpy(), 2)
+        if isinstance(value, np.ndarray):
+            return np.round(value, 2)
+        if isinstance(value, list):
+            return list(np.round(np.array(value), 2))
+        if isinstance(value, dict):
+            return {key: _rounded_copy(item) for key, item in value.items()}
+        return value
+
+    # Build a detached serialization tree. Dumping output is an I/O operation
+    # and must not delete keys or replace tensors in the caller's prediction.
+    return {
+        key: _rounded_copy(value)
+        for key, value in full_confidence_dict.items()
+        if key not in {"atom_coordinate", "atom_is_polymer"}
+    }
+
+
+def _remove_output_path(path: str) -> None:
+    """Remove one file/symlink/tree without following a destination symlink."""
+
+    if os.path.islink(path) or os.path.isfile(path):
+        os.unlink(path)
+    elif os.path.isdir(path):
+        shutil.rmtree(path)
 
 
 class DataDumper:
@@ -90,6 +119,10 @@ class DataDumper:
         Generate the directory path for dumping data based on the group name,
         sample name, and seed.
         """
+        sample_name = validate_sample_name(sample_name)
+        if group_name:
+            group_name = validate_sample_name(group_name)
+        seed = validate_inference_seed(seed, location="output seed")
         dump_dir = os.path.join(self.base_dir, group_name, sample_name, f"seed_{seed}")
         return dump_dir
 
@@ -113,43 +146,70 @@ class DataDumper:
             entity_poly_type (dict[str, str]): Dictionary mapping entity IDs to their polymer types.
             seed (int): Random seed used for the prediction.
         """
+        os.makedirs(dump_dir, exist_ok=True)
         prediction_save_dir = os.path.join(dump_dir, "predictions")
-        os.makedirs(prediction_save_dir, exist_ok=True)
+        staging_dir = tempfile.mkdtemp(prefix=".predictions-staging-", dir=dump_dir)
 
-        # Dump structure
-        b_factor = None
-        if "full_data" in pred_dict:
-            all_atom_plddt = []
-            # len(pred_dict["full_data"]) == N_sample
-            for each_sample_dict in pred_dict["full_data"]:
-                if "atom_plddt" in each_sample_dict:
-                    # atom_plddt.shape == [N_atom]
-                    atom_plddt = each_sample_dict["atom_plddt"]
-                    if atom_plddt.dtype == torch.bfloat16:
-                        atom_plddt = atom_plddt.to(torch.float32)
-                    all_atom_plddt.append(atom_plddt.cpu().numpy() * 100.0)
+        try:
+            # Dump structure
+            b_factor = None
+            if "full_data" in pred_dict:
+                all_atom_plddt = []
+                # len(pred_dict["full_data"]) == N_sample
+                for each_sample_dict in pred_dict["full_data"]:
+                    if "atom_plddt" in each_sample_dict:
+                        # atom_plddt.shape == [N_atom]
+                        atom_plddt = each_sample_dict["atom_plddt"]
+                        if atom_plddt.dtype == torch.bfloat16:
+                            atom_plddt = atom_plddt.to(torch.float32)
+                        all_atom_plddt.append(atom_plddt.cpu().numpy() * 100.0)
 
-            if len(all_atom_plddt) == len(pred_dict["full_data"]):
-                b_factor = all_atom_plddt
-        sorted_indices = self._get_ranker_indices(data=pred_dict)
-        self._save_structure(
-            pred_coordinates=pred_dict["coordinate"],
-            prediction_save_dir=prediction_save_dir,
-            sample_name=pdb_id,
-            atom_array=atom_array,
-            entity_poly_type=entity_poly_type,
-            seed=seed,
-            sorted_indices=sorted_indices,
-            b_factor=b_factor,
-        )
-        # Dump confidence
-        self._save_confidence(
-            data=pred_dict,
-            prediction_save_dir=prediction_save_dir,
-            sample_name=pdb_id,
-            seed=seed,
-            sorted_indices=sorted_indices,
-        )
+                if len(all_atom_plddt) == len(pred_dict["full_data"]):
+                    b_factor = all_atom_plddt
+            sorted_indices = self._get_ranker_indices(data=pred_dict)
+            self._save_structure(
+                pred_coordinates=pred_dict["coordinate"],
+                prediction_save_dir=staging_dir,
+                sample_name=pdb_id,
+                atom_array=atom_array,
+                entity_poly_type=entity_poly_type,
+                seed=seed,
+                sorted_indices=sorted_indices,
+                b_factor=b_factor,
+            )
+            # Dump confidence
+            self._save_confidence(
+                data=pred_dict,
+                prediction_save_dir=staging_dir,
+                sample_name=pdb_id,
+                seed=seed,
+                sorted_indices=sorted_indices,
+            )
+            self._replace_prediction_directory(staging_dir, prediction_save_dir)
+            staging_dir = ""
+        finally:
+            if staging_dir and os.path.lexists(staging_dir):
+                _remove_output_path(staging_dir)
+
+    @staticmethod
+    def _replace_prediction_directory(staging_dir: str, destination: str) -> None:
+        """Publish one complete output set without mixing it with a prior run."""
+
+        backup = ""
+        if os.path.lexists(destination):
+            backup = os.path.join(
+                os.path.dirname(destination),
+                f".predictions-backup-{uuid.uuid4().hex}",
+            )
+            os.replace(destination, backup)
+        try:
+            os.replace(staging_dir, destination)
+        except BaseException:
+            if backup and os.path.lexists(backup):
+                os.replace(backup, destination)
+            raise
+        if backup and os.path.lexists(backup):
+            _remove_output_path(backup)
 
     def _save_structure(
         self,
@@ -184,12 +244,16 @@ class DataDumper:
                 prediction_save_dir,
                 f"{sample_name}_sample_{rank}.cif",
             )
+            output_atom_array = atom_array
             if b_factor is not None:
                 # b_factor.shape == [N_sample, N_atom]
-                atom_array.set_annotation("b_factor", np.round(b_factor[idx], 2))
+                # The dumper is an I/O boundary; annotating the caller's
+                # AtomArray makes a later reuse observe the last sample's pLDDT.
+                output_atom_array = atom_array.copy()
+                output_atom_array.set_annotation("b_factor", np.round(b_factor[idx], 2))
 
             save_structure_cif(
-                atom_array=atom_array,
+                atom_array=output_atom_array,
                 pred_coordinate=pred_coordinates[idx],
                 output_fpath=output_fpath,
                 entity_poly_type=entity_poly_type,
@@ -242,11 +306,6 @@ class DataDumper:
             sorted_indices (Optional[List[int]]): Indices for ranking.
         """
         N_sample = len(data["summary_confidence"])
-        if self.need_atom_confidence:
-            for idx in range(N_sample):
-                data["full_data"][idx] = get_clean_full_confidence(
-                    data["full_data"][idx]
-                )
         if sorted_indices is None:
             sorted_indices = list(range(N_sample))
         for idx, rank in enumerate(sorted_indices):
@@ -260,4 +319,8 @@ class DataDumper:
                     prediction_save_dir,
                     f"{sample_name}_full_data_sample_{rank}.json",
                 )
-                save_json(data["full_data"][idx], output_fpath, indent=None)
+                save_json(
+                    get_clean_full_confidence(data["full_data"][idx]),
+                    output_fpath,
+                    indent=None,
+                )

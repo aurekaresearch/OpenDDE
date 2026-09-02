@@ -13,6 +13,7 @@ from typing import Any, Iterator, Optional
 
 import torch
 
+from opendde.distributed.foldcp.comm import detach_rank_local_error_traceback
 from opendde.distributed.foldcp.config import FoldCPConfig
 
 _MIB = 1024 * 1024
@@ -84,6 +85,8 @@ class FoldCPStageMetric:
     stage_peak_mib: Optional[float]
     total_peak_mib: Optional[float]
     allocated_after_mib: Optional[float]
+    reserved_peak_mib: Optional[float]
+    reserved_after_mib: Optional[float]
     rank: int = 0
     device_index: Optional[int] = None
     cuda_free_mib: Optional[float] = None
@@ -161,9 +164,15 @@ def measure_foldcp_stage(
         if _cuda_available(device):
             start_peak = bytes_to_mib(torch.cuda.max_memory_allocated(device=device))
             start_allocated = bytes_to_mib(torch.cuda.memory_allocated(device=device))
+            start_reserved_peak = bytes_to_mib(
+                torch.cuda.max_memory_reserved(device=device)
+            )
+            start_reserved = bytes_to_mib(torch.cuda.memory_reserved(device=device))
         else:
             start_peak = None
             start_allocated = None
+            start_reserved_peak = None
+            start_reserved = None
         start_free, start_total = _cuda_mem_info_mib(device)
         recorder.record(
             FoldCPStageMetric(
@@ -181,6 +190,8 @@ def measure_foldcp_stage(
                 stage_peak_mib=start_peak,
                 total_peak_mib=start_peak,
                 allocated_after_mib=start_allocated,
+                reserved_peak_mib=start_reserved_peak,
+                reserved_after_mib=start_reserved,
                 cuda_free_mib=start_free,
                 cuda_total_mib=start_total,
                 status="started",
@@ -194,10 +205,17 @@ def measure_foldcp_stage(
     except RuntimeError as exc:
         status = "oom" if "out of memory" in str(exc).lower() else "error"
         error = str(exc).splitlines()[0]
+        # The stage traceback can own multi-gigabyte CUDA temporaries.  Release
+        # those frames before synchronize/memory sampling in ``finally``;
+        # otherwise metric finalization itself runs while the failed payload is
+        # still live and can turn a recoverable rank-local OOM into a second OOM
+        # or a distributed error-reporting hang.
+        detach_rank_local_error_traceback(exc)
         raise
     except Exception as exc:
         status = "error"
         error = str(exc).splitlines()[0]
+        detach_rank_local_error_traceback(exc)
         raise
     finally:
         _sync_device(device)
@@ -205,9 +223,13 @@ def measure_foldcp_stage(
         if _cuda_available(device):
             peak = bytes_to_mib(torch.cuda.max_memory_allocated(device=device))
             allocated_after = bytes_to_mib(torch.cuda.memory_allocated(device=device))
+            reserved_peak = bytes_to_mib(torch.cuda.max_memory_reserved(device=device))
+            reserved_after = bytes_to_mib(torch.cuda.memory_reserved(device=device))
         else:
             peak = None
             allocated_after = None
+            reserved_peak = None
+            reserved_after = None
         cuda_free, cuda_total = _cuda_mem_info_mib(device)
         recorder.record(
             FoldCPStageMetric(
@@ -225,6 +247,8 @@ def measure_foldcp_stage(
                 stage_peak_mib=peak,
                 total_peak_mib=peak,
                 allocated_after_mib=allocated_after,
+                reserved_peak_mib=reserved_peak,
+                reserved_after_mib=reserved_after,
                 cuda_free_mib=cuda_free,
                 cuda_total_mib=cuda_total,
                 status=status,

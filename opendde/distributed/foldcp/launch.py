@@ -42,6 +42,7 @@ def foldcp_module_with_canonical_launch_chunks(
         if output is None:
             output = projected.new_empty((local_rows, projected.shape[-1]))
         output[start : start + valid_rows].copy_(projected[:valid_rows])
+        del launch, projected
     if output is None:
         projected = module(flat)
         return projected.reshape(*x.shape[:-1], projected.shape[-1])

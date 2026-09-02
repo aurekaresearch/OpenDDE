@@ -4,7 +4,9 @@ from typing import Any, Callable, Optional
 
 import numpy as np
 import torch
+import torch.distributed as dist
 
+from opendde.distributed.foldcp.comm import run_group_rank_action_synchronized
 from opendde.model.utils import centre_random_augmentation
 from opendde.tfg import TFGEngine, parse_tfg_config
 from opendde.utils.logger import get_logger
@@ -94,6 +96,7 @@ def sample_diffusion(
     pair_z_spec: Any = None,
     atom_window_spec: Any = None,
     foldcp_attention_bias: Any = None,
+    foldcp_group: Optional[dist.ProcessGroup] = None,
 ) -> torch.Tensor:
     """Implements Algorithm 18 in AF3.
     It performances denoising steps from time 0 to time T.
@@ -127,6 +130,9 @@ def sample_diffusion(
         enable_efficient_fusion (bool): Whether to enable efficient fusion. Defaults to False.
         guidance_configs (Optional[dict[str, Any]]): Training-free guidance configs. Defaults to None.
         pair_z_spec (Any): Optional Fold-CP pair shard metadata forwarded to denoise_net.
+        foldcp_group (Optional[dist.ProcessGroup]): Process group for the maintained
+            1xP Fold-CP topology. When provided, rank-local sampler work is
+            completed on every rank before the next denoiser collective starts.
 
     Returns:
         torch.Tensor: the denoised coordinates of x in inference stage
@@ -149,49 +155,81 @@ def sample_diffusion(
 
     num_diffusion_steps = len(noise_schedule) - 1
 
+    def _run_sampler_action(action: Callable[[], Any], description: str) -> Any:
+        if foldcp_group is None:
+            return action()
+        result = run_group_rank_action_synchronized(
+            action,
+            group=foldcp_group,
+            description=description,
+        )
+        if result is None:  # pragma: no cover - actions below always return tensors
+            raise RuntimeError(f"{description} returned no result.")
+        return result
+
     def _chunk_sample_diffusion(chunk_n_sample, inplace_safe):
         # init noise
         # [..., chunk_n_sample, N_atom, 3]
-        x_l = noise_schedule[0] * torch.randn(
-            size=(*batch_shape, chunk_n_sample, N_atom, 3),
-            device=device,
-            dtype=dtype,
-            generator=torch_generator,
+        x_l = _run_sampler_action(
+            lambda: (
+                noise_schedule[0]
+                * torch.randn(
+                    size=(*batch_shape, chunk_n_sample, N_atom, 3),
+                    device=device,
+                    dtype=dtype,
+                    generator=torch_generator,
+                )
+            ),
+            "Fold-CP diffusion initial-noise preparation",
         )
 
         for step_i, (c_tau_last, c_tau) in enumerate(
             zip(noise_schedule[:-1], noise_schedule[1:])
         ):
-            # [..., chunk_n_sample, N_atom, 3]
-            x_l = (
-                centre_random_augmentation(
-                    x_input_coords=x_l,
-                    N_sample=1,
-                    torch_generator=torch_generator,
-                    numpy_rng=numpy_rng,
-                )
-                .squeeze(dim=-3)
-                .to(dtype)
-            )
-            # Denoise with a predictor-corrector sampler
-            # 1. Add noise to move x_{c_tau_last} to x_{t_hat}
-            gamma = float(gamma0) if c_tau > gamma_min else 0
-            t_hat = c_tau_last * (gamma + 1)
 
-            delta_noise_level = torch.sqrt(t_hat**2 - c_tau_last**2)
-            x_noisy = x_l + noise_scale_lambda * delta_noise_level * torch.randn(
-                size=x_l.shape,
-                device=device,
-                dtype=dtype,
-                generator=torch_generator,
+            def _prepare_diffusion_step():
+                # [..., chunk_n_sample, N_atom, 3]
+                augmented_x_l = (
+                    centre_random_augmentation(
+                        x_input_coords=x_l,
+                        N_sample=1,
+                        torch_generator=torch_generator,
+                        numpy_rng=numpy_rng,
+                    )
+                    .squeeze(dim=-3)
+                    .to(dtype)
+                )
+                # Denoise with a predictor-corrector sampler
+                # 1. Add noise to move x_{c_tau_last} to x_{t_hat}
+                gamma = float(gamma0) if c_tau > gamma_min else 0
+                prepared_t_hat = c_tau_last * (gamma + 1)
+
+                delta_noise_level = torch.sqrt(prepared_t_hat**2 - c_tau_last**2)
+                prepared_x_noisy = (
+                    augmented_x_l
+                    + noise_scale_lambda
+                    * delta_noise_level
+                    * torch.randn(
+                        size=augmented_x_l.shape,
+                        device=device,
+                        dtype=dtype,
+                        generator=torch_generator,
+                    )
+                )
+                # 2. Denoise from x_{t_hat} to x_{c_tau}
+                # Euler step only
+                prepared_t_hat = (
+                    prepared_t_hat.reshape((1,) * (len(batch_shape) + 1))
+                    .expand(*batch_shape, chunk_n_sample)
+                    .to(dtype)
+                )
+                return prepared_x_noisy, prepared_t_hat
+
+            prepared_step = _run_sampler_action(
+                _prepare_diffusion_step,
+                f"Fold-CP diffusion sampler step {step_i} preparation",
             )
-            # 2. Denoise from x_{t_hat} to x_{c_tau}
-            # Euler step only
-            t_hat = (
-                t_hat.reshape((1,) * (len(batch_shape) + 1))
-                .expand(*batch_shape, chunk_n_sample)
-                .to(dtype)
-            )
+            x_noisy, t_hat = prepared_step
 
             if tfg_cfg.enable:
                 x_l = tfg.step(
@@ -216,6 +254,9 @@ def sample_diffusion(
                     num_diffusion_steps=num_diffusion_steps,
                     step_scale_eta=step_scale_eta,
                     torch_generator=torch_generator,
+                    rank_action_synchronizer=(
+                        _run_sampler_action if foldcp_group is not None else None
+                    ),
                 )
             else:
                 x_denoised = denoise_net(
@@ -236,11 +277,17 @@ def sample_diffusion(
                     enable_efficient_fusion=enable_efficient_fusion,
                 )
 
-                delta = (x_noisy - x_denoised) / t_hat[
-                    ..., None, None
-                ]  # Line 9 of AF3 uses x_l_hat instead, which we believe is a typo.
-                dt = c_tau - t_hat
-                x_l = x_noisy + step_scale_eta * dt[..., None, None] * delta
+                def _complete_diffusion_step():
+                    delta = (x_noisy - x_denoised) / t_hat[
+                        ..., None, None
+                    ]  # Line 9 of AF3 uses x_l_hat instead, which we believe is a typo.
+                    dt = c_tau - t_hat
+                    return x_noisy + step_scale_eta * dt[..., None, None] * delta
+
+                x_l = _run_sampler_action(
+                    _complete_diffusion_step,
+                    f"Fold-CP diffusion sampler step {step_i} completion",
+                )
 
         return x_l
 
@@ -258,6 +305,9 @@ def sample_diffusion(
                 chunk_n_sample, inplace_safe=inplace_safe
             )
             x_l.append(chunk_x_l)
-        x_l = torch.cat(x_l, -3)  # [..., N_sample, N_atom, 3]
+        x_l = _run_sampler_action(
+            lambda: torch.cat(x_l, -3),
+            "Fold-CP diffusion sample-chunk assembly",
+        )  # [..., N_sample, N_atom, 3]
 
     return x_l

@@ -214,7 +214,9 @@ see the inference guide for details.
 
 > [!IMPORTANT]
 > Multi-GPU Fold-CP does not support cuEquivariance triangle kernels, so use
-> `--trimul_kernel torch --triatt_kernel torch`. On CUDA BF16, the distributed
+> `--trimul_kernel torch --triatt_kernel torch`. Distributed `auto` requests
+> resolve to these PyTorch kernels, while an explicit cuEquivariance request is
+> rejected before model loading. On CUDA BF16, the distributed
 > PyTorch triangle-attention path uses the Triton dependency from the GPU install
 > extra to fuse attention-bias addition. See the
 > [Fold-CP reproduction guide](https://github.com/aurekaresearch/OpenDDE/blob/main/docs/foldcp_e2e_baseline.md)
@@ -243,10 +245,11 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node 4 \
   --foldcp_size_cp 4
 ```
 
-`--nproc_per_node` must equal `--foldcp_size_dp * --foldcp_size_cp`. The example
-uses a `1 x 4` context-parallel mesh; replace both occurrences of `4` with the
-desired `P`. For normal single-GPU or CPU inference, omit the Fold-CP flags or
-use `--foldcp_mode single --foldcp_size_cp 1`.
+Only the `1 x P` topology is supported. `--nproc_per_node` must equal
+`--foldcp_size_cp P`; `--foldcp_size_dp` is retained only for command-line
+compatibility and must remain `1`. The example uses `P=4`; replace both
+occurrences of `4` with the desired `P`. For normal single-GPU or CPU inference,
+omit the Fold-CP flags or use `--foldcp_mode single --foldcp_size_cp 1`.
 
 ## Input JSON
 

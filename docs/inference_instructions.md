@@ -255,7 +255,9 @@ below that.
 > [!IMPORTANT]
 > Fold-CP inference does not currently support cuEquivariance (`cueq`) triangle
 > kernels. Select the distributed PyTorch implementations with
-> `--triatt_kernel torch --trimul_kernel torch`. On CUDA BF16, Fold-CP triangle
+> `--triatt_kernel torch --trimul_kernel torch`. In distributed mode, `auto`
+> resolves to these PyTorch kernels and an explicit `cueq` request fails before
+> model loading. On CUDA BF16, Fold-CP triangle
 > attention also uses Triton 3.3.1 from the GPU install extra to fuse
 > attention-bias addition; this Triton helper is separate from cuEquivariance.
 
@@ -338,11 +340,11 @@ Outputs are written to:
 | `--seeds` | Comma-separated seeds, e.g. `101,102`. Overrides the job's `modelSeeds`; if unset, `modelSeeds` are used, or a random seed when both are absent. |
 | `--use_msa` | Use/generate protein MSA features. |
 | `--use_template` | Use/generate template features. |
-| `--use_rna_msa` | Use/generate RNA MSA features. |
+| `--use_rna_msa` | Use/generate RNA MSA features; requires `--use_msa true`. |
 | `--use_tfg_guidance` | Enable Training-Free Guidance. |
 | `--foldcp_mode` | `single` or `distributed`; use `distributed` with `torchrun` for multi-GPU Fold-CP inference. |
-| `--foldcp_size_dp` | Number of data-parallel ranks. Use `1` for the documented `1 x P` Fold-CP topology. |
-| `--foldcp_size_cp` | Number of context-parallel ranks in the `1 x P` mesh; must match the launched process count when `size_dp=1`. |
+| `--foldcp_size_dp` | Compatibility option; only `1` is supported. Runtime `2 x 2` topology is not maintained. |
+| `--foldcp_size_cp` | Context-parallel degree `P` in the maintained `1 x P` mesh; must match the launched process count. |
 | `--foldcp_devices` | Optional visible-device list recorded in Fold-CP metrics; actual GPU visibility is controlled by `CUDA_VISIBLE_DEVICES`. |
 | `--foldcp_metrics_jsonl` | Optional JSONL path for Fold-CP timing and memory metrics. |
 | `--dtype` | `bf16` or `fp32`. |

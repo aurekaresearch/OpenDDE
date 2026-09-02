@@ -2,9 +2,10 @@
 # Copyright (c) 2026 Aureka AI Research
 import copy
 import os
+import sys
 import time
-from contextlib import nullcontext
-from typing import Any, Optional
+from contextlib import contextmanager, nullcontext
+from typing import Any, Callable, Optional
 
 import torch
 import torch.distributed as dist
@@ -13,6 +14,10 @@ import torch.nn as nn
 from opendde.config.schema import OpenDDEConfig
 from opendde.data.tokenizer import STRUCTURAL_TOKEN_ROLES
 from opendde.distributed.foldcp.config import FoldCPConfig
+from opendde.distributed.foldcp.comm import (
+    detach_rank_local_error_traceback,
+    run_group_rank_action_synchronized,
+)
 from opendde.distributed.foldcp.mesh import FoldCPProcessMesh
 from opendde.distributed.foldcp.metrics import (
     FoldCPBenchmarkRecorder,
@@ -59,6 +64,124 @@ from opendde.utils.torch_utils import autocasting_disable_decorator
 logger = get_logger(__name__)
 
 
+@contextmanager
+def _tf32_runtime_scope(enabled: bool):
+    """Apply one model's TF32 policy without leaking it to the host process."""
+
+    previous_matmul = torch.backends.cuda.matmul.allow_tf32
+    previous_cudnn = torch.backends.cudnn.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = bool(enabled)
+    torch.backends.cudnn.allow_tf32 = bool(enabled)
+    try:
+        yield
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous_matmul
+        torch.backends.cudnn.allow_tf32 = previous_cudnn
+
+
+@contextmanager
+def _synchronized_foldcp_stage_context(
+    metric_context: Any,
+    *,
+    group: dist.ProcessGroup,
+    stage_name: str,
+):
+    """Enter and leave an internal metric boundary as one CP replica."""
+
+    entered = False
+
+    def _enter_metric() -> None:
+        nonlocal entered
+        metric_context.__enter__()
+        entered = True
+
+    try:
+        run_group_rank_action_synchronized(
+            _enter_metric,
+            group=group,
+            description=f"Fold-CP {stage_name} metric initialization",
+        )
+    except Exception:
+        # A healthy rank may have entered its context before learning that a
+        # peer failed. Close that local context before the distributed job
+        # unwinds; no model stage has started yet.
+        if entered:
+            entry_error_info = sys.exc_info()
+            try:
+                metric_context.__exit__(*entry_error_info)
+            except Exception:
+                logger.exception(
+                    "Failed to close %s metric context after remote entry failure.",
+                    stage_name,
+                )
+        raise
+    try:
+        yield
+    except Exception as body_error:
+        exception_info = sys.exc_info()
+
+        # Finalize the local metric before retaining the model failure for the
+        # group handshake.  Keeping ``exception_info`` or ``body_error`` with
+        # its original traceback alive across that handshake can retain every
+        # tensor referenced by the failed stage, which is especially harmful
+        # after CUDA OOM and can prevent the tiny error collective from making
+        # progress.
+        synchronized_error: Exception
+        try:
+            metric_context.__exit__(*exception_info)
+        except Exception as metric_error:
+            # A metric-finalization failure is raised while the stage error is
+            # already being handled, so its implicit context points back to
+            # ``body_error``. Detach that complete chain before replacing it
+            # with the lightweight combined diagnostic; otherwise the original
+            # CUDA/OOM frames (and their tensors) survive through the CP status
+            # handshake in the still-live ``body_error`` local.
+            detach_rank_local_error_traceback(metric_error)
+            synchronized_error = RuntimeError(
+                f"{stage_name} failed with {type(body_error).__name__}: "
+                f"{body_error}; metric finalization also failed with "
+                f"{type(metric_error).__name__}: {metric_error}"
+            )
+        else:
+            synchronized_error = body_error
+        del exception_info
+        synchronized_error = detach_rank_local_error_traceback(synchronized_error)
+
+        def _raise_failed_stage() -> None:
+            raise synchronized_error
+
+        run_group_rank_action_synchronized(
+            _raise_failed_stage,
+            group=group,
+            description=f"Fold-CP {stage_name} metric/error finalization",
+        )
+        raise RuntimeError(  # pragma: no cover - synchronized action always raises
+            f"Fold-CP {stage_name} failure was not propagated."
+        )
+    else:
+        run_group_rank_action_synchronized(
+            lambda: metric_context.__exit__(None, None, None),
+            group=group,
+            description=f"Fold-CP {stage_name} metric finalization",
+        )
+
+
+def _offload_prediction_tree_to_cpu(value: Any) -> Any:
+    """Detach prediction leaves from the accelerator between model seeds."""
+
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu()
+    if isinstance(value, dict):
+        return {
+            key: _offload_prediction_tree_to_cpu(item) for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_offload_prediction_tree_to_cpu(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_offload_prediction_tree_to_cpu(item) for item in value)
+    return value
+
+
 def update_input_feature_dict(input_feature_dict: dict[str, Any]) -> dict[str, Any]:
     """
     Lines 1-3 of Algorithm 5 compute d_lm, v_lm, and pad_info utilized in the AtomAttentionEncoder.
@@ -101,8 +224,6 @@ class OpenDDE(nn.Module):
     def __init__(self, configs: OpenDDEConfig) -> None:
         super(OpenDDE, self).__init__()
         self.configs = configs
-        torch.backends.cuda.matmul.allow_tf32 = self.configs.enable_tf32
-        torch.backends.cudnn.allow_tf32 = self.configs.enable_tf32
         # Some constants
         self.enable_diffusion_shared_vars_cache = (
             self.configs.enable_diffusion_shared_vars_cache
@@ -228,13 +349,7 @@ class OpenDDE(nn.Module):
             return None
         if torch.is_grad_enabled():
             return None
-        foldcp = FoldCPConfig.from_runtime_args(
-            mode="distributed",
-            size_dp=int(os.environ.get("OPENDDE_FOLDCP_SIZE_DP", "1")),
-            size_cp=int(os.environ.get("OPENDDE_FOLDCP_SIZE_CP", "4")),
-            devices=os.environ.get("OPENDDE_FOLDCP_DEVICES", ""),
-            metrics_jsonl=os.environ.get("OPENDDE_FOLDCP_METRICS_JSONL", ""),
-        )
+        foldcp = FoldCPConfig.from_environment()
         return FoldCPProcessMesh.create(foldcp)
 
     @staticmethod
@@ -243,36 +358,43 @@ class OpenDDE(nn.Module):
             return None
         if not dist.is_available() or not dist.is_initialized():
             return None
-        foldcp = FoldCPConfig.from_runtime_args(
-            mode="distributed",
-            size_dp=int(os.environ.get("OPENDDE_FOLDCP_SIZE_DP", "1")),
-            size_cp=int(os.environ.get("OPENDDE_FOLDCP_SIZE_CP", "4")),
-            devices=os.environ.get("OPENDDE_FOLDCP_DEVICES", ""),
-            metrics_jsonl=os.environ.get("OPENDDE_FOLDCP_METRICS_JSONL", ""),
-        )
+        foldcp = FoldCPConfig.from_environment()
         if not foldcp.metrics_jsonl:
             return None
         return foldcp
 
     def _foldcp_stage_context(self, stage_name: str, n_token: int):
-        foldcp = self._maybe_foldcp_config()
-        if foldcp is None:
+        mesh = self._maybe_foldcp_mesh()
+        if mesh is None:
             return nullcontext()
-        rank = dist.get_rank() if dist.is_initialized() else 0
-        recorder = FoldCPBenchmarkRecorder(
-            foldcp.metrics_jsonl,
-            rank=rank,
-            write_rank_sidecar=stage_name == "opendde_pre_sample" + "_p2p_warmup",
-        )
-        return measure_foldcp_stage(
-            task_id="i69",
+        foldcp = FoldCPConfig.from_environment()
+        if foldcp.metrics_jsonl:
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            recorder = FoldCPBenchmarkRecorder(
+                foldcp.metrics_jsonl,
+                rank=rank,
+                write_rank_sidecar=(stage_name == "opendde_pre_sample" + "_p2p_warmup"),
+            )
+            metric_context = measure_foldcp_stage(
+                task_id="i69",
+                stage_name=stage_name,
+                foldcp_config=foldcp,
+                recorder=recorder,
+                sample_name="opendde_model",
+                n_token=n_token,
+                reset_peak=False,
+                record_start=True,
+            )
+        else:
+            # Error propagation is a correctness boundary, not a benchmark
+            # feature.  Keep the synchronized enter/exit handshake active when
+            # metric collection is disabled without paying CUDA timing or
+            # memory-query overhead.
+            metric_context = nullcontext()
+        return _synchronized_foldcp_stage_context(
+            metric_context,
+            group=mesh.group_2d,
             stage_name=stage_name,
-            foldcp_config=foldcp,
-            recorder=recorder,
-            sample_name="opendde_model",
-            n_token=n_token,
-            reset_peak=False,
-            record_start=True,
         )
 
     @staticmethod
@@ -282,6 +404,21 @@ class OpenDDE(nn.Module):
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
 
+    @staticmethod
+    def _run_foldcp_local_action_synchronized(
+        mesh: Optional[FoldCPProcessMesh],
+        action: Callable[[], Any],
+        *,
+        description: str,
+    ) -> Any:
+        if mesh is None:
+            return action()
+        return run_group_rank_action_synchronized(
+            action,
+            group=mesh.group_2d,
+            description=description,
+        )
+
     def expand_to_structural_tokens(
         self,
         input_feature_dict: dict[str, Any],
@@ -290,6 +427,7 @@ class OpenDDE(nn.Module):
         z: torch.Tensor,
         inplace_safe: bool = False,
         chunk_size: Optional[int] = None,
+        lazy_relp: bool = False,
     ) -> tuple[dict[str, Any], torch.Tensor, torch.Tensor, torch.Tensor]:
         if not self.enable_structural_token_expansion:
             return input_feature_dict, s_inputs, s, z
@@ -314,7 +452,6 @@ class OpenDDE(nn.Module):
                 "missing required structural feature(s): " + ", ".join(missing_features)
             )
 
-        parent = input_feature_dict["parent_residue_idx"].long()
         structural_feature_dict = dict(input_feature_dict)
         for residue_feature in [
             "token_index",
@@ -344,6 +481,7 @@ class OpenDDE(nn.Module):
         if foldcp_result is not None:
             return foldcp_result
 
+        parent = input_feature_dict["parent_residue_idx"].long()
         s_inputs, s, z, structural_pair_features = self.structural_token_expander(
             input_feature_dict=input_feature_dict,
             s_inputs_res=s_inputs,
@@ -379,10 +517,9 @@ class OpenDDE(nn.Module):
         ].long()
         for feature_name, feature_value in structural_pair_features.items():
             structural_feature_dict[feature_name] = feature_value
-        lazy_structural_relp = os.environ.get("OPENDDE_FOLDCP_MODE") == "distributed"
         structural_feature_dict = self.relative_position_encoding.generate_relp(
             structural_feature_dict,
-            lazy=lazy_structural_relp,
+            lazy=lazy_relp,
         )
         if self.enable_structural_token_refiner:
             s, z = self.structural_token_refiner(
@@ -414,7 +551,13 @@ class OpenDDE(nn.Module):
         if mesh is None:
             return None
 
-        parent = input_feature_dict["parent_residue_idx"].long()
+        parent = run_group_rank_action_synchronized(
+            lambda: input_feature_dict["parent_residue_idx"].long(),
+            group=mesh.group_2d,
+            description="Fold-CP structural parent-index preparation",
+        )
+        if parent is None:  # pragma: no cover
+            raise RuntimeError("Fold-CP structural parent indices were not prepared.")
 
         (
             s_inputs,
@@ -431,38 +574,55 @@ class OpenDDE(nn.Module):
             mesh=mesh,
             z_res_spec=input_feature_dict.get("_foldcp_pair_z_spec"),
         )
-        if z_local.is_cuda and not torch.is_grad_enabled():
-            torch.cuda.empty_cache()
 
-        structural_feature_dict["token_index"] = input_feature_dict[
-            "structural_token_index"
-        ].long()
-        structural_feature_dict["atom_to_token_idx"] = input_feature_dict[
-            "atom_to_structural_token_idx"
-        ].long()
-        structural_feature_dict["atom_to_tokatom_idx"] = input_feature_dict[
-            "atom_to_structural_tokatom_idx"
-        ].long()
-        for token_feature in ["asym_id", "residue_index", "entity_id", "sym_id"]:
-            structural_feature_dict[token_feature] = input_feature_dict[
-                token_feature
-            ].index_select(dim=-1, index=parent)
+        def _prepare_structural_features():
+            if z_local.is_cuda and not torch.is_grad_enabled():
+                torch.cuda.empty_cache()
 
-        structural_feature_dict["has_frame"] = input_feature_dict[
-            "structural_has_frame"
-        ]
-        structural_feature_dict["frame_atom_index"] = input_feature_dict[
-            "structural_frame_atom_index"
-        ]
-        for feature_name, feature_value in structural_pair_features_local.items():
-            structural_feature_dict[feature_name] = feature_value.contiguous()
-        structural_feature_dict["_foldcp_pair_feature_specs"] = structural_pair_specs
-        structural_feature_dict["_foldcp_pair_features_are_local"] = True
+            structural_feature_dict["token_index"] = input_feature_dict[
+                "structural_token_index"
+            ].long()
+            structural_feature_dict["atom_to_token_idx"] = input_feature_dict[
+                "atom_to_structural_token_idx"
+            ].long()
+            structural_feature_dict["atom_to_tokatom_idx"] = input_feature_dict[
+                "atom_to_structural_tokatom_idx"
+            ].long()
+            for token_feature in [
+                "asym_id",
+                "residue_index",
+                "entity_id",
+                "sym_id",
+            ]:
+                structural_feature_dict[token_feature] = input_feature_dict[
+                    token_feature
+                ].index_select(dim=-1, index=parent)
 
-        structural_feature_dict = self.relative_position_encoding.generate_relp(
-            structural_feature_dict,
-            lazy=True,
+            structural_feature_dict["has_frame"] = input_feature_dict[
+                "structural_has_frame"
+            ]
+            structural_feature_dict["frame_atom_index"] = input_feature_dict[
+                "structural_frame_atom_index"
+            ]
+            for feature_name, feature_value in structural_pair_features_local.items():
+                structural_feature_dict[feature_name] = feature_value.contiguous()
+            structural_feature_dict["_foldcp_pair_feature_specs"] = (
+                structural_pair_specs
+            )
+            structural_feature_dict["_foldcp_pair_features_are_local"] = True
+            return self.relative_position_encoding.generate_relp(
+                structural_feature_dict,
+                lazy=True,
+            )
+
+        prepared_structural_features = run_group_rank_action_synchronized(
+            _prepare_structural_features,
+            group=mesh.group_2d,
+            description="Fold-CP structural feature preparation",
         )
+        if prepared_structural_features is None:  # pragma: no cover
+            raise RuntimeError("Fold-CP structural features were not prepared.")
+        structural_feature_dict = prepared_structural_features
         if self.enable_structural_token_refiner:
             s, z_local, z_spec = distributed_pairformer_stack_single_bridge_update(
                 self.structural_token_refiner,
@@ -479,9 +639,22 @@ class OpenDDE(nn.Module):
                 z_spec=z_spec,
                 chunk_size=chunk_size,
             )
-        structural_feature_dict["_foldcp_pair_z_spec"] = z_spec
-        self.drop_residue_only_features_for_structural_branch(structural_feature_dict)
-        return structural_feature_dict, s_inputs, s, z_local.contiguous()
+
+        def _finalize_structural_branch():
+            structural_feature_dict["_foldcp_pair_z_spec"] = z_spec
+            self.drop_residue_only_features_for_structural_branch(
+                structural_feature_dict
+            )
+            return structural_feature_dict, s_inputs, s, z_local.contiguous()
+
+        finalized = run_group_rank_action_synchronized(
+            _finalize_structural_branch,
+            group=mesh.group_2d,
+            description="Fold-CP structural branch finalization",
+        )
+        if finalized is None:  # pragma: no cover
+            raise RuntimeError("Fold-CP structural branch was not finalized.")
+        return finalized
 
     def select_pair_output_branch(
         self,
@@ -901,28 +1074,53 @@ class OpenDDE(nn.Module):
         if mesh is None:
             return None
 
-        z_init_local, z_spec = build_trunk_z_init_local(
-            s_init=s_init,
-            linear_zinit1=self.linear_no_bias_zinit1,
-            linear_zinit2=self.linear_no_bias_zinit2,
-            relative_position_encoding=self.relative_position_encoding,
-            linear_token_bond=self.linear_no_bias_token_bond,
-            relp_feature=input_feature_dict["relp"],
-            token_bonds=input_feature_dict["token_bonds"],
-            mesh=mesh,
+        def _initialize_local_trunk():
+            local_init, local_spec = build_trunk_z_init_local(
+                s_init=s_init,
+                linear_zinit1=self.linear_no_bias_zinit1,
+                linear_zinit2=self.linear_no_bias_zinit2,
+                relative_position_encoding=self.relative_position_encoding,
+                linear_token_bond=self.linear_no_bias_token_bond,
+                relp_feature=input_feature_dict["relp"],
+                token_bonds=input_feature_dict["token_bonds"],
+                mesh=mesh,
+            )
+            return (
+                local_init,
+                local_spec,
+                torch.zeros_like(local_init),
+                torch.zeros_like(s_init),
+            )
+
+        initialized = run_group_rank_action_synchronized(
+            _initialize_local_trunk,
+            group=mesh.group_2d,
+            description="Fold-CP trunk initialization",
         )
-        z_local = torch.zeros_like(z_init_local)
-        s = torch.zeros_like(s_init)
+        if initialized is None:  # pragma: no cover
+            raise RuntimeError("Fold-CP trunk initialization returned no tensors.")
+        z_init_local, z_spec, z_local, s = initialized
+        # Do not let the synchronization result tuple retain the initial zero
+        # pair/single buffers after their loop variables are replaced below.
+        del initialized
 
         for _ in range(N_cycle):
             with torch.set_grad_enabled(False):
-                z_local = apply_trunk_z_cycle_local(
-                    z_init_local=z_init_local,
-                    z_local=z_local,
-                    layernorm_z_cycle=self.layernorm_z_cycle,
-                    linear_z_cycle=self.linear_no_bias_z_cycle,
-                    z_spec=z_spec,
+                cycled_z = run_group_rank_action_synchronized(
+                    lambda: apply_trunk_z_cycle_local(
+                        z_init_local=z_init_local,
+                        z_local=z_local,
+                        layernorm_z_cycle=self.layernorm_z_cycle,
+                        linear_z_cycle=self.linear_no_bias_z_cycle,
+                        z_spec=z_spec,
+                    ),
+                    group=mesh.group_2d,
+                    description="Fold-CP trunk cycle update",
                 )
+                if cycled_z is None:  # pragma: no cover
+                    raise RuntimeError("Fold-CP trunk cycle returned no pair tensor.")
+                z_local = cycled_z
+                del cycled_z
                 if self.template_embedder.n_blocks > 0:
                     template_update_local, z_spec = (
                         self.template_embedder.forward_foldcp_local_pair(
@@ -938,7 +1136,17 @@ class OpenDDE(nn.Module):
                         )
                     )
                     if template_update_local is not None:
-                        z_local = z_local + template_update_local
+                        updated_z = run_group_rank_action_synchronized(
+                            lambda: z_local + template_update_local,
+                            group=mesh.group_2d,
+                            description="Fold-CP template residual update",
+                        )
+                        if updated_z is None:  # pragma: no cover
+                            raise RuntimeError(
+                                "Fold-CP template residual returned no pair tensor."
+                            )
+                        z_local = updated_z
+                        del updated_z, template_update_local
                 z_local, z_spec = self.msa_module.forward_foldcp_local_pair(
                     input_feature_dict=input_feature_dict,
                     z_local=z_local,
@@ -951,7 +1159,15 @@ class OpenDDE(nn.Module):
                     inplace_safe=inplace_safe,
                     chunk_size=chunk_size,
                 )
-                s = s_init + self.linear_no_bias_s(self.layernorm_s(s))
+                updated_s = run_group_rank_action_synchronized(
+                    lambda: s_init + self.linear_no_bias_s(self.layernorm_s(s)),
+                    group=mesh.group_2d,
+                    description="Fold-CP trunk single update",
+                )
+                if updated_s is None:  # pragma: no cover
+                    raise RuntimeError("Fold-CP trunk returned no single update.")
+                s = updated_s
+                del updated_s
                 s, z_local, z_spec = distributed_pairformer_stack_single_bridge_update(
                     self.pairformer_stack,
                     s,
@@ -962,9 +1178,19 @@ class OpenDDE(nn.Module):
                     z_spec=z_spec,
                 )
 
-        input_feature_dict["_foldcp_pair_z_spec"] = z_spec
-        input_feature_dict["_foldcp_pair_is_local"] = True
-        return s_inputs, s, z_local.contiguous()
+        def _finalize_local_trunk():
+            input_feature_dict["_foldcp_pair_z_spec"] = z_spec
+            input_feature_dict["_foldcp_pair_is_local"] = True
+            return s_inputs, s, z_local.contiguous()
+
+        finalized = run_group_rank_action_synchronized(
+            _finalize_local_trunk,
+            group=mesh.group_2d,
+            description="Fold-CP trunk output finalization",
+        )
+        if finalized is None:  # pragma: no cover
+            raise RuntimeError("Fold-CP trunk output was not finalized.")
+        return finalized
 
     def run_sample_diffusion_stage(
         self,
@@ -981,38 +1207,93 @@ class OpenDDE(nn.Module):
         chunk_size: Optional[int],
         inplace_safe: bool,
     ) -> torch.Tensor:
-        sample_pair_z_spec = cache["pair_z_spec"]
-        if sample_pair_z_spec is None and cache["pair_z"] is None:
-            sample_pair_z_spec = pair_z_spec
-        sample_input_feature_dict = input_feature_dict
-        sample_pair_z = cache["pair_z"]
-        sample_z_trunk = None if sample_pair_z is not None else z
-        rollout_seed = input_feature_dict.get("inference_seed")
-        if isinstance(rollout_seed, torch.Tensor):
-            rollout_seed = int(rollout_seed.detach().cpu().item())
-        elif rollout_seed is not None:
-            rollout_seed = int(rollout_seed)
+        foldcp_mesh = self._maybe_foldcp_mesh()
 
-        pred_dict["coordinate"] = self.sample_diffusion(
-            denoise_net=self.diffusion_module,
-            input_feature_dict=sample_input_feature_dict,
-            s_inputs=s_inputs,
-            s_trunk=s,
-            z_trunk=sample_z_trunk,
-            pair_z=sample_pair_z,
-            pair_z_spec=sample_pair_z_spec,
-            p_lm=cache["p_lm/c_l"][0],
-            c_l=cache["p_lm/c_l"][1],
-            atom_window_spec=cache.get("atom_window_spec"),
-            foldcp_attention_bias=cache.get("diffusion_attn_bias"),
-            N_sample=N_sample,
-            noise_schedule=noise_schedule,
-            attn_chunk_size=chunk_size,
-            diffusion_chunk_size=self.configs.infer_setting.sample_diffusion_chunk_size,
-            inplace_safe=inplace_safe,
-            enable_efficient_fusion=self.enable_efficient_fusion,
-            rollout_seed=rollout_seed,
+        def _prepare_rollout_inputs():
+            sample_pair_z_spec = cache["pair_z_spec"]
+            if sample_pair_z_spec is None and cache["pair_z"] is None:
+                sample_pair_z_spec = pair_z_spec
+            sample_pair_z = cache["pair_z"]
+            sample_z_trunk = None if sample_pair_z is not None else z
+            rollout_seed = input_feature_dict.get("inference_seed")
+            if isinstance(rollout_seed, torch.Tensor):
+                rollout_seed = int(rollout_seed.detach().cpu().item())
+            elif rollout_seed is not None:
+                rollout_seed = int(rollout_seed)
+            return sample_pair_z_spec, sample_pair_z, sample_z_trunk, rollout_seed
+
+        prepared = self._run_foldcp_local_action_synchronized(
+            foldcp_mesh,
+            _prepare_rollout_inputs,
+            description="Fold-CP diffusion rollout-input preparation",
         )
+        if prepared is None:  # pragma: no cover
+            raise RuntimeError("Fold-CP diffusion rollout inputs were not prepared.")
+        sample_pair_z_spec, sample_pair_z, sample_z_trunk, rollout_seed = prepared
+
+        foldcp_group = None
+        if (
+            foldcp_mesh is not None
+            and int(foldcp_mesh.layout.shape[0]) == 1
+            and int(foldcp_mesh.layout.shape[1]) > 1
+        ):
+            foldcp_group = foldcp_mesh.group_2d
+
+        rollout_error: Exception | None = None
+        try:
+            pred_dict["coordinate"] = self.sample_diffusion(
+                denoise_net=self.diffusion_module,
+                input_feature_dict=input_feature_dict,
+                s_inputs=s_inputs,
+                s_trunk=s,
+                z_trunk=sample_z_trunk,
+                pair_z=sample_pair_z,
+                pair_z_spec=sample_pair_z_spec,
+                p_lm=cache["p_lm/c_l"][0],
+                c_l=cache["p_lm/c_l"][1],
+                atom_window_spec=cache.get("atom_window_spec"),
+                foldcp_attention_bias=cache.get("diffusion_attn_bias"),
+                N_sample=N_sample,
+                noise_schedule=noise_schedule,
+                attn_chunk_size=chunk_size,
+                diffusion_chunk_size=self.configs.infer_setting.sample_diffusion_chunk_size,
+                inplace_safe=inplace_safe,
+                enable_efficient_fusion=self.enable_efficient_fusion,
+                rollout_seed=rollout_seed,
+                foldcp_group=foldcp_group,
+            )
+        except Exception as exc:
+            rollout_error = detach_rank_local_error_traceback(exc)
+
+        cleanup_error: Exception | None = None
+        try:
+            self._run_foldcp_local_action_synchronized(
+                foldcp_mesh,
+                self.diffusion_module.diffusion_transformer.clear_foldcp_attention_workspace,
+                description="Fold-CP diffusion workspace cleanup",
+            )
+        except Exception as exc:
+            cleanup_error = detach_rank_local_error_traceback(exc)
+
+        # Every rank reaches this boundary after cleanup. A rank-local rollout
+        # failure must win over a secondary cleanup failure on every peer;
+        # otherwise ranks can report different causes or hide the actual OOM.
+        if foldcp_mesh is not None:
+            try:
+                self._run_foldcp_local_action_synchronized(
+                    foldcp_mesh,
+                    None
+                    if rollout_error is None
+                    else lambda: (_ for _ in ()).throw(rollout_error),
+                    description="Fold-CP diffusion rollout failure propagation",
+                )
+            except Exception as exc:
+                rollout_error = detach_rank_local_error_traceback(exc)
+
+        if rollout_error is not None:
+            raise rollout_error
+        if cleanup_error is not None:
+            raise cleanup_error
         return pred_dict["coordinate"]
 
     def sample_diffusion(
@@ -1054,12 +1335,14 @@ class OpenDDE(nn.Module):
 
     @staticmethod
     def _foldcp_is_non_output_rank() -> bool:
-        return (
-            os.environ.get("OPENDDE_FOLDCP_MODE", "single") == "distributed"
-            and torch.distributed.is_available()
-            and torch.distributed.is_initialized()
-            and torch.distributed.get_rank() != 0
-        )
+        if (
+            os.environ.get("OPENDDE_FOLDCP_MODE", "single") != "distributed"
+            or not torch.distributed.is_available()
+            or not torch.distributed.is_initialized()
+        ):
+            return False
+        size_cp = FoldCPConfig.from_environment().size_cp
+        return torch.distributed.get_rank() % size_cp != 0
 
     def prepare_diffusion_cache_for_sampling(
         self,
@@ -1119,9 +1402,22 @@ class OpenDDE(nn.Module):
                     inplace_safe=False,
                 )
                 cache["p_lm/c_l"] = [p_lm, c_l]
-                cache_z = cache["pair_z"].to(dtype=torch.float32)
-                if self.enable_efficient_fusion:
-                    cache_z = self.diffusion_module.normalize(cache_z)
+
+                def _prepare_diffusion_bias_source():
+                    cache_z = cache["pair_z"].to(dtype=torch.float32)
+                    if self.enable_efficient_fusion:
+                        cache_z = self.diffusion_module.normalize(cache_z)
+                    return cache_z
+
+                cache_z = run_group_rank_action_synchronized(
+                    _prepare_diffusion_bias_source,
+                    group=foldcp_mesh.group_2d,
+                    description="Fold-CP diffusion bias-source preparation",
+                )
+                if cache_z is None:  # pragma: no cover
+                    raise RuntimeError(
+                        "Fold-CP diffusion bias source was not prepared."
+                    )
                 cache["diffusion_attn_bias"] = autocasting_disable_decorator(
                     self.configs.skip_amp.sample_diffusion
                 )(
@@ -1198,62 +1494,6 @@ class OpenDDE(nn.Module):
             pair_z_spec=pair_z_spec,
         )
         return pred_dict["contact_probs"]
-
-    def run_post_confidence_outputs_stage(
-        self,
-        *,
-        pred_dict: dict[str, Any],
-        input_feature_dict: dict[str, Any],
-        pair_input_feature_dict: dict[str, Any],
-        pair_z: torch.Tensor,
-        N_cycle: int,
-    ) -> dict[str, Any]:
-        del pair_z
-        torch.cuda.empty_cache()
-
-        self.add_shape_complementarity_predictions(
-            pred_dict=pred_dict,
-            input_feature_dict=pair_input_feature_dict,
-            coordinate=pred_dict["coordinate"],
-            label_dict=None,
-        )
-
-        residue_confidence_inputs = self.get_residue_level_confidence_inputs(
-            input_feature_dict=pair_input_feature_dict,
-            pae_logits=pred_dict["pae"],
-            pde_logits=pred_dict["pde"],
-            contact_probs=pred_dict.get(
-                "per_sample_contact_probs", pred_dict["contact_probs"]
-            ),
-            target_device=pred_dict["plddt"].device,
-        )
-        self.replace_public_pair_logits_with_residue_level(
-            pred_dict=pred_dict,
-            residue_confidence_inputs=residue_confidence_inputs,
-        )
-        (
-            pred_dict["summary_confidence"],
-            pred_dict["full_data"],
-        ) = autocasting_disable_decorator(True)(
-            sample_confidence.compute_full_data_and_summary
-        )(
-            configs=self.configs,
-            pae_logits=residue_confidence_inputs["pae_logits"],
-            plddt_logits=pred_dict["plddt"],
-            pde_logits=residue_confidence_inputs["pde_logits"],
-            contact_probs=residue_confidence_inputs["contact_probs"],
-            token_asym_id=residue_confidence_inputs["token_asym_id"],
-            token_has_frame=residue_confidence_inputs["token_has_frame"],
-            atom_coordinate=pred_dict["coordinate"],
-            atom_to_token_idx=residue_confidence_inputs["atom_to_token_idx"],
-            atom_is_polymer=1 - input_feature_dict["is_ligand"],
-            N_recycle=N_cycle,
-            interested_atom_mask=None,
-            return_full_data=bool(getattr(self.configs, "need_atom_confidence", False)),
-            mol_id=None,
-            elements_one_hot=None,
-        )
-        return pred_dict
 
     def run_confidence_head(self, *args: Any, **kwargs: Any) -> Any:
         """
@@ -1353,10 +1593,8 @@ class OpenDDE(nn.Module):
         pred_dict: dict[str, Any],
         input_feature_dict: dict[str, Any],
         pair_input_feature_dict: dict[str, Any],
-        pair_z: torch.Tensor,
         N_cycle: int,
     ) -> dict[str, Any]:
-        del pair_z
         torch.cuda.empty_cache()
 
         self.add_shape_complementarity_predictions(
@@ -1373,7 +1611,10 @@ class OpenDDE(nn.Module):
             contact_probs=pred_dict.get(
                 "per_sample_contact_probs", pred_dict["contact_probs"]
             ),
-            target_device=pred_dict["plddt"].device,
+            # Multi-sample inference may deliberately retain pair logits on
+            # CPU.  Keep the aggregate there; confidence summary generation
+            # stages only the current sample to the pLDDT compute device.
+            target_device=pred_dict["pae"].device,
         )
         self.replace_public_pair_logits_with_residue_level(
             pred_dict=pred_dict,
@@ -1427,20 +1668,71 @@ class OpenDDE(nn.Module):
             pred_dicts = []
             log_dicts = []
             time_trackers = []
-            for _ in range(N_model_seed):
+            non_output_rank = self._foldcp_is_non_output_rank()
+            foldcp_mesh = self._maybe_foldcp_mesh()
+            last_non_output_prediction = None
+            for model_seed_index in range(N_model_seed):
+                if non_output_rank and model_seed_index > 0:
+                    # Drop the previous placeholder before evaluating the next
+                    # model seed. Keeping either this binding or ``pred_dict``
+                    # alive extends the complete prior GPU prediction lifetime
+                    # through the next forward.
+                    last_non_output_prediction = None
+
+                seed_input_features = self._run_foldcp_local_action_synchronized(
+                    foldcp_mesh,
+                    lambda: copy.deepcopy(input_feature_dict),
+                    description=(
+                        f"Fold-CP model-seed {model_seed_index} input preparation"
+                    ),
+                )
+                if seed_input_features is None:  # pragma: no cover
+                    raise RuntimeError(
+                        f"Fold-CP model-seed {model_seed_index} input was not prepared."
+                    )
                 pred_dict, log_dict, time_tracker = self._main_inference_loop(
-                    input_feature_dict=copy.deepcopy(input_feature_dict),
+                    input_feature_dict=seed_input_features,
                     N_cycle=N_cycle,
                     inplace_safe=inplace_safe,
                     chunk_size=chunk_size,
                 )
-                pred_dicts.append(pred_dict)
+                # The per-seed copy may contain device tensors after the model
+                # mutates it. Release that tree before retaining the prediction
+                # or preparing the next seed.
+                del seed_input_features
+
+                def _retain_model_seed_prediction():
+                    if non_output_rank:
+                        return pred_dict
+                    return _offload_prediction_tree_to_cpu(pred_dict)
+
+                retained_prediction = self._run_foldcp_local_action_synchronized(
+                    foldcp_mesh,
+                    _retain_model_seed_prediction,
+                    description=(
+                        f"Fold-CP model-seed {model_seed_index} prediction retention"
+                    ),
+                )
+                if retained_prediction is None:  # pragma: no cover
+                    raise RuntimeError(
+                        f"Fold-CP model-seed {model_seed_index} prediction was not retained."
+                    )
+                if non_output_rank:
+                    # Only the CP leader writes results. Retain just the newest
+                    # placeholder on peers, and remove the loop variable so it
+                    # cannot keep the same GPU tree alive during the next RHS.
+                    last_non_output_prediction = retained_prediction
+                else:
+                    pred_dicts.append(retained_prediction)
+                del retained_prediction, pred_dict
                 log_dicts.append(log_dict)
                 time_trackers.append(time_tracker)
 
-            if self._foldcp_is_non_output_rank():
+            if non_output_rank:
+                if last_non_output_prediction is None:  # pragma: no cover
+                    raise RuntimeError("multi-seed inference produced no prediction.")
                 return (
-                    pred_dicts[-1],
+                    last_non_output_prediction,
                     simple_merge_dict_list(log_dicts),
                     simple_merge_dict_list(time_trackers),
                 )
@@ -1501,6 +1793,26 @@ class OpenDDE(nn.Module):
         # For token counts larger than the largest threshold, use smallest chunk_size
         return 32  # extreme case for very large proteins
 
+    @staticmethod
+    def _bound_pairformer_chunk_size(
+        n_token: int,
+        chunk_size: Optional[int],
+    ) -> Optional[int]:
+        """Bound attention score batches by a platform-neutral N-squared budget."""
+        requested_chunk = chunk_size or n_token
+        # The dominant temporary scales with chunk_size * N**2. Quantizing the
+        # cap to powers of two also keeps launch shapes stable across input sizes.
+        score_batch_budget = 450_000_000
+        budget_chunk = max(
+            1,
+            score_batch_budget // max(1, n_token * n_token),
+        )
+        power_of_two_chunk = 1 << (budget_chunk.bit_length() - 1)
+        bounded_chunk = min(requested_chunk, power_of_two_chunk)
+        if chunk_size is None and bounded_chunk >= n_token:
+            return None
+        return bounded_chunk
+
     def _main_inference_loop(
         self,
         input_feature_dict: dict[str, Any],
@@ -1524,6 +1836,7 @@ class OpenDDE(nn.Module):
         )
         if dynamic_chunk_size:
             chunk_size = self._get_dynamic_chunk_size(N_token)
+        chunk_size = self._bound_pairformer_chunk_size(N_token, chunk_size)
         # If dynamic chunking is disabled, chunk_size keeps its original value from the function parameter
 
         log_dict = {}
@@ -1536,14 +1849,23 @@ class OpenDDE(nn.Module):
                 inplace_safe=inplace_safe,
                 chunk_size=chunk_size,
             )
-        if self._maybe_foldcp_mesh() is not None and s_inputs.is_cuda:
-            torch.cuda.empty_cache()
+        if s_inputs.is_cuda:
+            self._run_foldcp_local_action_synchronized(
+                self._maybe_foldcp_mesh(),
+                torch.cuda.empty_cache,
+                description="Fold-CP post-trunk allocator cleanup",
+            )
         residue_input_feature_dict = input_feature_dict
         residue_s_inputs, residue_s, residue_z = s_inputs, s, z
         structural_chunk_size = chunk_size
-        if dynamic_chunk_size and self.enable_structural_token_expansion:
-            structural_chunk_size = self._get_dynamic_chunk_size(
-                input_feature_dict["parent_residue_idx"].shape[-1]
+        structural_refiner_chunk_size = structural_chunk_size
+        if self.enable_structural_token_expansion:
+            n_structural_token = input_feature_dict["parent_residue_idx"].shape[-1]
+            if dynamic_chunk_size:
+                structural_chunk_size = self._get_dynamic_chunk_size(n_structural_token)
+            structural_refiner_chunk_size = self._bound_pairformer_chunk_size(
+                n_structural_token,
+                structural_chunk_size,
             )
         with self._foldcp_stage_context("opendde_structural_token_expansion", N_token):
             with foldcp_triatt_canonical_batch_scope(False):
@@ -1553,7 +1875,8 @@ class OpenDDE(nn.Module):
                     s=s,
                     z=z,
                     inplace_safe=inplace_safe,
-                    chunk_size=structural_chunk_size,
+                    chunk_size=structural_refiner_chunk_size,
+                    lazy_relp=True,
                 )
         with self._foldcp_stage_context("opendde_pair_output_branch", N_token):
             (
@@ -1598,7 +1921,11 @@ class OpenDDE(nn.Module):
         step_trunk = time.time()
         time_tracker.update({"pairformer": step_trunk - step_st})
         with self._foldcp_stage_context("opendde_pre_sample_p2p_warmup", N_token):
-            self._foldcp_cleanup_before_p2p_warmup()
+            self._run_foldcp_local_action_synchronized(
+                foldcp_mesh,
+                self._foldcp_cleanup_before_p2p_warmup,
+                description="Fold-CP pre-warmup allocator cleanup",
+            )
             if (
                 foldcp_mesh is not None
                 and (diffusion_z_spec is not None or pair_z_spec is not None)
@@ -1614,9 +1941,19 @@ class OpenDDE(nn.Module):
         N_sample = self.configs.sample_diffusion["N_sample"]
         N_step = self.configs.sample_diffusion["N_step"]
 
-        noise_schedule = self.inference_noise_scheduler(
-            N_step=N_step, device=s_inputs.device, dtype=s_inputs.dtype
+        noise_schedule = self._run_foldcp_local_action_synchronized(
+            foldcp_mesh,
+            lambda device=s_inputs.device, dtype=s_inputs.dtype: (
+                self.inference_noise_scheduler(
+                    N_step=N_step,
+                    device=device,
+                    dtype=dtype,
+                )
+            ),
+            description="Fold-CP inference noise-schedule preparation",
         )
+        if noise_schedule is None:  # pragma: no cover
+            raise RuntimeError("Fold-CP inference noise schedule was not prepared.")
         with self._foldcp_stage_context("opendde_diffusion_cache", N_token):
             cache = self.prepare_diffusion_cache_for_sampling(
                 input_feature_dict=input_feature_dict,
@@ -1625,7 +1962,11 @@ class OpenDDE(nn.Module):
                 diffusion_z_spec=diffusion_z_spec,
             )
         if foldcp_mesh is not None and s_inputs.is_cuda:
-            torch.cuda.empty_cache()
+            self._run_foldcp_local_action_synchronized(
+                foldcp_mesh,
+                torch.cuda.empty_cache,
+                description="Fold-CP post-cache allocator cleanup",
+            )
         with self._foldcp_stage_context("opendde_sample_diffusion", N_token):
             self.run_sample_diffusion_stage(
                 pred_dict=pred_dict,
@@ -1643,7 +1984,11 @@ class OpenDDE(nn.Module):
 
         del cache
         if foldcp_mesh is not None and s_inputs.is_cuda:
-            torch.cuda.empty_cache()
+            self._run_foldcp_local_action_synchronized(
+                foldcp_mesh,
+                torch.cuda.empty_cache,
+                description="Fold-CP post-diffusion allocator cleanup",
+            )
 
         step_diffusion = time.time()
         time_tracker.update({"diffusion": step_diffusion - step_trunk})
@@ -1675,21 +2020,58 @@ class OpenDDE(nn.Module):
         step_confidence = time.time()
         time_tracker.update({"confidence": step_confidence - step_diffusion})
         time_tracker.update({"model_forward": time.time() - step_st})
-        if self._foldcp_is_non_output_rank():
-            return pred_dict, log_dict, time_tracker
-
+        # Confidence is the final consumer of the trunk pair/single tensors.
+        # Release every residue/structural alias in this owning frame before
+        # post-processing allocates confidence summaries and shape-complementarity
+        # workspaces. Deleting ``pair_z`` in the callee cannot release storage
+        # while these caller bindings remain alive.
+        del pair_s_inputs, pair_s, pair_z, s_inputs, s, z, noise_schedule
+        is_non_output_rank = self._foldcp_is_non_output_rank()
         with self._foldcp_stage_context("opendde_post_confidence_outputs", N_token):
-            self.run_post_confidence_outputs_stage(
-                pred_dict=pred_dict,
-                input_feature_dict=input_feature_dict,
-                pair_input_feature_dict=pair_input_feature_dict,
-                pair_z=pair_z,
-                N_cycle=N_cycle,
-            )
+            # Every CP rank must cross the metric boundary even though only the
+            # output leader owns the full logits needed by this CPU/GPU stage.
+            if not is_non_output_rank:
+                self.run_post_confidence_outputs_stage(
+                    pred_dict=pred_dict,
+                    input_feature_dict=input_feature_dict,
+                    pair_input_feature_dict=pair_input_feature_dict,
+                    N_cycle=N_cycle,
+                )
+
+        if is_non_output_rank:
+            return pred_dict, log_dict, time_tracker
 
         return pred_dict, log_dict, time_tracker
 
     def forward(
+        self,
+        input_feature_dict: dict[str, Any],
+        label_full_dict: Optional[dict[str, Any]] = None,
+        label_dict: Optional[dict[str, Any]] = None,
+        mode: str = "inference",
+        disable_inplace: bool = False,
+    ) -> tuple[dict[str, torch.Tensor], Optional[dict[str, Any]], dict[str, Any]]:
+        """Run one forward with this model's TF32 policy scoped to the call."""
+
+        # Minimal embedded/test model objects may intentionally omit the
+        # inference-only policy field. In that case preserve the host's active
+        # matmul policy rather than inventing a new one.
+        enable_tf32 = getattr(
+            self.configs,
+            "enable_tf32",
+            torch.backends.cuda.matmul.allow_tf32,
+        )
+        with _tf32_runtime_scope(enable_tf32):
+            return OpenDDE._forward_impl(
+                self,
+                input_feature_dict=input_feature_dict,
+                label_full_dict=label_full_dict,
+                label_dict=label_dict,
+                mode=mode,
+                disable_inplace=disable_inplace,
+            )
+
+    def _forward_impl(
         self,
         input_feature_dict: dict[str, Any],
         label_full_dict: Optional[dict[str, Any]] = None,
@@ -1717,12 +2099,22 @@ class OpenDDE(nn.Module):
         not_use_gradient = not torch.is_grad_enabled()
         inplace_safe = not_use_gradient and (not disable_inplace)
 
-        lazy_relp = os.environ.get("OPENDDE_FOLDCP_MODE") == "distributed"
-        input_feature_dict = self.relative_position_encoding.generate_relp(
-            input_feature_dict,
-            lazy=lazy_relp,
+        foldcp_mesh = self._maybe_foldcp_mesh()
+
+        def _prepare_forward_input_features():
+            prepared_input_features = self.relative_position_encoding.generate_relp(
+                input_feature_dict,
+                lazy=True,
+            )
+            return update_input_feature_dict(prepared_input_features)
+
+        input_feature_dict = self._run_foldcp_local_action_synchronized(
+            foldcp_mesh,
+            _prepare_forward_input_features,
+            description="Fold-CP forward input-feature preparation",
         )
-        input_feature_dict = update_input_feature_dict(input_feature_dict)
+        if input_feature_dict is None:  # pragma: no cover
+            raise RuntimeError("Fold-CP forward input features were not prepared.")
 
         pred_dict, log_dict, time_tracker = self.main_inference_loop(
             input_feature_dict=input_feature_dict,

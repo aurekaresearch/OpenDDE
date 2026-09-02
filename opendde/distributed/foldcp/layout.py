@@ -11,8 +11,9 @@ from dataclasses import dataclass
 class FoldCP2DLayout:
     """Map between a CP coordinate and rank inside a CP group.
 
-    Fold-CP launches use a 1 x P mesh. Square meshes remain accepted so callers
-    using the original 2D layout can migrate independently.
+    The maintained Fold-CP topology is strictly 1 x P.  Keeping the two-axis
+    coordinate type avoids a broad representation change in pair-sharding
+    metadata, but the row coordinate is always zero at runtime.
     """
 
     shape: tuple[int, int]
@@ -23,8 +24,8 @@ class FoldCP2DLayout:
         rows, cols = self.shape
         if rows < 1 or cols < 1:
             raise ValueError("Fold-CP mesh dimensions must be positive.")
-        if rows != 1 and rows != cols:
-            raise ValueError("Fold-CP requires either a 1 x P or square CP mesh.")
+        if rows != 1:
+            raise ValueError("Only the maintained 1 x P Fold-CP layout is supported.")
 
     @property
     def numel(self) -> int:

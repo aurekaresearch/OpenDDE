@@ -33,18 +33,18 @@ def disabled_autocast():
 
 
 def to_device(obj, device, non_blocking: bool = False):
-    """Move tensor or dict of tensors to device"""
+    """Return tensors on ``device`` without mutating the caller's container."""
     if isinstance(obj, dict):
-        for k, v in obj.items():
-            if isinstance(v, dict):
-                to_device(v, device, non_blocking=non_blocking)
-            elif isinstance(v, torch.Tensor):
-                obj[k] = obj[k].to(device=device, non_blocking=non_blocking)
+        return {
+            key: to_device(value, device, non_blocking=non_blocking)
+            if isinstance(value, (dict, torch.Tensor))
+            else value
+            for key, value in obj.items()
+        }
     elif isinstance(obj, torch.Tensor):
-        obj = obj.to(device=device, non_blocking=non_blocking)
+        return obj.to(device=device, non_blocking=non_blocking)
     else:
         raise Exception(f"type {type(obj)} not supported")
-    return obj
 
 
 def _clear_accelerator_cache(
@@ -133,16 +133,19 @@ def cdist(a: torch.Tensor, b: torch.Tensor | None = None) -> torch.Tensor:
 
 
 def map_values_to_list(data, recursive=True):
+    converted = {}
     for k, v in data.items():
         if isinstance(v, torch.Tensor):
             if v.dtype == torch.bfloat16:
                 v = v.float()
-            data[k] = v.cpu().numpy().tolist()
+            converted[k] = v.cpu().numpy().tolist()
         elif isinstance(v, np.ndarray):
-            data[k] = v.tolist()
+            converted[k] = v.tolist()
         elif isinstance(v, dict) and recursive:
-            data[k] = map_values_to_list(v, recursive)
-    return data
+            converted[k] = map_values_to_list(v, recursive)
+        else:
+            converted[k] = v
+    return converted
 
 
 def round_values(data, recursive=True):

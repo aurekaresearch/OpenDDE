@@ -9,6 +9,12 @@ import os
 import torch
 import torch.distributed as dist
 
+from opendde.distributed.foldcp.comm import (
+    detach_rank_local_error_traceback,
+    dispatch_p2p_batch_and_wait,
+    gather_tensor_by_ring,
+    run_group_rank_action_synchronized,
+)
 from opendde.distributed.foldcp.launch import (
     foldcp_pair_row_slab_linear_with_source_launch_policy,
 )
@@ -52,55 +58,95 @@ def _transpose_pair_tile_collective(
             if output_device is None
             else torch.device(output_device)
         )
+        if result_device == z_pair_local.device:
+
+            def _allocate_all_to_all() -> tuple[
+                torch.Tensor, torch.Tensor, int, int, int, int
+            ]:
+                n_token = int(z_pair_local.shape[-3])
+                tile = int(z_pair_local.shape[-2])
+                padded_n = int(mesh_cols) * tile
+                if n_token > padded_n:
+                    raise ValueError(
+                        f"pair length {n_token} exceeds padded length {padded_n}."
+                    )
+                if n_token == padded_n:
+                    padded = z_pair_local.contiguous()
+                else:
+                    padded = z_pair_local.new_zeros(
+                        z_pair_local.shape[:-3]
+                        + (padded_n, tile, z_pair_local.shape[-1])
+                    )
+                    padded[..., :n_token, :, :].copy_(z_pair_local)
+                prefix_dims = padded.ndim - 3
+                send = (
+                    padded.reshape(
+                        padded.shape[:-3]
+                        + (
+                            int(mesh_cols),
+                            int(tile),
+                            int(tile),
+                            padded.shape[-1],
+                        )
+                    )
+                    .movedim(prefix_dims, 0)
+                    .contiguous()
+                )
+                return (
+                    send,
+                    torch.empty_like(send),
+                    prefix_dims,
+                    n_token,
+                    tile,
+                    padded_n,
+                )
+
+            buffers = run_group_rank_action_synchronized(
+                _allocate_all_to_all,
+                group=mesh.group_row,
+                description="distogram 1xP transpose all-to-all allocation",
+            )
+            if buffers is None:  # pragma: no cover - action always runs on every rank
+                raise RuntimeError("distogram transpose returned no buffers.")
+            send, recv, prefix_dims, n_token, tile, padded_n = buffers
+            del buffers
+            dist.all_to_all_single(recv, send, group=mesh.group_row)
+            del send
+
+            result = run_group_rank_action_synchronized(
+                lambda: (
+                    recv.movedim(0, prefix_dims)
+                    .transpose(-3, -2)
+                    .contiguous()
+                    .reshape(
+                        z_pair_local.shape[:-3]
+                        + (padded_n, tile, z_pair_local.shape[-1])
+                    )[..., :n_token, :, :]
+                    .contiguous()
+                ),
+                group=mesh.group_row,
+                description="distogram 1xP transpose all-to-all assembly",
+            )
+            if result is None:  # pragma: no cover - action always runs on every rank
+                raise RuntimeError("distogram transpose returned no result.")
+            return result
+
         n_token = z_pair_local.shape[-3]
         tile = z_pair_local.shape[-2]
-        if result_device == z_pair_local.device:
-            padded_n = int(mesh_cols) * int(tile)
-            if n_token > padded_n:
-                raise ValueError(
-                    f"pair length {n_token} exceeds padded length {padded_n}."
-                )
-            if n_token == padded_n:
-                padded = z_pair_local.contiguous()
-            else:
-                padded = z_pair_local.new_zeros(
-                    z_pair_local.shape[:-3] + (padded_n, tile, z_pair_local.shape[-1])
-                )
-                padded[..., :n_token, :, :].copy_(z_pair_local)
-            prefix_dims = padded.ndim - 3
-            send = (
-                padded.reshape(
-                    padded.shape[:-3]
-                    + (
-                        int(mesh_cols),
-                        int(tile),
-                        int(tile),
-                        padded.shape[-1],
-                    )
-                )
-                .movedim(prefix_dims, 0)
-                .contiguous()
-            )
-            recv = torch.empty_like(send)
-            dist.all_to_all_single(recv, send, group=mesh.group_row)
-            transposed = (
-                recv.movedim(0, prefix_dims)
-                .transpose(-3, -2)
-                .contiguous()
-                .reshape(
-                    z_pair_local.shape[:-3] + (padded_n, tile, z_pair_local.shape[-1])
-                )
-            )
-            return transposed[..., :n_token, :, :].contiguous()
-
         block_shape = list(z_pair_local.shape)
         block_shape[-3] = tile
         block_shape[-2] = tile
-        z_pair_t_recv = torch.zeros(
-            tuple(z_pair_local.shape),
-            dtype=z_pair_local.dtype,
-            device=result_device,
+        z_pair_t_recv = run_group_rank_action_synchronized(
+            lambda: torch.zeros(
+                tuple(z_pair_local.shape),
+                dtype=z_pair_local.dtype,
+                device=result_device,
+            ),
+            group=mesh.group_2d,
+            description="distogram streamed-transpose output allocation",
         )
+        if z_pair_t_recv is None:  # pragma: no cover
+            raise RuntimeError("distogram streamed transpose returned no output.")
 
         def _send_block(
             destination: int,
@@ -135,29 +181,38 @@ def _transpose_pair_tile_collective(
             1,
             (256 * 1024**2) // max(1, block_row_bytes),
         )
-        for channel_start in range(
-            0,
-            int(z_pair_local.shape[-1]),
-            channel_chunk,
-        ):
-            channel_end = min(
-                channel_start + channel_chunk,
+
+        def _initialize_self_tile() -> None:
+            for channel_start in range(
+                0,
                 int(z_pair_local.shape[-1]),
-            )
-            if self_valid_rows:
-                z_pair_t_recv[
-                    ...,
-                    self_row_start : self_row_start + self_valid_rows,
-                    :self_valid_rows,
-                    channel_start:channel_end,
-                ].copy_(
-                    z_pair_local[
+                channel_chunk,
+            ):
+                channel_end = min(
+                    channel_start + channel_chunk,
+                    int(z_pair_local.shape[-1]),
+                )
+                if self_valid_rows:
+                    z_pair_t_recv[
                         ...,
                         self_row_start : self_row_start + self_valid_rows,
                         :self_valid_rows,
                         channel_start:channel_end,
-                    ].transpose(-3, -2)
-                )
+                    ].copy_(
+                        z_pair_local[
+                            ...,
+                            self_row_start : self_row_start + self_valid_rows,
+                            :self_valid_rows,
+                            channel_start:channel_end,
+                        ].transpose(-3, -2)
+                    )
+
+        run_group_rank_action_synchronized(
+            _initialize_self_tile,
+            group=mesh.group_2d,
+            description="distogram streamed-transpose self-tile assembly",
+        )
+        assembly_error: Exception | None = None
         for send_peer, recv_peer in _one_by_p_transpose_peer_rounds(
             cp_rank=mesh.cp_rank,
             mesh_cols=mesh_cols,
@@ -176,12 +231,26 @@ def _transpose_pair_tile_collective(
                     channel_start + channel_chunk,
                     int(z_pair_local.shape[-1]),
                 )
-                send_block = _send_block(
-                    send_peer,
-                    channel_start,
-                    channel_end,
+
+                def _allocate_stream_blocks() -> tuple[torch.Tensor, torch.Tensor]:
+                    send_block = _send_block(
+                        send_peer,
+                        channel_start,
+                        channel_end,
+                    )
+                    return send_block, torch.empty_like(send_block)
+
+                buffers = run_group_rank_action_synchronized(
+                    _allocate_stream_blocks,
+                    group=mesh.group_2d,
+                    description="distogram streamed-transpose block allocation",
                 )
-                recv_block = torch.empty_like(send_block)
+                if buffers is None:  # pragma: no cover
+                    raise RuntimeError(
+                        "distogram streamed transpose returned no block buffers."
+                    )
+                send_block, recv_block = buffers
+                del buffers
                 operations = [
                     dist.P2POp(
                         dist.irecv,
@@ -196,49 +265,102 @@ def _transpose_pair_tile_collective(
                         group=mesh.group_2d,
                     ),
                 ]
-                for work in dist.batch_isend_irecv(operations):
-                    work.wait()
-                if recv_valid_rows and self_valid_rows:
-                    z_pair_t_recv[
-                        ...,
-                        recv_start : recv_start + recv_valid_rows,
-                        :self_valid_rows,
-                        channel_start:channel_end,
-                    ].copy_(
-                        recv_block[
+                dispatch_p2p_batch_and_wait(operations)
+                del operations
+                if recv_valid_rows and self_valid_rows and assembly_error is None:
+                    try:
+                        z_pair_t_recv[
                             ...,
+                            recv_start : recv_start + recv_valid_rows,
                             :self_valid_rows,
-                            :recv_valid_rows,
-                            :,
-                        ].transpose(-3, -2)
-                    )
+                            channel_start:channel_end,
+                        ].copy_(
+                            recv_block[
+                                ...,
+                                :self_valid_rows,
+                                :recv_valid_rows,
+                                :,
+                            ].transpose(-3, -2)
+                        )
+                    except Exception as exc:
+                        assembly_error = detach_rank_local_error_traceback(exc)
                 del send_block, recv_block
-        return z_pair_t_recv
 
-    if output_device is not None and torch.device(output_device) != z_pair_local.device:
-        raise ValueError("CPU-source transpose is only supported for 1xP Fold-CP.")
-    z_pair_t_send = z_pair_local.transpose(-2, -3).contiguous()
+        def _finish_streamed_transpose() -> torch.Tensor:
+            if assembly_error is not None:
+                raise assembly_error
+            return z_pair_t_recv
+
+        result = run_group_rank_action_synchronized(
+            _finish_streamed_transpose,
+            group=mesh.group_2d,
+            description="distogram streamed-transpose assembly",
+        )
+        if result is None:  # pragma: no cover
+            raise RuntimeError("distogram streamed transpose returned no result.")
+        return result
+
     transposed_rank = mesh.layout.transpose_rank(mesh.coord)
-    z_pair_t_recv = torch.empty_like(z_pair_t_send)
+
+    def _allocate_2d_transpose() -> tuple[torch.Tensor, torch.Tensor]:
+        if (
+            output_device is not None
+            and torch.device(output_device) != z_pair_local.device
+        ):
+            raise ValueError("CPU-source transpose is only supported for 1xP Fold-CP.")
+        send = z_pair_local.transpose(-2, -3).contiguous()
+        return send, torch.empty_like(send)
+
+    buffers = run_group_rank_action_synchronized(
+        _allocate_2d_transpose,
+        group=mesh.group_2d,
+        description="distogram 2D transpose allocation",
+    )
+    if buffers is None:  # pragma: no cover
+        raise RuntimeError("distogram 2D transpose returned no buffers.")
+    z_pair_t_send, z_pair_t_recv = buffers
 
     # Broadcast one source tile at a time. Every rank participates in the same
     # collective order, but each rank only keeps the reciprocal tile it needs.
+    assembly_error: Exception | None = None
     for source_rank in range(mesh.layout.numel):
-        buffer = (
-            z_pair_t_send
+        buffer = run_group_rank_action_synchronized(
+            None
             if mesh.cp_rank == source_rank
-            else torch.empty_like(z_pair_t_send)
+            else lambda: torch.empty_like(z_pair_t_send),
+            group=mesh.group_2d,
+            description=f"distogram broadcast buffer allocation for source {source_rank}",
         )
+        if mesh.cp_rank == source_rank:
+            buffer = z_pair_t_send
+        if buffer is None:  # pragma: no cover
+            raise RuntimeError("distogram broadcast returned no buffer.")
         dist.broadcast(
             buffer,
             src=mesh.cp_global_ranks[source_rank],
             group=mesh.group_2d,
         )
-        if source_rank == transposed_rank:
-            z_pair_t_recv.copy_(buffer)
+        if source_rank == transposed_rank and assembly_error is None:
+            try:
+                z_pair_t_recv.copy_(buffer)
+            except Exception as exc:
+                assembly_error = detach_rank_local_error_traceback(exc)
         if mesh.cp_rank != source_rank:
             del buffer
-    return z_pair_t_recv.contiguous()
+
+    def _finish_broadcast_transpose() -> torch.Tensor:
+        if assembly_error is not None:
+            raise assembly_error
+        return z_pair_t_recv.contiguous()
+
+    result = run_group_rank_action_synchronized(
+        _finish_broadcast_transpose,
+        group=mesh.group_2d,
+        description="distogram broadcast-transpose assembly",
+    )
+    if result is None:  # pragma: no cover
+        raise RuntimeError("distogram broadcast transpose returned no result.")
+    return result
 
 
 def _project_pair_row_slab_local(
@@ -259,123 +381,179 @@ def _project_pair_row_slab_local(
     layout without materializing full pair logits on any rank.
     """
 
-    if z_pair_local.ndim != 3:
-        raise ValueError(
-            "Fold-CP distogram row-slab projection expects [tile, tile, c_z]."
+    def _prepare_projection_metadata():
+        if z_pair_local.ndim != 3:
+            raise ValueError(
+                "Fold-CP distogram row-slab projection expects [tile, tile, c_z]."
+            )
+        row_start, row_end = z_pair_spec.row_range
+        col_start, col_end = z_pair_spec.col_range
+        n_token = z_pair_spec.original_shape[z_pair_spec.pair_dims[0]]
+        valid_rows = max(0, min(row_end, n_token) - row_start)
+        tile_col = int(z_pair_local.shape[-2])
+        valid_cols = max(0, min(col_end, n_token) - col_start)
+        source_slab_bytes = (
+            int(n_token)
+            * int(n_token)
+            * int(z_pair_local.shape[-1])
+            * int(z_pair_local.element_size())
+        )
+        source_slab_budget = int(
+            os.environ.get(
+                "OPENDDE_FOLDCP_DISTOGRAM_SOURCE_SLAB_MAX_BYTES",
+                str(16 * 1024**3),
+            )
+        )
+        return (
+            row_start,
+            col_start,
+            n_token,
+            valid_rows,
+            tile_col,
+            valid_cols,
+            source_slab_bytes,
+            source_slab_budget,
         )
 
-    row_start, row_end = z_pair_spec.row_range
-    col_start, col_end = z_pair_spec.col_range
-    n_token = z_pair_spec.original_shape[z_pair_spec.pair_dims[0]]
-    valid_rows = max(0, min(row_end, n_token) - row_start)
-    tile_col = int(z_pair_local.shape[-2])
-    valid_cols = max(0, min(col_end, n_token) - col_start)
-    source_slab_bytes = (
-        int(n_token)
-        * int(n_token)
-        * int(z_pair_local.shape[-1])
-        * int(z_pair_local.element_size())
-    )
-    source_slab_budget = int(
-        os.environ.get(
-            "OPENDDE_FOLDCP_DISTOGRAM_SOURCE_SLAB_MAX_BYTES",
-            str(16 * 1024**3),
+    if mesh.layout.numel == 1:
+        metadata = _prepare_projection_metadata()
+    else:
+        metadata = run_group_rank_action_synchronized(
+            _prepare_projection_metadata,
+            group=mesh.group_2d,
+            description="distogram projection metadata preparation",
         )
-    )
+        if metadata is None:  # pragma: no cover
+            raise RuntimeError("distogram projection metadata returned no state.")
+    (
+        row_start,
+        col_start,
+        n_token,
+        valid_rows,
+        tile_col,
+        valid_cols,
+        source_slab_bytes,
+        source_slab_budget,
+    ) = metadata
     if (
         mesh.layout.shape[0] == 1
         and source_slab_budget >= 0
         and source_slab_bytes > source_slab_budget
     ):
-        chunk_cols = int(os.environ.get("OPENDDE_FOLDCP_DISTOGRAM_COL_CHUNK", "256"))
-        if chunk_cols <= 0:
-            raise ValueError("Fold-CP distogram column chunk must be positive.")
-        out_features = int(linear.weight.shape[0])
-        logits_local = z_pair_local.new_zeros(
-            (z_pair_local.shape[-3], tile_col, out_features)
-        )
-        local_col_end = col_start + valid_cols
-        for chunk_start in range(0, int(n_token), chunk_cols):
-            chunk_end = min(chunk_start + chunk_cols, int(n_token))
-            overlap_start = max(col_start, chunk_start)
-            overlap_end = min(local_col_end, chunk_end)
-            if overlap_start >= overlap_end:
-                continue
-            local_offset = overlap_start - col_start
-            chunk_offset = overlap_start - chunk_start
-            overlap_cols = overlap_end - overlap_start
-            source_chunk = z_pair_local.new_zeros(
-                (int(n_token), chunk_cols, z_pair_local.shape[-1])
+
+        def _project_column_chunks() -> torch.Tensor:
+            chunk_cols = int(
+                os.environ.get("OPENDDE_FOLDCP_DISTOGRAM_COL_CHUNK", "256")
             )
-            source_chunk[
-                :valid_rows,
-                chunk_offset : chunk_offset + overlap_cols,
-            ] = z_pair_local[
-                :valid_rows,
-                local_offset : local_offset + overlap_cols,
-            ]
-            projected_chunk = linear(source_chunk)
-            logits_local[
-                :valid_rows,
-                local_offset : local_offset + overlap_cols,
-            ] = projected_chunk[
-                :valid_rows,
-                chunk_offset : chunk_offset + overlap_cols,
-            ]
-            del projected_chunk, source_chunk
-        return logits_local.contiguous()
+            if chunk_cols <= 0:
+                raise ValueError("Fold-CP distogram column chunk must be positive.")
+            out_features = int(linear.weight.shape[0])
+            logits_local = z_pair_local.new_zeros(
+                (z_pair_local.shape[-3], tile_col, out_features)
+            )
+            local_col_end = col_start + valid_cols
+            for chunk_start in range(0, int(n_token), chunk_cols):
+                chunk_end = min(chunk_start + chunk_cols, int(n_token))
+                overlap_start = max(col_start, chunk_start)
+                overlap_end = min(local_col_end, chunk_end)
+                if overlap_start >= overlap_end:
+                    continue
+                local_offset = overlap_start - col_start
+                chunk_offset = overlap_start - chunk_start
+                overlap_cols = overlap_end - overlap_start
+                source_chunk = z_pair_local.new_zeros(
+                    (int(n_token), chunk_cols, z_pair_local.shape[-1])
+                )
+                source_chunk[
+                    :valid_rows,
+                    chunk_offset : chunk_offset + overlap_cols,
+                ] = z_pair_local[
+                    :valid_rows,
+                    local_offset : local_offset + overlap_cols,
+                ]
+                projected_chunk = linear(source_chunk)
+                logits_local[
+                    :valid_rows,
+                    local_offset : local_offset + overlap_cols,
+                ] = projected_chunk[
+                    :valid_rows,
+                    chunk_offset : chunk_offset + overlap_cols,
+                ]
+                del projected_chunk, source_chunk
+            return logits_local.contiguous()
+
+        if mesh.layout.numel == 1:
+            return _project_column_chunks()
+        result = run_group_rank_action_synchronized(
+            _project_column_chunks,
+            group=mesh.group_2d,
+            description="distogram chunked local projection",
+        )
+        if result is None:  # pragma: no cover
+            raise RuntimeError("distogram chunked projection returned no result.")
+        return result
 
     side = mesh.layout.shape[1]
     if side == 1:
         z_row_slab = z_pair_local.contiguous()
     else:
         ring = mesh.ring_comm()
-        row_tiles: list[torch.Tensor | None] = [None for _ in range(side)]
-        row_tiles[mesh.coord[1]] = z_pair_local.contiguous()
-        ready = row_tiles[mesh.coord[1]]
-        for step in range(1, side):
-            ready = ring.comm_row.exchange(ready.contiguous())
-            source_col = (mesh.coord[1] + step) % side
-            row_tiles[source_col] = ready
-        if any(item is None for item in row_tiles):
-            raise RuntimeError("failed to collect distogram row slab.")
-        z_row_slab = torch.cat([item for item in row_tiles if item is not None], dim=-2)
-        z_row_slab = z_row_slab.contiguous()
-        del row_tiles
-
-    if mesh.layout.shape[0] == 1:
-        # A 1 x P mesh owns every source row on every rank after the row-ring
-        # collection above.  Crop CP padding before the projection and launch
-        # the exact [N, N, C] operation used by the serial head.  The generic
-        # source-grid launcher preserves logical indexing, but its segmented
-        # GEMM shape can differ from the serial GEMM at P >= 4 by a few ulps.
-        source_pair = z_row_slab[:n_token, :n_token, :].contiguous()
-        logits_row_slab = linear(source_pair)
-        del source_pair
-    else:
-        logits_row_slab = foldcp_pair_row_slab_linear_with_source_launch_policy(
-            linear,
-            z_row_slab,
-            original_n=n_token,
-            row_start=row_start,
-            col_start=0,
-            valid_rows=valid_rows,
-            valid_cols=n_token,
+        z_row_slab = gather_tensor_by_ring(
+            z_pair_local,
+            comm=ring.comm_row,
+            group=mesh.group_row,
+            local_index=mesh.coord[1],
+            side=side,
+            dim=-2,
+            description="distogram row-slab ring",
         )
-    del z_row_slab
-    if keep_full_one_by_p and int(mesh.layout.shape[0]) == 1:
-        return logits_row_slab.contiguous()
 
-    logits_local = logits_row_slab.new_zeros(
-        (z_pair_local.shape[-3], tile_col, logits_row_slab.shape[-1])
+    projection_source = [z_row_slab]
+    z_row_slab = None
+
+    def _project_row_slab() -> torch.Tensor:
+        source_slab = projection_source.pop()
+        if mesh.layout.shape[0] == 1:
+            # A 1 x P mesh owns every source row on every rank after the row-ring
+            # collection above. Crop CP padding before the projection and launch
+            # the exact [N, N, C] operation used by the serial head.
+            source_pair = source_slab[:n_token, :n_token, :].contiguous()
+            del source_slab
+            logits_row_slab = linear(source_pair)
+            del source_pair
+        else:
+            logits_row_slab = foldcp_pair_row_slab_linear_with_source_launch_policy(
+                linear,
+                source_slab,
+                original_n=n_token,
+                row_start=row_start,
+                col_start=0,
+                valid_rows=valid_rows,
+                valid_cols=n_token,
+            )
+            del source_slab
+        if keep_full_one_by_p and int(mesh.layout.shape[0]) == 1:
+            return logits_row_slab.contiguous()
+
+        logits_local = logits_row_slab.new_zeros(
+            (z_pair_local.shape[-3], tile_col, logits_row_slab.shape[-1])
+        )
+        if valid_cols:
+            logits_local[:, :valid_cols, :] = logits_row_slab[
+                :, col_start : col_start + valid_cols, :
+            ]
+        return logits_local.contiguous()
+
+    if mesh.layout.numel == 1:
+        return _project_row_slab()
+    result = run_group_rank_action_synchronized(
+        _project_row_slab,
+        group=mesh.group_2d,
+        description="distogram local row-slab projection",
     )
-    if valid_cols:
-        logits_local[:, :valid_cols, :] = logits_row_slab[
-            :, col_start : col_start + valid_cols, :
-        ]
-    logits_local = logits_local.contiguous()
-    del logits_row_slab
-    return logits_local
+    if result is None:  # pragma: no cover
+        raise RuntimeError("distogram local projection returned no result.")
+    return result
 
 
 def _distogram_bin_tops(
@@ -538,16 +716,42 @@ def distributed_distogram_contact_probs(
 ) -> torch.Tensor | None:
     """Compute contact probabilities from CP-sharded pair activations."""
 
-    contact_local = distogram_contact_probs_local(
-        z_pair_local=z_pair_local,
-        z_pair_spec=z_pair_spec,
-        mesh=mesh,
-        linear=linear,
-        min_bin=min_bin,
-        max_bin=max_bin,
-        no_bins=no_bins,
-        thres=thres,
-    )
+    def _compute_local_contact() -> torch.Tensor:
+        return distogram_contact_probs_local(
+            z_pair_local=z_pair_local,
+            z_pair_spec=z_pair_spec,
+            mesh=mesh,
+            linear=linear,
+            min_bin=min_bin,
+            max_bin=max_bin,
+            no_bins=no_bins,
+            thres=thres,
+        )
+
+    if mesh.layout.numel == 1:
+        contact_local = _compute_local_contact()
+    else:
+        local_contact = None
+        local_error: Exception | None = None
+        try:
+            local_contact = _compute_local_contact()
+        except Exception as exc:
+            local_error = detach_rank_local_error_traceback(exc)
+
+        def _finish_local_contact() -> torch.Tensor:
+            if local_error is not None:
+                raise local_error
+            if local_contact is None:  # pragma: no cover
+                raise RuntimeError("distogram local contact is missing.")
+            return local_contact
+
+        contact_local = run_group_rank_action_synchronized(
+            _finish_local_contact,
+            group=mesh.group_2d,
+            description="distogram local contact computation",
+        )
+        if contact_local is None:  # pragma: no cover
+            raise RuntimeError("distogram local contact returned no result.")
     contact_local_with_channel = contact_local.unsqueeze(dim=-1)
     if gather_to_rank0_only:
         contact = _gather_pair_like_collective_to_rank0(
@@ -571,41 +775,87 @@ def _gather_pair_like_collective_to_rank0(
     spec: FoldCPPairShardSpec,
     mesh: FoldCPProcessMesh,
 ) -> torch.Tensor | None:
-    row_dim, col_dim = spec.pair_dims
-    group_rank = torch.distributed.get_rank(mesh.group_2d)
-    gathered = (
-        [torch.empty_like(local_tensor) for _ in range(mesh.layout.numel)]
-        if group_rank == 0
-        else None
+    def _prepare_gather_buffers() -> tuple[
+        torch.Tensor,
+        list[torch.Tensor] | None,
+        torch.Tensor | None,
+        int,
+        int,
+        int,
+    ]:
+        row_dim, col_dim = spec.pair_dims
+        group_rank = torch.distributed.get_rank(mesh.group_2d)
+        output_shape = list(local_tensor.shape)
+        output_shape[row_dim] = spec.original_shape[row_dim]
+        output_shape[col_dim] = spec.original_shape[col_dim]
+        send_tensor = local_tensor.contiguous()
+        if group_rank != 0:
+            return send_tensor, None, None, row_dim, col_dim, group_rank
+        return (
+            send_tensor,
+            [torch.empty_like(send_tensor) for _ in range(mesh.layout.numel)],
+            local_tensor.new_empty(tuple(output_shape)),
+            row_dim,
+            col_dim,
+            group_rank,
+        )
+
+    prepared_buffers = run_group_rank_action_synchronized(
+        _prepare_gather_buffers,
+        group=mesh.group_2d,
+        description="distogram destination-buffer allocation",
     )
+    if prepared_buffers is None:  # pragma: no cover - every rank runs the action
+        raise RuntimeError("distogram gather buffers were not prepared.")
+    send_tensor, gathered, full, row_dim, col_dim, group_rank = prepared_buffers
     torch.distributed.gather(
-        local_tensor.contiguous(),
+        send_tensor,
         gather_list=gathered,
         dst=mesh.cp_global_ranks[0],
         group=mesh.group_2d,
     )
+    assembly_error = ""
+    if group_rank == 0:
+        try:
+            if gathered is None:
+                raise ValueError(
+                    "gathered shards must be available on the destination rank."
+                )
+            if full is None:
+                raise ValueError(
+                    "full output must be available on the destination rank."
+                )
+            tile_row = local_tensor.shape[row_dim]
+            tile_col = local_tensor.shape[col_dim]
+            for cp_rank, shard in enumerate(gathered):
+                row, col = mesh.layout.to_coord(cp_rank)
+                row_range = (row * tile_row, (row + 1) * tile_row)
+                col_range = (col * tile_col, (col + 1) * tile_col)
+                _copy_pair_shard_into_output(
+                    full,
+                    shard,
+                    spec.pair_dims,
+                    row_range,
+                    col_range,
+                )
+        except Exception as exc:
+            assembly_error = (
+                f"distogram output assembly failed: {type(exc).__name__}: {exc}"
+            )
+
+    def _raise_assembly_error() -> None:
+        if assembly_error:
+            raise RuntimeError(assembly_error)
+
+    run_group_rank_action_synchronized(
+        _raise_assembly_error if group_rank == 0 else None,
+        group=mesh.group_2d,
+        description="distogram output assembly",
+    )
     if group_rank != 0:
         return None
-    if gathered is None:
-        raise ValueError("gathered shards must be available on the destination rank.")
-
-    output_shape = list(local_tensor.shape)
-    output_shape[row_dim] = spec.original_shape[row_dim]
-    output_shape[col_dim] = spec.original_shape[col_dim]
-    full = local_tensor.new_empty(tuple(output_shape))
-    tile_row = local_tensor.shape[row_dim]
-    tile_col = local_tensor.shape[col_dim]
-    for cp_rank, shard in enumerate(gathered):
-        row, col = mesh.layout.to_coord(cp_rank)
-        row_range = (row * tile_row, (row + 1) * tile_row)
-        col_range = (col * tile_col, (col + 1) * tile_col)
-        _copy_pair_shard_into_output(
-            full,
-            shard,
-            spec.pair_dims,
-            row_range,
-            col_range,
-        )
+    if full is None:
+        raise RuntimeError("destination rank returned no distogram output.")
     return full
 
 
@@ -652,24 +902,38 @@ def distributed_distogram_contact_probs_from_full_pair(
     computes local distogram logits/contact, and gathers contact probabilities.
     """
 
-    z_pair_local, z_pair_spec = shard_pair_tensor(z_pair, mesh, pair_dims=(-3, -2))
-    z_pair_t_local = _reciprocal_tile_from_full_pair(
-        z_pair=z_pair,
-        spec=z_pair_spec,
-        reference=z_pair_local,
-    )
-    logits_local = linear(z_pair_local) + linear(z_pair_t_local)
-    del z_pair_t_local
-    probs_local = torch.nn.functional.softmax(logits_local, dim=-1)
-    bin_tops = _distogram_bin_tops(
-        min_bin=min_bin,
-        max_bin=max_bin,
-        no_bins=no_bins,
-        device=logits_local.device,
-        dtype=logits_local.dtype,
-    )
-    contact_local = probs_local[..., bin_tops <= thres].sum(dim=-1).contiguous()
-    del logits_local, probs_local
+    def _compute_local_contact() -> tuple[torch.Tensor, FoldCPPairShardSpec]:
+        z_pair_local, z_pair_spec = shard_pair_tensor(z_pair, mesh, pair_dims=(-3, -2))
+        z_pair_t_local = _reciprocal_tile_from_full_pair(
+            z_pair=z_pair,
+            spec=z_pair_spec,
+            reference=z_pair_local,
+        )
+        logits_local = linear(z_pair_local) + linear(z_pair_t_local)
+        del z_pair_t_local
+        probs_local = torch.nn.functional.softmax(logits_local, dim=-1)
+        bin_tops = _distogram_bin_tops(
+            min_bin=min_bin,
+            max_bin=max_bin,
+            no_bins=no_bins,
+            device=logits_local.device,
+            dtype=logits_local.dtype,
+        )
+        contact_local = probs_local[..., bin_tops <= thres].sum(dim=-1).contiguous()
+        del logits_local, probs_local
+        return contact_local, z_pair_spec
+
+    if mesh.layout.numel == 1:
+        contact_local, z_pair_spec = _compute_local_contact()
+    else:
+        prepared = run_group_rank_action_synchronized(
+            _compute_local_contact,
+            group=mesh.group_2d,
+            description="distogram full-pair local contact computation",
+        )
+        if prepared is None:  # pragma: no cover
+            raise RuntimeError("distogram full-pair local contact returned no result.")
+        contact_local, z_pair_spec = prepared
     contact_local_with_channel = contact_local.unsqueeze(dim=-1)
     if gather_to_rank0_only:
         contact = _gather_pair_like_collective_to_rank0(

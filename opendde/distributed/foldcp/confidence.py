@@ -6,10 +6,18 @@ from __future__ import annotations
 
 import math
 import os
+from collections.abc import Callable
 
 import torch
 import torch.distributed as dist
 
+from opendde.distributed.foldcp.comm import (
+    _append_cuda_cache_cleanup_error,
+    detach_rank_local_error_traceback,
+    exchange_tensor_synchronized,
+    gather_tensor_by_ring,
+    run_group_rank_action_synchronized,
+)
 from opendde.distributed.foldcp.mesh import FoldCPProcessMesh
 from opendde.distributed.foldcp.pair_sharding import (
     FoldCPPairShardSpec,
@@ -22,6 +30,45 @@ from opendde.utils.torch_utils import cdist, disabled_autocast
 
 _CONFIDENCE_TRANSPOSE_CPU_OFFLOAD_MIN_BYTES = 2 * 1024**3
 _CONFIDENCE_CPU_ADD_CHUNK_MAX_BYTES = 256 * 1024**2
+
+
+def _allocate_confidence_stream_output(
+    output_shape: tuple[int, ...],
+    *,
+    dtype: torch.dtype,
+    source_device: torch.device,
+    output_bytes: int,
+    gpu_output_max_bytes: int,
+) -> torch.Tensor:
+    """Allocate rank-0 logits, falling back to CPU only after a real GPU OOM."""
+
+    use_cpu = (
+        source_device.type == "cuda"
+        and gpu_output_max_bytes >= 0
+        and output_bytes > gpu_output_max_bytes
+    )
+    if not use_cpu:
+        try:
+            return torch.empty(output_shape, dtype=dtype, device=source_device)
+        except RuntimeError as exc:
+            is_cuda_oom = source_device.type == "cuda" and (
+                isinstance(exc, torch.OutOfMemoryError)
+                or "out of memory" in str(exc).lower()
+            )
+            if not is_cuda_oom:
+                raise
+        # Leave the except block before allocating the fallback so Python drops
+        # the allocator traceback first. The live gather buffers are retained.
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+        use_cpu = True
+    return torch.empty(
+        output_shape,
+        dtype=dtype,
+        device="cpu" if use_cpu else source_device,
+    )
 
 
 def _confidence_should_offload_transpose_source(
@@ -64,8 +111,14 @@ def _transpose_pair_tile_collective(
 
     if output_device is not None and torch.device(output_device) != z_pair_local.device:
         raise ValueError("CPU-source transpose is only supported for 1xP Fold-CP.")
-    z_pair_t_send = z_pair_local.transpose(-2, -3).contiguous()
-    return mesh.ring_comm().comm_2d_trans.exchange(z_pair_t_send).contiguous()
+    ring = mesh.ring_comm()
+    return exchange_tensor_synchronized(
+        z_pair_local,
+        comm=ring.comm_2d_trans,
+        group=mesh.group_2d,
+        description="confidence reciprocal pair-tile transpose",
+        prepare=lambda tensor: tensor.transpose(-2, -3),
+    ).contiguous()
 
 
 def _add_cpu_pair_source_in_place(
@@ -97,18 +150,15 @@ def _collect_pair_row_slab(
         return z_pair_local.contiguous()
 
     ring = mesh.ring_comm()
-    row_tiles: list[torch.Tensor | None] = [None for _ in range(side)]
-    row_tiles[mesh.coord[1]] = z_pair_local.contiguous()
-    ready = row_tiles[mesh.coord[1]]
-    for step in range(1, side):
-        ready = ring.comm_row.exchange(ready.contiguous())
-        source_col = (mesh.coord[1] + step) % side
-        row_tiles[source_col] = ready
-    if any(item is None for item in row_tiles):
-        raise RuntimeError("failed to collect confidence row slab.")
-    row_slab = torch.cat([item for item in row_tiles if item is not None], dim=-2)
-    del row_tiles
-    return row_slab.contiguous()
+    return gather_tensor_by_ring(
+        z_pair_local,
+        comm=ring.comm_row,
+        group=mesh.group_row,
+        local_index=mesh.coord[1],
+        side=side,
+        dim=-2,
+        description="confidence row-slab ring",
+    )
 
 
 def _linear_pair_row_slab_with_source_grid_launch(
@@ -229,6 +279,9 @@ def _confidence_pair_logits_local_rowslab(
     layer_norm: torch.nn.Module,
     linear: torch.nn.Module,
     add_local: torch.Tensor | None = None,
+    z_row_slab: torch.Tensor | None = None,
+    add_row_slab: torch.Tensor | None = None,
+    stream_projection: bool | None = None,
 ) -> torch.Tensor:
     """Project local confidence logits from a source-layout row slab."""
 
@@ -251,13 +304,15 @@ def _confidence_pair_logits_local_rowslab(
             str(16 * 1024**3),
         )
     )
-    if _confidence_should_stream_projection(
-        mesh_rows=mesh.layout.shape[0],
-        mesh_cols=mesh.layout.shape[1],
-        source_slab_bytes=source_slab_bytes,
-        source_slab_budget=source_slab_budget,
-        deterministic=torch.are_deterministic_algorithms_enabled(),
-    ):
+    if stream_projection is None:
+        stream_projection = _confidence_should_stream_projection(
+            mesh_rows=mesh.layout.shape[0],
+            mesh_cols=mesh.layout.shape[1],
+            source_slab_bytes=source_slab_bytes,
+            source_slab_budget=source_slab_budget,
+            deterministic=torch.are_deterministic_algorithms_enabled(),
+        )
+    if stream_projection:
         chunk_cols = int(os.environ.get("OPENDDE_FOLDCP_CONFIDENCE_COL_CHUNK", "256"))
         if chunk_cols <= 0:
             raise ValueError("Fold-CP confidence column chunk must be positive.")
@@ -305,9 +360,9 @@ def _confidence_pair_logits_local_rowslab(
             del projected_chunk, source_chunk, source_values
         return logits_local.contiguous()
 
-    z_row_slab = _collect_pair_row_slab(z_pair_local, mesh)
-    if add_local is not None:
-        add_row_slab = _collect_pair_row_slab(add_local, mesh)
+    if z_row_slab is None:
+        raise RuntimeError("confidence row-slab projection has no collected source.")
+    if add_row_slab is not None:
         z_row_slab = z_row_slab + add_row_slab
         del add_row_slab
 
@@ -339,7 +394,9 @@ def _confidence_pair_logits_local_rowslab(
             z_launch[:tile_rows] = z_row_slab
         else:
             z_launch = z_row_slab
+        del z_row_slab
         logits_row_slab = linear(layer_norm(z_launch))
+        del z_launch
 
     if (
         logits_row_slab.shape[-3] != tile_rows
@@ -355,9 +412,6 @@ def _confidence_pair_logits_local_rowslab(
             :copy_cols,
         ] = logits_row_slab[:copy_rows, :copy_cols]
         logits_row_slab = logits_padded
-    if not uses_source_grid_launch:
-        del z_row_slab
-
     tile_col = z_pair_local.shape[-2]
     col_start = mesh.coord[1] * tile_col
     col_end = col_start + tile_col
@@ -368,6 +422,96 @@ def _confidence_pair_logits_local_rowslab(
     return logits_local
 
 
+def _confidence_pair_logits_local_rowslab_synchronized(
+    *,
+    z_pair_local: torch.Tensor,
+    z_pair_spec: FoldCPPairShardSpec,
+    mesh: FoldCPProcessMesh,
+    layer_norm: torch.nn.Module,
+    linear: torch.nn.Module,
+    add_local: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Project local logits without nesting collectives in a caught action."""
+
+    def _prepare_projection() -> bool:
+        if z_pair_spec.pair_dims != (0, 1) or z_pair_local.ndim != 3:
+            raise ValueError("confidence pair logits currently expect local z=[T,T,C].")
+        row_dim = z_pair_spec.pair_dims[0]
+        n_token = int(z_pair_spec.original_shape[row_dim])
+        source_slab_bytes = (
+            n_token
+            * n_token
+            * int(z_pair_local.shape[-1])
+            * int(z_pair_local.element_size())
+        )
+        source_slab_budget = int(
+            os.environ.get(
+                "OPENDDE_FOLDCP_CONFIDENCE_SOURCE_SLAB_MAX_BYTES",
+                str(16 * 1024**3),
+            )
+        )
+        mesh_shape = tuple(getattr(mesh.layout, "shape", z_pair_spec.mesh_shape))
+        if mesh_shape != tuple(z_pair_spec.mesh_shape):
+            raise ValueError(
+                "confidence pair spec mesh shape does not match the process mesh."
+            )
+        return _confidence_should_stream_projection(
+            mesh_rows=mesh_shape[0],
+            mesh_cols=mesh_shape[1],
+            source_slab_bytes=source_slab_bytes,
+            source_slab_budget=source_slab_budget,
+            deterministic=torch.are_deterministic_algorithms_enabled(),
+        )
+
+    stream_projection = run_group_rank_action_synchronized(
+        _prepare_projection,
+        group=mesh.group_2d,
+        description="confidence row-slab projection preflight",
+    )
+    if stream_projection is None:  # pragma: no cover
+        raise RuntimeError("confidence row-slab preflight returned no policy.")
+
+    z_row_slab = None
+    add_row_slab = None
+    if not stream_projection:
+        # These helpers own their communication/error handshakes.  They must run
+        # outside the rank-local action below: catching an exception around an
+        # inner collective can leave healthy peers blocked inside that collective.
+        z_row_slab = _collect_pair_row_slab(z_pair_local, mesh)
+        if add_local is not None:
+            add_row_slab = _collect_pair_row_slab(add_local, mesh)
+
+    projection_sources = [z_row_slab, add_row_slab]
+    z_row_slab = add_row_slab = None
+
+    def _project_local_rowslab() -> torch.Tensor:
+        projection_z, projection_add = projection_sources
+        projection_sources.clear()
+        if projection_add is not None:
+            projection_z = projection_z + projection_add
+            del projection_add
+        return _confidence_pair_logits_local_rowslab(
+            z_pair_local=z_pair_local,
+            z_pair_spec=z_pair_spec,
+            mesh=mesh,
+            layer_norm=layer_norm,
+            linear=linear,
+            add_local=add_local,
+            z_row_slab=projection_z,
+            add_row_slab=None,
+            stream_projection=stream_projection,
+        )
+
+    result = run_group_rank_action_synchronized(
+        _project_local_rowslab,
+        group=mesh.group_2d,
+        description="confidence local row-slab projection",
+    )
+    if result is None:  # pragma: no cover
+        raise RuntimeError("confidence local row-slab projection returned no logits.")
+    return result
+
+
 def _gather_pair_logit_chunk_to_rank0(
     *,
     full_output: torch.Tensor | None,
@@ -376,16 +520,12 @@ def _gather_pair_logit_chunk_to_rank0(
     mesh: FoldCPProcessMesh,
     row_start: int,
     row_end: int,
+    gathered: list[torch.Tensor] | None,
+    prior_copy_error: str = "",
     dst_group_rank: int = 0,
-) -> None:
+) -> str:
     group = mesh.group_2d
     group_rank = dist.get_rank(group)
-    local_chunk = local_chunk.contiguous()
-    gathered = (
-        [torch.empty_like(local_chunk) for _ in range(mesh.layout.numel)]
-        if group_rank == dst_group_rank
-        else None
-    )
     dist.gather(
         local_chunk,
         gather_list=gathered,
@@ -394,31 +534,47 @@ def _gather_pair_logit_chunk_to_rank0(
     )
 
     if group_rank != dst_group_rank:
-        return
+        return prior_copy_error
+    if prior_copy_error:
+        return prior_copy_error
 
-    if full_output is None:
-        raise ValueError("full_output must be allocated on the destination rank.")
-    if gathered is None:
-        raise ValueError("gathered shards must be available on the destination rank.")
+    try:
+        if full_output is None:
+            raise ValueError("full_output must be allocated on the destination rank.")
+        if gathered is None:
+            raise ValueError(
+                "gathered shards must be available on the destination rank."
+            )
 
-    row_dim, col_dim = z_pair_spec.pair_dims
-    tile_row = z_pair_spec.local_shape[row_dim]
-    tile_col = z_pair_spec.local_shape[col_dim]
-    for cp_rank in range(mesh.layout.numel):
-        row, col = mesh.layout.to_coord(cp_rank)
-        target_row_range = (row * tile_row + row_start, row * tile_row + row_end)
-        target_col_range = (col * tile_col, (col + 1) * tile_col)
-        output_shard = gathered[cp_rank]
-        if output_shard.device != full_output.device:
-            output_shard = output_shard.to(device=full_output.device)
-        _copy_pair_shard_into_output(
-            full_output,
-            output_shard,
-            z_pair_spec.pair_dims,
-            target_row_range,
-            target_col_range,
+        row_dim, col_dim = z_pair_spec.pair_dims
+        tile_row = z_pair_spec.local_shape[row_dim]
+        tile_col = z_pair_spec.local_shape[col_dim]
+        for cp_rank in range(mesh.layout.numel):
+            row, col = mesh.layout.to_coord(cp_rank)
+            target_row_range = (row * tile_row + row_start, row * tile_row + row_end)
+            target_col_range = (col * tile_col, (col + 1) * tile_col)
+            output_shard = gathered[cp_rank]
+            if output_shard.device != full_output.device:
+                output_shard = output_shard.to(device=full_output.device)
+            _copy_pair_shard_into_output(
+                full_output,
+                output_shard,
+                z_pair_spec.pair_dims,
+                target_row_range,
+                target_col_range,
+            )
+            del output_shard
+    except Exception as exc:
+        error = (
+            f"group rank {group_rank} confidence output assembly failed: "
+            f"{type(exc).__name__}: {exc}"
         )
-        del output_shard
+        detach_rank_local_error_traceback(exc)
+        return _append_cuda_cache_cleanup_error(
+            error,
+            attempt=local_chunk.device.type == "cuda",
+        )
+    return ""
 
 
 def _stream_pair_logits_to_rank0(
@@ -429,6 +585,7 @@ def _stream_pair_logits_to_rank0(
     layer_norm: torch.nn.Module,
     linear: torch.nn.Module,
     add_local: torch.Tensor | None = None,
+    output_device: torch.device | None = None,
 ) -> torch.Tensor | None:
     """Compute confidence pair logits with source row-slab projection layout.
 
@@ -440,11 +597,7 @@ def _stream_pair_logits_to_rank0(
     column tile and gathers the public logits on rank 0.
     """
 
-    row_dim, col_dim = z_pair_spec.pair_dims
-    if row_dim != 0 or col_dim != 1 or z_pair_local.ndim != 3:
-        raise ValueError("confidence pair logits currently expect local z=[T,T,C].")
-
-    logits_local = _confidence_pair_logits_local_rowslab(
+    logits_local = _confidence_pair_logits_local_rowslab_synchronized(
         z_pair_local=z_pair_local,
         z_pair_spec=z_pair_spec,
         mesh=mesh,
@@ -453,41 +606,120 @@ def _stream_pair_logits_to_rank0(
         add_local=add_local,
     )
 
-    output_dim = int(linear.weight.shape[0])
-    full_output = None
-    if dist.get_rank(mesh.group_2d) == 0:
-        output_shape = list(z_pair_spec.original_shape)
-        output_shape[-1] = output_dim
-        output_bytes = math.prod(output_shape) * int(z_pair_local.element_size())
-        gpu_output_max_bytes = int(
-            os.environ.get(
-                "OPENDDE_FOLDCP_CONFIDENCE_GPU_OUTPUT_MAX_BYTES",
-                str(2 * 1024**3),
+    def _allocate_stream_buffers() -> tuple[
+        torch.Tensor,
+        list[torch.Tensor] | None,
+        torch.Tensor | None,
+        int,
+        int,
+    ]:
+        output_dim = int(linear.weight.shape[0])
+        group_rank = dist.get_rank(mesh.group_2d)
+        gather_row_chunk = min(128, max(1, z_pair_local.shape[0]))
+        fixed_chunk_shape = (
+            gather_row_chunk,
+            *z_pair_local.shape[1:-1],
+            output_dim,
+        )
+        pad_buffer = z_pair_local.new_empty(fixed_chunk_shape)
+        gathered_buffers = (
+            [torch.empty_like(pad_buffer) for _ in range(mesh.layout.numel)]
+            if group_rank == 0
+            else None
+        )
+        full_output = None
+        if group_rank == 0:
+            output_shape = list(z_pair_spec.original_shape)
+            output_shape[-1] = output_dim
+            output_bytes = math.prod(output_shape) * int(z_pair_local.element_size())
+            requested_output_device = (
+                z_pair_local.device
+                if output_device is None
+                else torch.device(output_device)
             )
-        )
-        spill_to_cpu = (
-            z_pair_local.is_cuda
-            and gpu_output_max_bytes >= 0
-            and output_bytes > gpu_output_max_bytes
-        )
-        full_output = torch.empty(
-            tuple(output_shape),
-            dtype=z_pair_local.dtype,
-            device="cpu" if spill_to_cpu else z_pair_local.device,
+            if requested_output_device.type == "cpu":
+                full_output = torch.empty(
+                    tuple(output_shape),
+                    dtype=z_pair_local.dtype,
+                    device="cpu",
+                )
+            else:
+                gpu_output_max_bytes = int(
+                    os.environ.get(
+                        "OPENDDE_FOLDCP_CONFIDENCE_GPU_OUTPUT_MAX_BYTES",
+                        str(2 * 1024**3),
+                    )
+                )
+                full_output = _allocate_confidence_stream_output(
+                    tuple(output_shape),
+                    dtype=z_pair_local.dtype,
+                    source_device=requested_output_device,
+                    output_bytes=output_bytes,
+                    gpu_output_max_bytes=gpu_output_max_bytes,
+                )
+        return (
+            pad_buffer,
+            gathered_buffers,
+            full_output,
+            group_rank,
+            gather_row_chunk,
         )
 
-    gather_row_chunk = min(128, max(1, z_pair_local.shape[0]))
+    stream_buffers = run_group_rank_action_synchronized(
+        _allocate_stream_buffers,
+        group=mesh.group_2d,
+        description="confidence stream-buffer allocation",
+    )
+    if stream_buffers is None:
+        raise RuntimeError("confidence stream buffers were not allocated.")
+    (
+        pad_buffer,
+        gathered_buffers,
+        full_output,
+        group_rank,
+        gather_row_chunk,
+    ) = stream_buffers
+
+    copy_error = ""
     for row_start in range(0, z_pair_local.shape[0], gather_row_chunk):
         row_end = min(row_start + gather_row_chunk, z_pair_local.shape[0])
-        _gather_pair_logit_chunk_to_rank0(
+        local_chunk = logits_local[row_start:row_end]
+        needs_staging = (
+            tuple(local_chunk.shape) != tuple(pad_buffer.shape)
+            or not local_chunk.is_contiguous()
+        )
+        if needs_staging:
+            try:
+                pad_buffer.zero_()
+                pad_buffer[: row_end - row_start].copy_(local_chunk)
+            except Exception as exc:
+                if not copy_error:
+                    copy_error = (
+                        "confidence local gather-chunk preparation failed: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+            local_chunk = pad_buffer
+        copy_error = _gather_pair_logit_chunk_to_rank0(
             full_output=full_output,
-            local_chunk=logits_local[row_start:row_end],
+            local_chunk=local_chunk,
             z_pair_spec=z_pair_spec,
             mesh=mesh,
             row_start=row_start,
             row_end=row_end,
+            gathered=gathered_buffers,
+            prior_copy_error=copy_error,
         )
-    del logits_local
+    del logits_local, pad_buffer, gathered_buffers
+
+    def _raise_copy_error() -> None:
+        if copy_error:
+            raise RuntimeError(copy_error)
+
+    run_group_rank_action_synchronized(
+        _raise_copy_error,
+        group=mesh.group_2d,
+        description="confidence output assembly",
+    )
 
     if full_output is None:
         return None
@@ -506,6 +738,8 @@ def distributed_confidence_pair_logits(
     compute_pae: bool = True,
     compute_pde: bool = True,
     gather_to_rank0_only: bool = False,
+    output_device: torch.device | None = None,
+    release_pair_source: Callable[[], None] | None = None,
 ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
     """Compute confidence pair logits from CP-sharded pair activations.
 
@@ -525,9 +759,10 @@ def distributed_confidence_pair_logits(
                 mesh=mesh,
                 layer_norm=pae_ln,
                 linear=pae_linear,
+                output_device=output_device,
             )
         else:
-            pae_local = _confidence_pair_logits_local_rowslab(
+            pae_local = _confidence_pair_logits_local_rowslab_synchronized(
                 z_pair_local=z_pair_local,
                 z_pair_spec=z_pair_spec,
                 mesh=mesh,
@@ -544,27 +779,66 @@ def distributed_confidence_pair_logits(
         )
         if offload_transpose_source:
             output_device = z_pair_local.device
-            z_pair_cpu = z_pair_local.cpu()
+            z_pair_cpu = run_group_rank_action_synchronized(
+                z_pair_local.cpu,
+                group=mesh.group_2d,
+                description="confidence transpose-source CPU offload",
+            )
+            if z_pair_cpu is None:  # pragma: no cover
+                raise RuntimeError("confidence transpose source was not offloaded.")
+            if release_pair_source is not None:
+                release_pair_source()
             del z_pair_local
-            torch.cuda.empty_cache()
+            run_group_rank_action_synchronized(
+                torch.cuda.empty_cache,
+                group=mesh.group_2d,
+                description="confidence post-offload allocator cleanup",
+            )
             z_pair_t_local = _transpose_pair_tile_collective(
                 z_pair_cpu,
                 mesh,
                 output_device=output_device,
             )
-            _add_cpu_pair_source_in_place(z_pair_t_local, z_pair_cpu)
+            updated_pair = run_group_rank_action_synchronized(
+                lambda: (
+                    _add_cpu_pair_source_in_place(
+                        z_pair_t_local,
+                        z_pair_cpu,
+                    )
+                    or z_pair_t_local
+                ),
+                group=mesh.group_2d,
+                description="confidence CPU pair-source addition",
+            )
+            if updated_pair is None:  # pragma: no cover
+                raise RuntimeError("confidence CPU pair source was not added.")
             del z_pair_cpu
-            z_pair_local = z_pair_t_local
+            z_pair_local = updated_pair
             del z_pair_t_local
-            torch.cuda.empty_cache()
+            run_group_rank_action_synchronized(
+                torch.cuda.empty_cache,
+                group=mesh.group_2d,
+                description="confidence post-CPU-add allocator cleanup",
+            )
         else:
             z_pair_t_local = _transpose_pair_tile_collective(z_pair_local, mesh)
         reuse_pair_storage = reuse_pair_storage and not offload_transpose_source
         if reuse_pair_storage:
-            z_pair_local.add_(z_pair_t_local)
+            updated_pair = run_group_rank_action_synchronized(
+                lambda: z_pair_local.add_(z_pair_t_local),
+                group=mesh.group_2d,
+                description="confidence reciprocal pair addition",
+            )
+            if updated_pair is None:  # pragma: no cover
+                raise RuntimeError("confidence reciprocal pair was not added.")
+            z_pair_local = updated_pair
             del z_pair_t_local
             if z_pair_local.is_cuda:
-                torch.cuda.empty_cache()
+                run_group_rank_action_synchronized(
+                    torch.cuda.empty_cache,
+                    group=mesh.group_2d,
+                    description="confidence post-reciprocal-add allocator cleanup",
+                )
         if gather_to_rank0_only:
             pde_pred = _stream_pair_logits_to_rank0(
                 z_pair_local=z_pair_local,
@@ -577,9 +851,10 @@ def distributed_confidence_pair_logits(
                     if reuse_pair_storage or offload_transpose_source
                     else z_pair_t_local
                 ),
+                output_device=output_device,
             )
         else:
-            pde_local = _confidence_pair_logits_local_rowslab(
+            pde_local = _confidence_pair_logits_local_rowslab_synchronized(
                 z_pair_local=z_pair_local,
                 z_pair_spec=z_pair_spec,
                 mesh=mesh,

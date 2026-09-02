@@ -34,6 +34,22 @@ def merge_per_sample_confidence_scores(
     return traverse_and_aggregate(summary_confidence_list, aggregation_func=stack_score)
 
 
+def _offload_confidence_tree_to_cpu(value: Any) -> Any:
+    """Release per-sample CUDA confidence outputs before the next sample."""
+
+    if isinstance(value, torch.Tensor):
+        return value.detach().to(device="cpu")
+    if isinstance(value, dict):
+        return {
+            key: _offload_confidence_tree_to_cpu(item) for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_offload_confidence_tree_to_cpu(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_offload_confidence_tree_to_cpu(item) for item in value)
+    return value
+
+
 def _compute_full_data_and_summary(
     configs: OpenDDEConfig,
     pae_logits: torch.Tensor,
@@ -854,6 +870,18 @@ def compute_full_data_and_summary(
     """Wrapper of `_compute_full_data_and_summary` by enumerating over N samples"""
 
     N_sample = pae_logits.size(0)
+    compute_device = plddt_logits.device
+    token_asym_id = token_asym_id.to(device=compute_device)
+    token_has_frame = token_has_frame.to(device=compute_device)
+    atom_coordinate = atom_coordinate.to(device=compute_device)
+    atom_to_token_idx = atom_to_token_idx.to(device=compute_device)
+    atom_is_polymer = atom_is_polymer.to(device=compute_device)
+    if interested_atom_mask is not None:
+        interested_atom_mask = interested_atom_mask.to(device=compute_device)
+    if mol_id is not None:
+        mol_id = mol_id.to(device=compute_device)
+    if elements_one_hot is not None:
+        elements_one_hot = elements_one_hot.to(device=compute_device)
     if contact_probs.dim() == 2:
         # Convert to [N_sample, N_token, N_token]
         contact_probs = contact_probs.unsqueeze(dim=0).expand(N_sample, -1, -1)
@@ -868,10 +896,10 @@ def compute_full_data_and_summary(
     for i in range(N_sample):
         summary_confidence_i, full_data_i = _compute_full_data_and_summary(
             configs=configs,
-            pae_logits=pae_logits[i : i + 1],
+            pae_logits=pae_logits[i : i + 1].to(device=compute_device),
             plddt_logits=plddt_logits[i : i + 1],
-            pde_logits=pde_logits[i : i + 1],
-            contact_probs=contact_probs[i],
+            pde_logits=pde_logits[i : i + 1].to(device=compute_device),
+            contact_probs=contact_probs[i].to(device=compute_device),
             token_asym_id=token_asym_id,
             token_has_frame=token_has_frame,
             atom_coordinate=atom_coordinate[i : i + 1],
@@ -883,6 +911,11 @@ def compute_full_data_and_summary(
             mol_id=mol_id,
             elements_one_hot=elements_one_hot,
         )
+        # ``return_full_data`` retains O(N_token^2) PAE/PDE/contact maps for
+        # every sample.  Move each completed tree off CUDA before evaluating
+        # the next sample instead of waiting for the outer model return path.
+        summary_confidence_i = _offload_confidence_tree_to_cpu(summary_confidence_i)
+        full_data_i = _offload_confidence_tree_to_cpu(full_data_i)
         summary_confidence.extend(summary_confidence_i)
         full_data.extend(full_data_i)
     return summary_confidence, full_data

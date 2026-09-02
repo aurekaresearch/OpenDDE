@@ -14,7 +14,8 @@ environment, and raw measurements from the same run.
   `--foldcp_size_dp * --foldcp_size_cp`.
 - Multi-GPU Fold-CP uses
   `--trimul_kernel torch --triatt_kernel torch`; cuEquivariance triangle
-  kernels are not supported in this mode.
+  kernels are not supported in this mode. Distributed `auto` resolves to
+  `torch`; an explicit cuEquivariance request is rejected before model loading.
 - On CUDA BF16, distributed triangle attention uses Triton 3.3.1 from the GPU
   install extra to fuse attention-bias addition. This is part of the Fold-CP
   PyTorch execution path, not cuEquivariance.

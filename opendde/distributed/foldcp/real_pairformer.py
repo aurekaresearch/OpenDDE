@@ -13,6 +13,12 @@ from typing import Iterator
 import torch
 import torch.distributed as dist
 
+from opendde.distributed.foldcp.comm import (
+    detach_rank_local_error_traceback,
+    exchange_tensor_synchronized,
+    gather_tensor_by_ring,
+    run_group_rank_action_synchronized,
+)
 from opendde.distributed.foldcp.mesh import FoldCPProcessMesh
 from opendde.distributed.foldcp.layout import FoldCP2DLayout
 from opendde.distributed.foldcp.launch import (
@@ -641,73 +647,177 @@ def _ring_gather_by_row(
     if side == 1:
         out = local_tensor
     elif mesh.layout.shape[0] == 1 and side >= 3:
-        dim = dim if dim >= 0 else local_tensor.ndim + dim
-        local_width = int(local_tensor.shape[dim])
-        padded_length = side * local_width
-        output_length = padded_length if length is None else int(length)
-        if output_length < 0 or output_length > padded_length:
-            raise ValueError(
-                f"row gather length must be in [0, {padded_length}], "
-                f"got {output_length}"
+
+        def _allocate_all_gather() -> tuple[torch.Tensor, torch.Tensor, int, int]:
+            normalized_dim = dim if dim >= 0 else local_tensor.ndim + dim
+            local_width = int(local_tensor.shape[normalized_dim])
+            padded_length = side * local_width
+            output_length = padded_length if length is None else int(length)
+            if output_length < 0 or output_length > padded_length:
+                raise ValueError(
+                    f"row gather length must be in [0, {padded_length}], "
+                    f"got {output_length}"
+                )
+            source = local_tensor.movedim(normalized_dim, 0).contiguous()
+            return (
+                source,
+                source.new_empty((padded_length,) + tuple(source.shape[1:])),
+                normalized_dim,
+                output_length,
             )
-        source = local_tensor.movedim(dim, 0).contiguous()
-        gathered = source.new_empty((padded_length,) + tuple(source.shape[1:]))
+
+        buffers = run_group_rank_action_synchronized(
+            _allocate_all_gather,
+            group=mesh.group_row,
+            description="Pairformer row all-gather allocation",
+        )
+        if buffers is None:  # pragma: no cover - action always runs on every rank
+            raise RuntimeError("Pairformer row all-gather returned no buffers.")
+        source, gathered, dim, output_length = buffers
+        del buffers
         dist.all_gather_into_tensor(
             gathered,
             source,
             group=mesh.group_row,
         )
-        out = gathered.narrow(0, 0, output_length).movedim(0, dim)
-        return out.contiguous()
+        del source
+
+        result = run_group_rank_action_synchronized(
+            lambda: gathered.narrow(0, 0, output_length).movedim(0, dim).contiguous(),
+            group=mesh.group_row,
+            description="Pairformer row all-gather assembly",
+        )
+        if result is None:  # pragma: no cover - action always runs on every rank
+            raise RuntimeError("Pairformer row all-gather returned no result.")
+        return result
     else:
-        dim = dim if dim >= 0 else local_tensor.ndim + dim
-        local_width = int(local_tensor.shape[dim])
-        padded_length = side * local_width
-        output_length = padded_length if length is None else int(length)
-        if output_length < 0 or output_length > padded_length:
-            raise ValueError(
-                f"row gather length must be in [0, {padded_length}], "
-                f"got {output_length}"
+
+        def _prepare_row_ring() -> tuple[
+            bool,
+            int,
+            int,
+            int,
+            torch.Tensor | None,
+            torch.Tensor,
+            tuple[torch.Tensor, ...],
+        ]:
+            normalized_dim = dim if dim >= 0 else local_tensor.ndim + dim
+            local_width = int(local_tensor.shape[normalized_dim])
+            padded_length = side * local_width
+            output_length = padded_length if length is None else int(length)
+            if output_length < 0 or output_length > padded_length:
+                raise ValueError(
+                    f"row gather length must be in [0, {padded_length}], "
+                    f"got {output_length}"
+                )
+            direct = _ring_gather_should_preallocate(
+                local_tensor,
+                side,
+                normalized_dim,
+                length,
             )
-        if not _ring_gather_should_preallocate(
-            local_tensor,
-            side,
-            dim,
-            length,
-        ):
+            local_block = local_tensor.contiguous()
+            if not direct:
+                return (
+                    False,
+                    normalized_dim,
+                    local_width,
+                    output_length,
+                    None,
+                    local_block,
+                    tuple(torch.empty_like(local_block) for _ in range(side - 1)),
+                )
+            out_shape = list(local_tensor.shape)
+            out_shape[normalized_dim] = output_length
+            return (
+                True,
+                normalized_dim,
+                local_width,
+                output_length,
+                local_tensor.new_empty(out_shape),
+                local_block,
+                tuple(torch.empty_like(local_block) for _ in range(min(2, side - 1))),
+            )
+
+        prepared = run_group_rank_action_synchronized(
+            _prepare_row_ring,
+            group=mesh.group_row,
+            description="Pairformer row-ring preparation",
+        )
+        if prepared is None:  # pragma: no cover
+            raise RuntimeError("Pairformer row ring returned no state.")
+        direct, dim, local_width, output_length, out, local_block, recv_blocks = (
+            prepared
+        )
+        if not direct:
             ring = mesh.ring_comm()
             gathered: list[torch.Tensor | None] = [None for _ in range(side)]
-            gathered[mesh.coord[1]] = local_tensor.contiguous()
-            ready = gathered[mesh.coord[1]]
+            gathered[mesh.coord[1]] = local_block
+            ready = local_block
             for step in range(1, side):
-                ready = ring.comm_row.exchange(ready.contiguous())
+                ready = ring.comm_row.exchange(
+                    ready,
+                    to_recv=recv_blocks[step - 1],
+                )
                 source_col = (mesh.coord[1] + step) % side
                 gathered[source_col] = ready
-            if any(item is None for item in gathered):
-                raise RuntimeError("failed to gather row ring blocks.")
-            out = torch.cat(
-                [item for item in gathered if item is not None],
-                dim=dim,
+
+            def _assemble_ring_blocks() -> torch.Tensor:
+                if any(item is None for item in gathered):
+                    raise RuntimeError("failed to gather row ring blocks.")
+                out = torch.cat(
+                    [item for item in gathered if item is not None],
+                    dim=dim,
+                )
+                if length is not None:
+                    out = out.narrow(dim, 0, length)
+                return out.contiguous()
+
+            result = run_group_rank_action_synchronized(
+                _assemble_ring_blocks,
+                group=mesh.group_row,
+                description="Pairformer row ring assembly",
             )
-            if length is not None:
-                out = out.narrow(dim, 0, length)
-            return out.contiguous()
-        out_shape = list(local_tensor.shape)
-        out_shape[dim] = output_length
-        out = local_tensor.new_empty(out_shape)
+            if result is None:  # pragma: no cover
+                raise RuntimeError("Pairformer row ring returned no result.")
+            return result
+
+        if out is None:  # pragma: no cover - direct preparation always allocates it
+            raise RuntimeError("Pairformer direct row ring returned no output.")
+        ready = local_block
+        recv_buffers = recv_blocks
         ring = mesh.ring_comm()
-        ready = local_tensor.contiguous()
+        assembly_error: Exception | None = None
         for step in range(side):
             source_col = (mesh.coord[1] + step) % side
             output_start = source_col * local_width
             output_end = min(output_start + local_width, output_length)
-            if output_start < output_end:
-                out.narrow(dim, output_start, output_end - output_start).copy_(
-                    ready.narrow(dim, 0, output_end - output_start)
-                )
+            if output_start < output_end and assembly_error is None:
+                try:
+                    out.narrow(dim, output_start, output_end - output_start).copy_(
+                        ready.narrow(dim, 0, output_end - output_start)
+                    )
+                except Exception as exc:
+                    assembly_error = detach_rank_local_error_traceback(exc)
             if step + 1 < side:
-                ready = ring.comm_row.exchange(ready.contiguous())
-        return out
+                ready = ring.comm_row.exchange(
+                    ready,
+                    to_recv=recv_buffers[step % len(recv_buffers)],
+                )
+
+        def _finish_direct_ring() -> torch.Tensor:
+            if assembly_error is not None:
+                raise assembly_error
+            return out
+
+        result = run_group_rank_action_synchronized(
+            _finish_direct_ring,
+            group=mesh.group_row,
+            description="Pairformer direct row-ring assembly",
+        )
+        if result is None:  # pragma: no cover
+            raise RuntimeError("Pairformer direct row ring returned no result.")
+        return result
     if length is not None:
         dim = dim if dim >= 0 else out.ndim + dim
         out = out.narrow(dim, 0, length)
@@ -736,58 +846,155 @@ def _ring_gather_pair_matmul_lhs(
     n_rows = int(local_tensor.shape[-3])
     channels = int(local_tensor.shape[-1])
     out_shape = (channels, length, n_rows) if incoming else (channels, n_rows, length)
-    out = local_tensor.new_empty(out_shape)
     ring = mesh.ring_comm()
     local_tensor_bytes = int(local_tensor.numel()) * int(local_tensor.element_size())
+    if side == 1:
+        out = local_tensor.new_empty(out_shape)
+        ready = local_tensor.contiguous()
+        output_end = min(local_width, length)
+        if output_end > 0:
+            if incoming:
+                out[:, :output_end, :].copy_(
+                    ready.squeeze(0).permute(2, 1, 0)[:, :output_end, :]
+                )
+            else:
+                out[:, :, :output_end].copy_(
+                    ready.squeeze(0).permute(2, 0, 1)[:, :, :output_end]
+                )
+        return out
+
+    recv_count = min(2, side - 1)
     if local_tensor_bytes > _ONE_BY_P_TRIMUL_LHS_RING_MAX_BYTES:
         row_bytes = local_width * channels * int(local_tensor.element_size())
         row_chunk = max(
             1,
             _ONE_BY_P_TRIMUL_LHS_RING_ROW_BUFFER_BYTES // max(1, row_bytes),
         )
+
+        def _allocate_chunked_ring() -> tuple[
+            torch.Tensor, torch.Tensor, tuple[torch.Tensor, ...]
+        ]:
+            buffer_shape = list(local_tensor.shape)
+            buffer_shape[-3] = min(row_chunk, n_rows)
+            send_buffer = local_tensor.new_empty(buffer_shape)
+            return (
+                local_tensor.new_empty(out_shape),
+                send_buffer,
+                tuple(torch.empty_like(send_buffer) for _ in range(recv_count)),
+            )
+
+        buffers = run_group_rank_action_synchronized(
+            _allocate_chunked_ring,
+            group=mesh.group_row,
+            description="Pairformer chunked BMM-LHS ring allocation",
+        )
+        if buffers is None:  # pragma: no cover
+            raise RuntimeError("Pairformer chunked BMM-LHS ring returned no buffers.")
+        out, send_buffer, recv_buffers = buffers
+        assembly_error: Exception | None = None
         for row_start in range(0, n_rows, row_chunk):
             row_end = min(row_start + row_chunk, n_rows)
-            ready = local_tensor[..., row_start:row_end, :, :].contiguous()
+            chunk_rows = row_end - row_start
+            ready = send_buffer[..., :chunk_rows, :, :]
+            if assembly_error is None:
+                try:
+                    ready.copy_(local_tensor[..., row_start:row_end, :, :])
+                except Exception as exc:
+                    assembly_error = detach_rank_local_error_traceback(exc)
             for step in range(side):
                 source_col = (int(mesh.coord[1]) + step) % side
                 output_start = source_col * local_width
                 output_end = min(output_start + local_width, length)
-                if output_start < output_end:
-                    width = output_end - output_start
-                    if incoming:
-                        out[
-                            :,
-                            output_start:output_end,
-                            row_start:row_end,
-                        ].copy_(ready.squeeze(0).permute(2, 1, 0)[:, :width, :])
-                    else:
-                        out[
-                            :,
-                            row_start:row_end,
-                            output_start:output_end,
-                        ].copy_(ready.squeeze(0).permute(2, 0, 1)[:, :, :width])
+                if output_start < output_end and assembly_error is None:
+                    try:
+                        width = output_end - output_start
+                        if incoming:
+                            out[
+                                :,
+                                output_start:output_end,
+                                row_start:row_end,
+                            ].copy_(ready.squeeze(0).permute(2, 1, 0)[:, :width, :])
+                        else:
+                            out[
+                                :,
+                                row_start:row_end,
+                                output_start:output_end,
+                            ].copy_(ready.squeeze(0).permute(2, 0, 1)[:, :, :width])
+                    except Exception as exc:
+                        assembly_error = detach_rank_local_error_traceback(exc)
                 if step + 1 < side:
-                    ready = ring.comm_row.exchange(ready.contiguous())
-        return out
+                    recv = recv_buffers[step % recv_count][..., :chunk_rows, :, :]
+                    ready = ring.comm_row.exchange(ready, to_recv=recv)
 
-    ready = local_tensor.contiguous()
+        def _finish_chunked_ring() -> torch.Tensor:
+            if assembly_error is not None:
+                raise assembly_error
+            return out
+
+        result = run_group_rank_action_synchronized(
+            _finish_chunked_ring,
+            group=mesh.group_row,
+            description="Pairformer chunked BMM-LHS ring assembly",
+        )
+        if result is None:  # pragma: no cover
+            raise RuntimeError("Pairformer chunked BMM-LHS ring returned no result.")
+        return result
+
+    def _allocate_full_ring() -> tuple[
+        torch.Tensor, torch.Tensor, tuple[torch.Tensor, ...]
+    ]:
+        local_block = local_tensor.contiguous()
+        return (
+            local_tensor.new_empty(out_shape),
+            local_block,
+            tuple(torch.empty_like(local_block) for _ in range(recv_count)),
+        )
+
+    buffers = run_group_rank_action_synchronized(
+        _allocate_full_ring,
+        group=mesh.group_row,
+        description="Pairformer BMM-LHS ring allocation",
+    )
+    if buffers is None:  # pragma: no cover
+        raise RuntimeError("Pairformer BMM-LHS ring returned no buffers.")
+    out, ready, recv_buffers = buffers
+    assembly_error: Exception | None = None
     for step in range(side):
         source_col = (int(mesh.coord[1]) + step) % side
         output_start = source_col * local_width
         output_end = min(output_start + local_width, length)
-        if output_start < output_end:
-            width = output_end - output_start
-            if incoming:
-                out[:, output_start:output_end, :].copy_(
-                    ready.squeeze(0).permute(2, 1, 0)[:, :width, :]
-                )
-            else:
-                out[:, :, output_start:output_end].copy_(
-                    ready.squeeze(0).permute(2, 0, 1)[:, :, :width]
-                )
+        if output_start < output_end and assembly_error is None:
+            try:
+                width = output_end - output_start
+                if incoming:
+                    out[:, output_start:output_end, :].copy_(
+                        ready.squeeze(0).permute(2, 1, 0)[:, :width, :]
+                    )
+                else:
+                    out[:, :, output_start:output_end].copy_(
+                        ready.squeeze(0).permute(2, 0, 1)[:, :, :width]
+                    )
+            except Exception as exc:
+                assembly_error = detach_rank_local_error_traceback(exc)
         if step + 1 < side:
-            ready = ring.comm_row.exchange(ready.contiguous())
-    return out
+            ready = ring.comm_row.exchange(
+                ready,
+                to_recv=recv_buffers[step % recv_count],
+            )
+
+    def _finish_full_ring() -> torch.Tensor:
+        if assembly_error is not None:
+            raise assembly_error
+        return out
+
+    result = run_group_rank_action_synchronized(
+        _finish_full_ring,
+        group=mesh.group_row,
+        description="Pairformer BMM-LHS ring assembly",
+    )
+    if result is None:  # pragma: no cover
+        raise RuntimeError("Pairformer BMM-LHS ring returned no result.")
+    return result
 
 
 def _one_by_p_local_source_column_chunk(
@@ -831,14 +1038,24 @@ def _one_by_p_gather_source_columns_by_row(
 ) -> torch.Tensor:
     """Reconstruct one P-independent source-column chunk on every row rank."""
 
-    chunk = _one_by_p_local_source_column_chunk(
-        local_tensor,
-        z_spec,
-        source_start,
-        source_end,
+    if mesh.layout.shape[1] == 1:
+        return _one_by_p_local_source_column_chunk(
+            local_tensor,
+            z_spec,
+            source_start,
+            source_end,
+        )
+
+    chunk = run_group_rank_action_synchronized(
+        lambda: _one_by_p_local_source_column_chunk(
+            local_tensor, z_spec, source_start, source_end
+        ),
+        group=mesh.group_row,
+        description="Pairformer source-column reduction allocation",
     )
-    if mesh.layout.shape[1] > 1:
-        dist.all_reduce(chunk, op=dist.ReduceOp.SUM, group=mesh.group_row)
+    if chunk is None:  # pragma: no cover - action always runs on every rank
+        raise RuntimeError("Pairformer source-column reduction returned no chunk.")
+    dist.all_reduce(chunk, op=dist.ReduceOp.SUM, group=mesh.group_row)
     return chunk
 
 
@@ -849,37 +1066,62 @@ def _one_by_p_transpose_columns_to_owned_rows(
 ) -> torch.Tensor:
     """Redistribute a column shard into this rank's rows with one all-to-all."""
 
-    if local_tensor.ndim != 4 or local_tensor.shape[0] != 1:
-        raise ValueError(
-            "1xP pair transpose expects an unbatched [1, N, N_local, C] tensor."
-        )
     side = int(mesh.layout.shape[1])
-    local_width = int(local_tensor.shape[-2])
-    original_n = int(z_spec.original_shape[z_spec.pair_dims[0]])
-    padded_n = side * local_width
-    if original_n > padded_n:
-        raise ValueError(
-            f"original pair length {original_n} exceeds padded length {padded_n}."
-        )
     if side == 1:
+        if local_tensor.ndim != 4 or local_tensor.shape[0] != 1:
+            raise ValueError(
+                "1xP pair transpose expects an unbatched [1, N, N_local, C] tensor."
+            )
         return local_tensor.transpose(-3, -2).contiguous()
 
-    padded = local_tensor.new_zeros((padded_n, local_width, local_tensor.shape[-1]))
-    padded[:original_n].copy_(local_tensor.squeeze(0)[:original_n])
-    send = padded.reshape(
-        side,
-        local_width,
-        local_width,
-        local_tensor.shape[-1],
-    ).contiguous()
-    recv = torch.empty_like(send)
-    dist.all_to_all_single(recv, send, group=mesh.group_row)
-    owned_rows = (
-        recv.permute(1, 0, 2, 3)
-        .contiguous()
-        .reshape(local_width, padded_n, local_tensor.shape[-1])
+    def _allocate_all_to_all() -> tuple[torch.Tensor, torch.Tensor, int, int, int]:
+        if local_tensor.ndim != 4 or local_tensor.shape[0] != 1:
+            raise ValueError(
+                "1xP pair transpose expects an unbatched [1, N, N_local, C] tensor."
+            )
+        local_width = int(local_tensor.shape[-2])
+        original_n = int(z_spec.original_shape[z_spec.pair_dims[0]])
+        padded_n = side * local_width
+        if original_n > padded_n:
+            raise ValueError(
+                f"original pair length {original_n} exceeds padded length {padded_n}."
+            )
+        padded = local_tensor.new_zeros((padded_n, local_width, local_tensor.shape[-1]))
+        padded[:original_n].copy_(local_tensor.squeeze(0)[:original_n])
+        send = padded.reshape(
+            side,
+            local_width,
+            local_width,
+            local_tensor.shape[-1],
+        ).contiguous()
+        return send, torch.empty_like(send), local_width, original_n, padded_n
+
+    buffers = run_group_rank_action_synchronized(
+        _allocate_all_to_all,
+        group=mesh.group_row,
+        description="Pairformer row-transpose all-to-all allocation",
     )
-    return owned_rows[:, :original_n].unsqueeze(0).contiguous()
+    if buffers is None:  # pragma: no cover - action always runs on every rank
+        raise RuntimeError("Pairformer row-transpose all-to-all returned no buffers.")
+    send, recv, local_width, original_n, padded_n = buffers
+    del buffers
+    dist.all_to_all_single(recv, send, group=mesh.group_row)
+    del send
+
+    result = run_group_rank_action_synchronized(
+        lambda: (
+            recv.permute(1, 0, 2, 3)
+            .contiguous()
+            .reshape(local_width, padded_n, local_tensor.shape[-1])[:, :original_n]
+            .unsqueeze(0)
+            .contiguous()
+        ),
+        group=mesh.group_row,
+        description="Pairformer row-transpose all-to-all assembly",
+    )
+    if result is None:  # pragma: no cover - action always runs on every rank
+        raise RuntimeError("Pairformer row-transpose all-to-all returned no result.")
+    return result
 
 
 _ONE_BY_P_OWNED_ROWS_MAX_TENSOR_BYTES = 2 * 1024**3
@@ -947,6 +1189,20 @@ def _one_by_p_should_offload_trimul_b(
     )
 
 
+def _one_by_p_offload_trimul_b_synchronized(
+    b_local: torch.Tensor,
+    mesh: FoldCPProcessMesh,
+) -> torch.Tensor:
+    b_cpu = run_group_rank_action_synchronized(
+        b_local.cpu,
+        group=mesh.group_2d,
+        description="Fold-CP triangle-multiplication B CPU offload",
+    )
+    if b_cpu is None:  # pragma: no cover
+        raise RuntimeError("Fold-CP triangle-multiplication B was not offloaded.")
+    return b_cpu
+
+
 def _one_by_p_gather_row_chunk_by_row(
     local_tensor: torch.Tensor,
     mesh: FoldCPProcessMesh,
@@ -1010,17 +1266,48 @@ def _ring_gather_by_col(
     if side == 1:
         out = local_tensor
     else:
+
+        def _allocate_col_ring() -> tuple[torch.Tensor, list[torch.Tensor]]:
+            local_block = local_tensor.contiguous()
+            return local_block, [torch.empty_like(local_block) for _ in range(side - 1)]
+
+        buffers = run_group_rank_action_synchronized(
+            _allocate_col_ring,
+            group=mesh.group_col,
+            description="Pairformer column-ring allocation",
+        )
+        if buffers is None:  # pragma: no cover
+            raise RuntimeError("Pairformer column ring returned no buffers.")
+        local_block, recv_blocks = buffers
         ring = mesh.ring_comm()
         gathered: list[torch.Tensor | None] = [None for _ in range(side)]
-        gathered[mesh.coord[0]] = local_tensor.contiguous()
-        ready = gathered[mesh.coord[0]]
+        gathered[mesh.coord[0]] = local_block
+        ready = local_block
         for step in range(1, side):
-            ready = ring.comm_col.exchange(ready.contiguous())
+            ready = ring.comm_col.exchange(
+                ready,
+                to_recv=recv_blocks[step - 1],
+            )
             source_row = (mesh.coord[0] + step) % side
             gathered[source_row] = ready
-        if any(item is None for item in gathered):
-            raise RuntimeError("failed to gather column ring blocks.")
-        out = torch.cat([item for item in gathered if item is not None], dim=dim)
+
+        def _assemble_col_ring() -> torch.Tensor:
+            if any(item is None for item in gathered):
+                raise RuntimeError("failed to gather column ring blocks.")
+            out = torch.cat([item for item in gathered if item is not None], dim=dim)
+            if length is not None:
+                normalized_dim = dim if dim >= 0 else out.ndim + dim
+                out = out.narrow(normalized_dim, 0, length)
+            return out.contiguous()
+
+        result = run_group_rank_action_synchronized(
+            _assemble_col_ring,
+            group=mesh.group_col,
+            description="Pairformer column-ring assembly",
+        )
+        if result is None:  # pragma: no cover
+            raise RuntimeError("Pairformer column ring returned no result.")
+        return result
     if length is not None:
         dim = dim if dim >= 0 else out.ndim + dim
         out = out.narrow(dim, 0, length)
@@ -1040,7 +1327,13 @@ def _transpose_source_pair_tile(
 
     if mesh.layout.shape[0] == 1:
         return local_tensor.transpose(-3, -2).contiguous()
-    return mesh.ring_comm().comm_2d_trans.exchange(local_tensor.contiguous())
+    ring = mesh.ring_comm()
+    return exchange_tensor_synchronized(
+        local_tensor,
+        comm=ring.comm_2d_trans,
+        group=mesh.group_2d,
+        description="triangle-multiplication reciprocal-tile transpose",
+    )
 
 
 def _select_query_row_stack(
@@ -1434,6 +1727,7 @@ def _triangle_a_projection_source_chunks(
             source_chunk_cols=original_n,
         )
         out[..., local_row_slice, :valid_cols, :] = projected
+        del projected
     return out.contiguous()
 
 
@@ -1456,29 +1750,37 @@ def _triangle_b_projection_source_chunk(
     valid_col_end = min(col_end, original_n)
     valid_rows = max(0, valid_row_end - row_start)
     valid_cols = max(0, valid_col_end - col_start)
-    if return_owned_rows and (
-        direction != TriangleMultiplicationDirection.OUTGOING
-        or tuple(mesh.layout.shape)[0] != 1
-    ):
-        raise ValueError(
-            "owned-row B projection requires outgoing triangle multiplication "
-            "on a 1xP mesh."
-        )
-    if return_owned_rows:
-        out = z_norm.new_zeros(
-            z_norm.shape[:-3]
-            + (
-                int(z_norm.shape[-2]),
-                int(original_n),
-                int(module.c_hidden),
+
+    def _allocate_projection_output() -> torch.Tensor:
+        if return_owned_rows and (
+            direction != TriangleMultiplicationDirection.OUTGOING
+            or tuple(mesh.layout.shape)[0] != 1
+        ):
+            raise ValueError(
+                "owned-row B projection requires outgoing triangle multiplication "
+                "on a 1xP mesh."
             )
-        )
-    else:
-        out = z_norm.new_zeros(z_norm.shape[:-1] + (int(module.c_hidden),))
+        if return_owned_rows:
+            return z_norm.new_zeros(
+                z_norm.shape[:-3]
+                + (
+                    int(z_norm.shape[-2]),
+                    int(original_n),
+                    int(module.c_hidden),
+                )
+            )
+        return z_norm.new_zeros(z_norm.shape[:-1] + (int(module.c_hidden),))
+
+    out = run_group_rank_action_synchronized(
+        _allocate_projection_output,
+        group=mesh.group_2d,
+        description="Pairformer B-projection output allocation",
+    )
+    if out is None:  # pragma: no cover - every rank runs the action
+        raise RuntimeError("Pairformer B projection returned no output.")
+    del _allocate_projection_output
     # A padding-only column rank must still enter row-group collectives so its
     # peers do not wait forever on non-divisible 1 x P layouts.
-    if valid_rows == 0:
-        return out
     use_source_grid = z_source is None and _trimul_can_projection_source_grid(
         z_norm,
         z_spec,
@@ -1486,6 +1788,7 @@ def _triangle_b_projection_source_chunk(
     z_project_source = z_norm if z_source is None else z_source
 
     if direction == TriangleMultiplicationDirection.OUTGOING:
+        projection_error: Exception | None = None
         for global_start, global_end in _triangle_source_column_chunks(original_n):
             overlap_start = max(global_start, row_start)
             overlap_end = min(global_end, valid_row_end)
@@ -1510,53 +1813,75 @@ def _triangle_b_projection_source_chunk(
                     original_n,
                 )
             )
-            if use_source_grid:
-                projected = _triangle_project_source_launch(
-                    module.linear_b_g,
-                    module.linear_b_p,
-                    z_slab,
-                    mask_slab,
-                    source_rows=int(global_end - global_start) * int(original_n),
-                    source_unbatched=source_unbatched,
-                    original_n=original_n,
-                    row_start=overlap_start,
-                    col_start=0,
-                )
-            else:
-                projected = _triangle_project_source_launch(
-                    module.linear_b_g,
-                    module.linear_b_p,
-                    z_slab,
-                    mask_slab,
-                    source_rows=int(global_end - global_start) * int(original_n),
-                    source_unbatched=source_unbatched,
-                    layer_norm=module.layer_norm_in if z_source is not None else None,
-                    row_start=overlap_start - global_start,
-                    col_start=0,
-                    source_chunk_rows=global_end - global_start,
-                    source_chunk_cols=original_n,
-                )
-            if return_owned_rows:
-                owned_start = max(overlap_start, col_start)
-                owned_end = min(overlap_end, valid_col_end)
-                if owned_start < owned_end:
-                    out[
-                        ...,
-                        owned_start - col_start : owned_end - col_start,
-                        :original_n,
-                        :,
-                    ] = projected[
-                        ...,
-                        owned_start - overlap_start : owned_end - overlap_start,
-                        :original_n,
-                        :,
+            if projection_error is not None:
+                del z_slab, mask_slab
+                continue
+            projected = None
+            try:
+                if use_source_grid:
+                    projected = _triangle_project_source_launch(
+                        module.linear_b_g,
+                        module.linear_b_p,
+                        z_slab,
+                        mask_slab,
+                        source_rows=int(global_end - global_start) * int(original_n),
+                        source_unbatched=source_unbatched,
+                        original_n=original_n,
+                        row_start=overlap_start,
+                        col_start=0,
+                    )
+                else:
+                    projected = _triangle_project_source_launch(
+                        module.linear_b_g,
+                        module.linear_b_p,
+                        z_slab,
+                        mask_slab,
+                        source_rows=int(global_end - global_start) * int(original_n),
+                        source_unbatched=source_unbatched,
+                        layer_norm=(
+                            module.layer_norm_in if z_source is not None else None
+                        ),
+                        row_start=overlap_start - global_start,
+                        col_start=0,
+                        source_chunk_rows=global_end - global_start,
+                        source_chunk_cols=original_n,
+                    )
+                if return_owned_rows:
+                    owned_start = max(overlap_start, col_start)
+                    owned_end = min(overlap_end, valid_col_end)
+                    if owned_start < owned_end:
+                        out[
+                            ...,
+                            owned_start - col_start : owned_end - col_start,
+                            :original_n,
+                            :,
+                        ] = projected[
+                            ...,
+                            owned_start - overlap_start : owned_end - overlap_start,
+                            :original_n,
+                            :,
+                        ]
+                else:
+                    out[..., local_row_slice, :valid_cols, :] = projected[
+                        ..., :, col_start:valid_col_end, :
                     ]
-            else:
-                out[..., local_row_slice, :valid_cols, :] = projected[
-                    ..., :, col_start:valid_col_end, :
-                ]
+            except Exception as exc:
+                projection_error = detach_rank_local_error_traceback(exc)
             del projected, z_slab, mask_slab
-        return out.contiguous()
+
+        def _finish_outgoing_projection() -> torch.Tensor:
+            if projection_error is not None:
+                raise projection_error
+            return out.contiguous()
+
+        result = run_group_rank_action_synchronized(
+            _finish_outgoing_projection,
+            group=mesh.group_2d,
+            description="Pairformer outgoing B-projection completion",
+        )
+        if result is None:  # pragma: no cover - every rank runs the action
+            raise RuntimeError("Pairformer outgoing B projection returned no result.")
+        return result
 
     if direction == TriangleMultiplicationDirection.INCOMING:
         z_slab = _ring_gather_by_col(z_project_source, mesh, dim=-3, length=original_n)
@@ -1565,49 +1890,69 @@ def _triangle_b_projection_source_chunk(
             if mask is None
             else _ring_gather_by_col(mask, mesh, dim=-3, length=original_n)
         )
-        z_slab = z_slab[..., :, :valid_cols, :]
-        if mask_slab is not None:
-            mask_slab = mask_slab[..., :, :valid_cols, :]
-        for global_start, global_end in _triangle_source_column_chunks(original_n):
-            overlap_start = max(global_start, col_start)
-            overlap_end = min(global_end, valid_col_end)
-            if overlap_start >= overlap_end:
-                continue
-            local_col_slice = slice(overlap_start - col_start, overlap_end - col_start)
-            if use_source_grid:
-                projected = _triangle_project_source_launch(
-                    module.linear_b_g,
-                    module.linear_b_p,
-                    z_slab[..., :, local_col_slice, :],
-                    None
-                    if mask_slab is None
-                    else mask_slab[..., :, local_col_slice, :],
-                    source_rows=int(original_n) * int(global_end - global_start),
-                    source_unbatched=source_unbatched,
-                    original_n=original_n,
-                    row_start=0,
-                    col_start=overlap_start,
+
+        def _finish_incoming_projection() -> torch.Tensor:
+            if valid_rows == 0:
+                return out
+            z_valid = z_slab[..., :, :valid_cols, :]
+            mask_valid = (
+                None if mask_slab is None else mask_slab[..., :, :valid_cols, :]
+            )
+            for global_start, global_end in _triangle_source_column_chunks(original_n):
+                overlap_start = max(global_start, col_start)
+                overlap_end = min(global_end, valid_col_end)
+                if overlap_start >= overlap_end:
+                    continue
+                local_col_slice = slice(
+                    overlap_start - col_start,
+                    overlap_end - col_start,
                 )
-            else:
-                projected = _triangle_project_source_launch(
-                    module.linear_b_g,
-                    module.linear_b_p,
-                    z_slab[..., :, local_col_slice, :],
-                    None
-                    if mask_slab is None
-                    else mask_slab[..., :, local_col_slice, :],
-                    source_rows=int(original_n) * int(global_end - global_start),
-                    source_unbatched=source_unbatched,
-                    layer_norm=module.layer_norm_in if z_source is not None else None,
-                    row_start=0,
-                    col_start=overlap_start - global_start,
-                    source_chunk_rows=original_n,
-                    source_chunk_cols=global_end - global_start,
-                )
-            out[..., :valid_rows, local_col_slice, :] = projected[
-                ..., row_start:valid_row_end, :, :
-            ]
-        return out.contiguous()
+                if use_source_grid:
+                    projected = _triangle_project_source_launch(
+                        module.linear_b_g,
+                        module.linear_b_p,
+                        z_valid[..., :, local_col_slice, :],
+                        None
+                        if mask_valid is None
+                        else mask_valid[..., :, local_col_slice, :],
+                        source_rows=int(original_n) * int(global_end - global_start),
+                        source_unbatched=source_unbatched,
+                        original_n=original_n,
+                        row_start=0,
+                        col_start=overlap_start,
+                    )
+                else:
+                    projected = _triangle_project_source_launch(
+                        module.linear_b_g,
+                        module.linear_b_p,
+                        z_valid[..., :, local_col_slice, :],
+                        None
+                        if mask_valid is None
+                        else mask_valid[..., :, local_col_slice, :],
+                        source_rows=int(original_n) * int(global_end - global_start),
+                        source_unbatched=source_unbatched,
+                        layer_norm=(
+                            module.layer_norm_in if z_source is not None else None
+                        ),
+                        row_start=0,
+                        col_start=overlap_start - global_start,
+                        source_chunk_rows=original_n,
+                        source_chunk_cols=global_end - global_start,
+                    )
+                out[..., :valid_rows, local_col_slice, :] = projected[
+                    ..., row_start:valid_row_end, :, :
+                ]
+                del projected
+            return out.contiguous()
+
+        result = run_group_rank_action_synchronized(
+            _finish_incoming_projection,
+            group=mesh.group_2d,
+            description="Pairformer incoming B-projection completion",
+        )
+        if result is None:  # pragma: no cover - every rank runs the action
+            raise RuntimeError("Pairformer incoming B projection returned no result.")
+        return result
 
     raise ValueError(f"unsupported direction={direction}")
 
@@ -1767,7 +2112,28 @@ def _distributed_triangle_multiplication_source_matmul(
             )
         if b_full_k is not None:
             del b_local
-        update = a_full_k.new_zeros(local_shape)
+        drain_streamed_outgoing = (
+            side > 1
+            and direction == TriangleMultiplicationDirection.OUTGOING
+            and b_full_k is None
+            and b_owned_rows is None
+        )
+        if side > 1:
+            allocation_description = (
+                "Pairformer streamed TriMul output allocation"
+                if drain_streamed_outgoing
+                else "Pairformer source TriMul output allocation"
+            )
+            update = run_group_rank_action_synchronized(
+                lambda: a_full_k.new_zeros(local_shape),
+                group=mesh.group_row,
+                description=allocation_description,
+            )
+            if update is None:  # pragma: no cover - every rank runs the action
+                raise RuntimeError("Pairformer source TriMul returned no output.")
+        else:
+            update = a_full_k.new_zeros(local_shape)
+        stream_compute_error: Exception | None = None
         for source_start, source_end in _triangle_source_column_chunks(original_n):
             overlap_start = max(source_start, col_start)
             overlap_end = min(source_end, valid_col_end)
@@ -1778,90 +2144,117 @@ def _distributed_triangle_multiplication_source_matmul(
             )
             if overlap_start >= overlap_end and not collective_outgoing_fallback:
                 continue
-            if b_full_k is not None:
-                if direction == TriangleMultiplicationDirection.OUTGOING:
-                    b_source_chunk = b_full_k[..., source_start:source_end, :, :]
+            if stream_compute_error is not None and not collective_outgoing_fallback:
+                continue
+            b_source_chunk = None
+            try:
+                if b_full_k is not None:
+                    if direction == TriangleMultiplicationDirection.OUTGOING:
+                        b_source_chunk = b_full_k[..., source_start:source_end, :, :]
+                    elif direction == TriangleMultiplicationDirection.INCOMING:
+                        b_source_chunk = b_full_k[..., source_start:source_end, :]
+                    else:
+                        raise ValueError(f"unsupported direction={direction}")
+                elif (
+                    side > 1
+                    and direction == TriangleMultiplicationDirection.OUTGOING
+                    and b_owned_rows is not None
+                ):
+                    b_source_chunk = a_full_k.new_zeros(
+                        a_full_k.shape[:-3]
+                        + (
+                            source_end - source_start,
+                            original_n,
+                            b_owned_rows.shape[-1],
+                        )
+                    )
+                    local_start = overlap_start - col_start
+                    local_end = overlap_end - col_start
+                    chunk_start = overlap_start - source_start
+                    chunk_end = overlap_end - source_start
+                    b_source_chunk[..., chunk_start:chunk_end, :, :].copy_(
+                        b_owned_rows[..., local_start:local_end, :, :]
+                    )
+                elif side > 1 and direction == TriangleMultiplicationDirection.INCOMING:
+                    b_source_chunk = _one_by_p_local_source_column_chunk(
+                        b_local_host if offload_b else b_local,
+                        z_spec,
+                        source_start,
+                        source_end,
+                    )
+                    if offload_b:
+                        b_source_chunk = b_source_chunk.to(device=a_full_k.device)
+                elif direction == TriangleMultiplicationDirection.OUTGOING:
+                    if offload_b:
+                        b_chunk_local = run_group_rank_action_synchronized(
+                            lambda: b_local_host[..., source_start:source_end, :, :].to(
+                                device=a_full_k.device
+                            ),
+                            group=mesh.group_row,
+                            description="Pairformer streamed TriMul host transfer",
+                        )
+                        if b_chunk_local is None:  # pragma: no cover
+                            raise RuntimeError(
+                                "Pairformer streamed TriMul returned no host chunk."
+                            )
+                    else:
+                        b_chunk_local = b_local[..., source_start:source_end, :, :]
+                    b_source_chunk = _ring_gather_by_row(
+                        b_chunk_local,
+                        mesh,
+                        dim=-2,
+                        length=original_n,
+                    )
+                    if offload_b:
+                        del b_chunk_local
                 elif direction == TriangleMultiplicationDirection.INCOMING:
-                    b_source_chunk = b_full_k[..., source_start:source_end, :]
+                    b_source_chunk = _one_by_p_gather_source_columns_by_row(
+                        b_local,
+                        mesh,
+                        z_spec,
+                        source_start,
+                        source_end,
+                    )
                 else:
                     raise ValueError(f"unsupported direction={direction}")
-            elif (
-                side > 1
-                and direction == TriangleMultiplicationDirection.OUTGOING
-                and b_owned_rows is not None
-            ):
-                b_source_chunk = a_full_k.new_zeros(
-                    a_full_k.shape[:-3]
-                    + (
-                        source_end - source_start,
-                        original_n,
-                        b_owned_rows.shape[-1],
-                    )
-                )
-                local_start = overlap_start - col_start
-                local_end = overlap_end - col_start
-                chunk_start = overlap_start - source_start
-                chunk_end = overlap_end - source_start
-                b_source_chunk[..., chunk_start:chunk_end, :, :].copy_(
-                    b_owned_rows[..., local_start:local_end, :, :]
-                )
-            elif side > 1 and direction == TriangleMultiplicationDirection.INCOMING:
-                b_source_chunk = _one_by_p_local_source_column_chunk(
-                    b_local_host if offload_b else b_local,
-                    z_spec,
-                    source_start,
-                    source_end,
-                )
-                if offload_b:
-                    b_source_chunk = b_source_chunk.to(device=a_full_k.device)
-            elif direction == TriangleMultiplicationDirection.OUTGOING:
-                b_chunk_local = (
-                    b_local_host[..., source_start:source_end, :, :].to(
-                        device=a_full_k.device
-                    )
-                    if offload_b
-                    else b_local[..., source_start:source_end, :, :]
-                )
-                b_source_chunk = _ring_gather_by_row(
-                    b_chunk_local,
-                    mesh,
-                    dim=-2,
-                    length=original_n,
-                )
-                if offload_b:
-                    del b_chunk_local
-            elif direction == TriangleMultiplicationDirection.INCOMING:
-                b_source_chunk = _one_by_p_gather_source_columns_by_row(
-                    b_local,
-                    mesh,
-                    z_spec,
-                    source_start,
-                    source_end,
-                )
-            else:
-                raise ValueError(f"unsupported direction={direction}")
+            except Exception as exc:
+                if side == 1 or collective_outgoing_fallback:
+                    raise
+                if b_source_chunk is not None:
+                    del b_source_chunk
+                stream_compute_error = detach_rank_local_error_traceback(exc)
+                continue
             if overlap_start >= overlap_end:
                 del b_source_chunk
                 continue
-            if direction == TriangleMultiplicationDirection.OUTGOING:
-                source_chunk = _source_unbatched_outgoing_matmul(
-                    a_full_k,
-                    b_source_chunk,
-                    a_full_k_prepared,
+            if stream_compute_error is not None:
+                del b_source_chunk
+                continue
+            source_chunk = None
+            try:
+                if direction == TriangleMultiplicationDirection.OUTGOING:
+                    source_chunk = _source_unbatched_outgoing_matmul(
+                        a_full_k,
+                        b_source_chunk,
+                        a_full_k_prepared,
+                    )
+                elif direction == TriangleMultiplicationDirection.INCOMING:
+                    source_chunk = _source_unbatched_incoming_matmul(
+                        a_full_k,
+                        b_source_chunk,
+                        a_full_k_prepared,
+                    )
+                local_slice = slice(overlap_start - col_start, overlap_end - col_start)
+                source_slice = slice(
+                    overlap_start - source_start, overlap_end - source_start
                 )
-            elif direction == TriangleMultiplicationDirection.INCOMING:
-                source_chunk = _source_unbatched_incoming_matmul(
-                    a_full_k,
-                    b_source_chunk,
-                    a_full_k_prepared,
-                )
-            local_slice = slice(overlap_start - col_start, overlap_end - col_start)
-            source_slice = slice(
-                overlap_start - source_start, overlap_end - source_start
-            )
-            update[..., :original_n, local_slice, :] = source_chunk[
-                ..., :original_n, source_slice, :
-            ]
+                update[..., :original_n, local_slice, :] = source_chunk[
+                    ..., :original_n, source_slice, :
+                ]
+            except Exception as exc:
+                if side == 1:
+                    raise
+                stream_compute_error = detach_rank_local_error_traceback(exc)
             del source_chunk, b_source_chunk
         del a_full_k, a_full_k_prepared
         del b_owned_rows
@@ -1871,6 +2264,26 @@ def _distributed_triangle_multiplication_source_matmul(
             del b_local
         else:
             del b_full_k
+        if side > 1:
+
+            def _finish_source_trimul() -> torch.Tensor:
+                if stream_compute_error is not None:
+                    raise stream_compute_error
+                return update.contiguous()
+
+            completion_description = (
+                "Pairformer streamed TriMul completion"
+                if drain_streamed_outgoing
+                else "Pairformer source TriMul completion"
+            )
+            result = run_group_rank_action_synchronized(
+                _finish_source_trimul,
+                group=mesh.group_row,
+                description=completion_description,
+            )
+            if result is None:  # pragma: no cover - every rank runs the action
+                raise RuntimeError("Pairformer source TriMul returned no result.")
+            return result
         return update.contiguous()
 
     if direction == TriangleMultiplicationDirection.OUTGOING:
@@ -1881,27 +2294,62 @@ def _distributed_triangle_multiplication_source_matmul(
         valid_row_end = min(row_end, original_n)
         valid_col_end = min(col_end, original_n)
         valid_rows = max(0, valid_row_end - row_start)
-        update = a_full_k.new_zeros(local_shape)
-        matmul_rows = _triangle_source_matmul_row_size(valid_rows, original_n)
-        a_mat_input = a_full_k[..., :valid_rows, :, :]
-        row_slice = slice(0, valid_rows)
-        if matmul_rows != valid_rows:
-            a_padded = a_full_k.new_zeros(
-                a_full_k.shape[:-3]
-                + (matmul_rows, a_full_k.shape[-2], a_full_k.shape[-1])
+
+        def _prepare_2d_outgoing_matmul():
+            prepared_update = a_full_k.new_zeros(local_shape)
+            prepared_matmul_rows = _triangle_source_matmul_row_size(
+                valid_rows, original_n
             )
-            row_slice = (
-                slice(row_start, valid_row_end)
-                if matmul_rows == original_n
-                else slice(0, valid_rows)
+            prepared_input = a_full_k[..., :valid_rows, :, :]
+            prepared_row_slice = slice(0, valid_rows)
+            prepared_padding = None
+            if prepared_matmul_rows != valid_rows:
+                prepared_padding = a_full_k.new_zeros(
+                    a_full_k.shape[:-3]
+                    + (
+                        prepared_matmul_rows,
+                        a_full_k.shape[-2],
+                        a_full_k.shape[-1],
+                    )
+                )
+                prepared_row_slice = (
+                    slice(row_start, valid_row_end)
+                    if prepared_matmul_rows == original_n
+                    else slice(0, valid_rows)
+                )
+                prepared_padding[..., prepared_row_slice, :, :] = prepared_input
+                prepared_input = prepared_padding
+            prepared_launch = (
+                prepared_input.squeeze(0).permute(2, 0, 1).contiguous()
+                if prepared_input.shape[0] == 1
+                else None
             )
-            a_padded[..., row_slice, :, :] = a_mat_input
-            a_mat_input = a_padded
-        a_mat_input_prepared = (
-            a_mat_input.squeeze(0).permute(2, 0, 1).contiguous()
-            if a_mat_input.shape[0] == 1
-            else None
+            return (
+                prepared_update,
+                prepared_matmul_rows,
+                prepared_input,
+                prepared_row_slice,
+                prepared_padding,
+                prepared_launch,
+            )
+
+        prepared = run_group_rank_action_synchronized(
+            _prepare_2d_outgoing_matmul,
+            group=mesh.group_2d,
+            description="Pairformer 2D outgoing TriMul preparation",
         )
+        if prepared is None:  # pragma: no cover - every rank runs the action
+            raise RuntimeError("Pairformer 2D outgoing TriMul returned no state.")
+        (
+            update,
+            matmul_rows,
+            a_mat_input,
+            row_slice,
+            a_padded,
+            a_mat_input_prepared,
+        ) = prepared
+        del _prepare_2d_outgoing_matmul
+        compute_error: Exception | None = None
         for global_start, global_end in _triangle_source_column_chunks(original_n):
             overlap_start = max(global_start, col_start)
             overlap_end = min(global_end, col_end, original_n)
@@ -1914,69 +2362,127 @@ def _distributed_triangle_multiplication_source_matmul(
                 dim=-2,
                 length=original_n,
             )
-            chunk = _source_unbatched_outgoing_matmul(
-                a_mat_input,
-                b_full_k,
-                a_mat_input_prepared,
-            )
-            if matmul_rows != valid_rows:
-                chunk = chunk[..., row_slice, :, :]
-            update[..., :valid_rows, local_col_slice, :] = chunk
+            if compute_error is not None:
+                del b_full_k
+                continue
+            chunk = None
+            try:
+                chunk = _source_unbatched_outgoing_matmul(
+                    a_mat_input,
+                    b_full_k,
+                    a_mat_input_prepared,
+                )
+                if matmul_rows != valid_rows:
+                    chunk = chunk[..., row_slice, :, :]
+                update[..., :valid_rows, local_col_slice, :] = chunk
+            except Exception as exc:
+                compute_error = detach_rank_local_error_traceback(exc)
             del chunk, b_full_k
-        if matmul_rows != valid_rows:
+        if a_padded is not None:
             del a_padded
         del a_mat_input, a_mat_input_prepared
         del a_full_k, b_trans
-        return update.contiguous()
+
+        def _finish_2d_outgoing() -> torch.Tensor:
+            if compute_error is not None:
+                raise compute_error
+            return update.contiguous()
+
+        result = run_group_rank_action_synchronized(
+            _finish_2d_outgoing,
+            group=mesh.group_2d,
+            description="Pairformer 2D outgoing TriMul completion",
+        )
+        if result is None:  # pragma: no cover - every rank runs the action
+            raise RuntimeError("Pairformer 2D outgoing TriMul returned no result.")
+        return result
 
     if direction == TriangleMultiplicationDirection.INCOMING:
         a_trans = _transpose_source_pair_tile(a_local, mesh)
         del a_local
         valid_row_end = min(row_end, original_n)
         valid_col_end = min(col_end, original_n)
-        if row_start < valid_row_end:
+        valid_rows = max(0, valid_row_end - row_start)
+        if valid_rows > 0:
             a_full_k = _ring_gather_by_row(
-                a_trans[..., : valid_row_end - row_start, :],
+                a_trans[..., :valid_rows, :],
                 mesh,
                 dim=-3,
                 length=original_n,
             )
-            del a_trans
-            update = a_full_k.new_zeros(local_shape)
-            valid_rows = valid_row_end - row_start
-            matmul_rows = _triangle_source_matmul_row_size(valid_rows, original_n)
-            a_mat_input = a_full_k
-            row_slice = slice(0, valid_rows)
-            if matmul_rows != valid_rows:
-                a_padded = a_full_k.new_zeros(
-                    a_full_k.shape[:-2] + (matmul_rows, a_full_k.shape[-1])
+        else:
+            a_full_k = None
+        del a_trans
+
+        def _prepare_2d_incoming_matmul():
+            prepared_update = b_local.new_zeros(local_shape)
+            if a_full_k is None:
+                return prepared_update, 0, None, slice(0, 0), None, None
+            prepared_matmul_rows = _triangle_source_matmul_row_size(
+                valid_rows, original_n
+            )
+            prepared_input = a_full_k
+            prepared_row_slice = slice(0, valid_rows)
+            prepared_padding = None
+            if prepared_matmul_rows != valid_rows:
+                prepared_padding = a_full_k.new_zeros(
+                    a_full_k.shape[:-2] + (prepared_matmul_rows, a_full_k.shape[-1])
                 )
-                row_slice = (
+                prepared_row_slice = (
                     slice(row_start, valid_row_end)
-                    if matmul_rows == original_n
+                    if prepared_matmul_rows == original_n
                     else slice(0, valid_rows)
                 )
-                a_padded[..., row_slice, :] = a_full_k
-                a_mat_input = a_padded
-            a_mat_input_prepared = (
-                a_mat_input.squeeze(0).permute(2, 1, 0).contiguous()
-                if a_mat_input.shape[0] == 1
+                prepared_padding[..., prepared_row_slice, :] = a_full_k
+                prepared_input = prepared_padding
+            prepared_launch = (
+                prepared_input.squeeze(0).permute(2, 1, 0).contiguous()
+                if prepared_input.shape[0] == 1
                 else None
             )
-            for global_start, global_end in _triangle_source_column_chunks(original_n):
-                overlap_start = max(global_start, col_start)
-                overlap_end = min(global_end, col_end, original_n)
-                if overlap_start >= overlap_end:
-                    continue
-                local_col_slice = slice(
-                    overlap_start - col_start, overlap_end - col_start
-                )
-                b_full_k = _ring_gather_by_col(
-                    b_local[..., local_col_slice, :],
-                    mesh,
-                    dim=-3,
-                    length=original_n,
-                )
+            return (
+                prepared_update,
+                prepared_matmul_rows,
+                prepared_input,
+                prepared_row_slice,
+                prepared_padding,
+                prepared_launch,
+            )
+
+        prepared = run_group_rank_action_synchronized(
+            _prepare_2d_incoming_matmul,
+            group=mesh.group_2d,
+            description="Pairformer 2D incoming TriMul preparation",
+        )
+        if prepared is None:  # pragma: no cover - every rank runs the action
+            raise RuntimeError("Pairformer 2D incoming TriMul returned no state.")
+        (
+            update,
+            matmul_rows,
+            a_mat_input,
+            row_slice,
+            a_padded,
+            a_mat_input_prepared,
+        ) = prepared
+        del _prepare_2d_incoming_matmul
+        compute_error: Exception | None = None
+        for global_start, global_end in _triangle_source_column_chunks(original_n):
+            overlap_start = max(global_start, col_start)
+            overlap_end = min(global_end, col_end, original_n)
+            if overlap_start >= overlap_end:
+                continue
+            local_col_slice = slice(overlap_start - col_start, overlap_end - col_start)
+            b_full_k = _ring_gather_by_col(
+                b_local[..., local_col_slice, :],
+                mesh,
+                dim=-3,
+                length=original_n,
+            )
+            if valid_rows == 0 or compute_error is not None:
+                del b_full_k
+                continue
+            chunk = None
+            try:
                 chunk = _source_unbatched_incoming_matmul(
                     a_mat_input,
                     b_full_k,
@@ -1985,16 +2491,27 @@ def _distributed_triangle_multiplication_source_matmul(
                 if matmul_rows != valid_rows:
                     chunk = chunk[..., row_slice, :, :]
                 update[..., :valid_rows, local_col_slice, :] = chunk
-                del chunk, b_full_k
-            if matmul_rows != valid_rows:
-                del a_padded
-            del a_mat_input, a_mat_input_prepared
-            del a_full_k
-        else:
-            update = b_local.new_zeros(local_shape)
-            del a_trans
+            except Exception as exc:
+                compute_error = detach_rank_local_error_traceback(exc)
+            del chunk, b_full_k
+        if a_padded is not None:
+            del a_padded
+        del a_mat_input, a_mat_input_prepared, a_full_k
         del b_local
-        return update.contiguous()
+
+        def _finish_2d_incoming() -> torch.Tensor:
+            if compute_error is not None:
+                raise compute_error
+            return update.contiguous()
+
+        result = run_group_rank_action_synchronized(
+            _finish_2d_incoming,
+            group=mesh.group_2d,
+            description="Pairformer 2D incoming TriMul completion",
+        )
+        if result is None:  # pragma: no cover - every rank runs the action
+            raise RuntimeError("Pairformer 2D incoming TriMul returned no result.")
+        return result
 
     raise ValueError(f"unsupported direction={direction}")
 
@@ -2029,6 +2546,7 @@ def _triangle_multiplication_output_norm_gate(
         out_chunk = module.linear_z(norm_chunk)
         gate_chunk = torch.sigmoid(module.linear_g(flat_z_norm[start:end]))
         out[start:end] = out_chunk * gate_chunk
+        del norm_chunk, out_chunk, gate_chunk
     if write_inplace:
         return update
     return out.reshape(update.shape[:-1] + (c_z,))
@@ -2261,7 +2779,8 @@ def _pair_tile_linears_are_batch_compatible(
     """Return whether two projections can share an unchanged batched GEMM geometry."""
 
     return (
-        first_x.ndim == 3
+        not torch.are_deterministic_algorithms_enabled()
+        and first_x.ndim == 3
         and second_x.shape == first_x.shape
         and first_linear.bias is None
         and second_linear.bias is None
@@ -2277,23 +2796,72 @@ def _triangle_multiplication_output_norm_gate_source_slab(
     z_spec: FoldCPPairShardSpec,
     *,
     source_unbatched: bool = False,
+    squeeze_batch: bool = False,
+    residual_local: torch.Tensor | None = None,
 ) -> torch.Tensor:
     original_n = z_spec.original_shape[z_spec.pair_dims[0]]
     row_start, row_end = z_spec.row_range
     col_start, col_end = z_spec.col_range
     valid_row_end = min(row_end, original_n)
-    out = update.new_zeros(update.shape[:-1] + (int(module.c_z),))
-    if row_start >= valid_row_end:
-        return out
-    source_grid = _triangle_multiplication_output_norm_gate_source_grid(
-        module,
+    valid_rows = max(0, valid_row_end - row_start)
+    synchronize_failures = int(mesh.layout.shape[0]) * int(mesh.layout.shape[1]) > 1
+
+    def _finish_output(output: torch.Tensor) -> torch.Tensor:
+        if squeeze_batch:
+            output = output.squeeze(0)
+        if residual_local is not None:
+            residual_local.add_(output)
+            return residual_local.contiguous()
+        return output.contiguous()
+
+    compute_error: Exception | None = None
+    out = None
+    try:
+        out = update.new_zeros(update.shape[:-1] + (int(module.c_z),))
+    except Exception as exc:
+        if not synchronize_failures:
+            raise
+        compute_error = detach_rank_local_error_traceback(exc)
+
+    source_grid_enabled = _trimul_output_can_use_source_grid(
         update,
         z_source,
         z_spec,
-        source_unbatched=source_unbatched,
+    ) and (
+        update.ndim != 4
+        or (source_unbatched and update.shape[0] == 1 and z_source.shape[0] == 1)
     )
-    if source_grid is not None:
-        return source_grid
+    if source_grid_enabled:
+
+        def _finish_source_grid() -> torch.Tensor:
+            if compute_error is not None:
+                raise compute_error
+            source_grid = _triangle_multiplication_output_norm_gate_source_grid(
+                module,
+                update,
+                z_source,
+                z_spec,
+                source_unbatched=source_unbatched,
+            )
+            if source_grid is None:  # pragma: no cover - guarded by the policy
+                raise RuntimeError("Pairformer source-grid TriMul returned no output.")
+            return _finish_output(source_grid)
+
+        if not synchronize_failures:
+            return _finish_source_grid()
+        result = run_group_rank_action_synchronized(
+            _finish_source_grid,
+            group=mesh.group_2d,
+            description="Pairformer source-grid TriMul output completion",
+        )
+        if result is None:  # pragma: no cover - every rank runs the action
+            raise RuntimeError("Pairformer source-grid TriMul returned no result.")
+        return result
+
+    if not synchronize_failures and valid_rows == 0:
+        if out is None:  # pragma: no cover - local allocation already raised
+            raise RuntimeError("Pairformer source TriMul returned no output.")
+        return _finish_output(out)
 
     for global_start, global_end in _triangle_source_column_chunks(original_n):
         overlap_start = max(global_start, col_start)
@@ -2313,28 +2881,57 @@ def _triangle_multiplication_output_norm_gate_source_slab(
             dim=-3,
             length=original_n,
         )
-        if source_unbatched and update_slab.ndim == 4 and update_slab.shape[0] == 1:
-            slab_3d = update_slab.squeeze(0)
-            z_slab_3d = z_slab.squeeze(0)
-            slab_norm = module.layer_norm_out(slab_3d)
-            gate_norm = module.layer_norm_in(z_slab_3d)
-            if _pair_tile_linears_are_batch_compatible(
-                module.linear_z,
-                module.linear_g,
-                slab_norm,
-                gate_norm,
-            ):
-                slab, gate = _paired_pair_tile_linears_with_source_chunk_launch(
+        if valid_rows == 0 or compute_error is not None:
+            del update_slab, z_slab
+            continue
+        slab_3d = None
+        z_slab_3d = None
+        slab_norm = None
+        gate_norm = None
+        slab = None
+        gate = None
+        try:
+            if source_unbatched and update_slab.ndim == 4 and update_slab.shape[0] == 1:
+                slab_3d = update_slab.squeeze(0)
+                z_slab_3d = z_slab.squeeze(0)
+                slab_norm = module.layer_norm_out(slab_3d)
+                gate_norm = module.layer_norm_in(z_slab_3d)
+                if _pair_tile_linears_are_batch_compatible(
                     module.linear_z,
                     module.linear_g,
                     slab_norm,
                     gate_norm,
-                    source_rows=original_n,
-                    source_cols=global_end - global_start,
-                    row_start=0,
-                    col_start=overlap_start - global_start,
-                )
+                ):
+                    slab, gate = _paired_pair_tile_linears_with_source_chunk_launch(
+                        module.linear_z,
+                        module.linear_g,
+                        slab_norm,
+                        gate_norm,
+                        source_rows=original_n,
+                        source_cols=global_end - global_start,
+                        row_start=0,
+                        col_start=overlap_start - global_start,
+                    )
+                else:
+                    slab = foldcp_pair_tile_linear_with_source_chunk_launch(
+                        module.linear_z,
+                        slab_norm,
+                        source_rows=original_n,
+                        source_cols=global_end - global_start,
+                        row_start=0,
+                        col_start=overlap_start - global_start,
+                    )
+                    gate = foldcp_pair_tile_linear_with_source_chunk_launch(
+                        module.linear_g,
+                        gate_norm,
+                        source_rows=original_n,
+                        source_cols=global_end - global_start,
+                        row_start=0,
+                        col_start=overlap_start - global_start,
+                    )
+                slab = (slab * torch.sigmoid(gate)).unsqueeze(0)
             else:
+                slab_norm = module.layer_norm_out(update_slab)
                 slab = foldcp_pair_tile_linear_with_source_chunk_launch(
                     module.linear_z,
                     slab_norm,
@@ -2343,6 +2940,7 @@ def _triangle_multiplication_output_norm_gate_source_slab(
                     row_start=0,
                     col_start=overlap_start - global_start,
                 )
+                gate_norm = module.layer_norm_in(z_slab)
                 gate = foldcp_pair_tile_linear_with_source_chunk_launch(
                     module.linear_g,
                     gate_norm,
@@ -2351,33 +2949,34 @@ def _triangle_multiplication_output_norm_gate_source_slab(
                     row_start=0,
                     col_start=overlap_start - global_start,
                 )
-            slab = (slab * torch.sigmoid(gate)).unsqueeze(0)
-            del slab_3d, z_slab_3d
-        else:
-            slab_norm = module.layer_norm_out(update_slab)
-            slab = foldcp_pair_tile_linear_with_source_chunk_launch(
-                module.linear_z,
-                slab_norm,
-                source_rows=original_n,
-                source_cols=global_end - global_start,
-                row_start=0,
-                col_start=overlap_start - global_start,
-            )
-            gate_norm = module.layer_norm_in(z_slab)
-            gate = foldcp_pair_tile_linear_with_source_chunk_launch(
-                module.linear_g,
-                gate_norm,
-                source_rows=original_n,
-                source_cols=global_end - global_start,
-                row_start=0,
-                col_start=overlap_start - global_start,
-            )
-            slab = slab * torch.sigmoid(gate)
-        out[..., : valid_row_end - row_start, local_col_slice, :] = slab[
-            ..., row_start:valid_row_end, :, :
-        ]
-        del update_slab, z_slab, slab_norm, gate_norm, gate, slab
-    return out.contiguous()
+                slab = slab * torch.sigmoid(gate)
+            out[..., :valid_rows, local_col_slice, :] = slab[
+                ..., row_start:valid_row_end, :, :
+            ]
+        except Exception as exc:
+            if not synchronize_failures:
+                raise
+            compute_error = detach_rank_local_error_traceback(exc)
+        del update_slab, z_slab
+        del slab_3d, z_slab_3d, slab_norm, gate_norm, gate, slab
+
+    def _finish_source_output() -> torch.Tensor:
+        if compute_error is not None:
+            raise compute_error
+        if out is None:  # pragma: no cover - allocation failure sets the error
+            raise RuntimeError("Pairformer source TriMul returned no output.")
+        return _finish_output(out)
+
+    if not synchronize_failures:
+        return _finish_source_output()
+    result = run_group_rank_action_synchronized(
+        _finish_source_output,
+        group=mesh.group_2d,
+        description="Pairformer source TriMul output completion",
+    )
+    if result is None:  # pragma: no cover - every rank runs the action
+        raise RuntimeError("Pairformer source TriMul returned no result.")
+    return result
 
 
 def _transpose_pair_spec(z_spec: FoldCPPairShardSpec) -> FoldCPPairShardSpec:
@@ -2412,37 +3011,60 @@ def _replicated_serial_triangle_multiplication_update(
 ) -> torch.Tensor:
     """Run the unchanged source inference kernel and restore local ownership."""
 
+    synchronize_failures = int(mesh.layout.shape[0]) * int(mesh.layout.shape[1]) > 1
     z_full = gather_pair_tensor_like(z_local, z_spec, mesh.group_2d)
     mask_full = None
     if mask_local is not None:
-        mask_spec = make_pair_shard_spec(
-            tuple(z_spec.original_shape[:-1]),
-            mesh,
-            pair_dims=z_spec.pair_dims,
+        prepare_mask_spec = lambda: make_pair_shard_spec(
+            tuple(z_spec.original_shape[:-1]), mesh, pair_dims=z_spec.pair_dims
         )
+        mask_spec = (
+            run_group_rank_action_synchronized(
+                prepare_mask_spec,
+                group=mesh.group_2d,
+                description="replicated TriMul mask-spec preparation",
+            )
+            if synchronize_failures
+            else prepare_mask_spec()
+        )
+        if mask_spec is None:  # pragma: no cover
+            raise RuntimeError("replicated TriMul mask spec was not prepared.")
         mask_full = gather_pair_tensor(
             mask_local,
             mask_spec,
             mesh.group_2d,
         )
-    source_result = module(
-        z_full,
-        mask=mask_full,
-        inplace_safe=True,
-        _add_with_inplace=True,
-        triangle_multiplicative="torch",
+
+    def _finish_replicated_trimul() -> torch.Tensor:
+        source_result = module(
+            z_full,
+            mask=mask_full,
+            inplace_safe=True,
+            _add_with_inplace=True,
+            triangle_multiplicative="torch",
+        )
+        local_result, local_spec = shard_pair_tensor(
+            source_result,
+            mesh,
+            pair_dims=z_spec.pair_dims,
+        )
+        if (
+            local_spec.row_range != z_spec.row_range
+            or local_spec.col_range != z_spec.col_range
+        ):
+            raise RuntimeError("replicated TriMul changed Fold-CP shard ownership.")
+        return local_result.contiguous()
+
+    if not synchronize_failures:
+        return _finish_replicated_trimul()
+    result = run_group_rank_action_synchronized(
+        _finish_replicated_trimul,
+        group=mesh.group_2d,
+        description="replicated TriMul local computation",
     )
-    local_result, local_spec = shard_pair_tensor(
-        source_result,
-        mesh,
-        pair_dims=z_spec.pair_dims,
-    )
-    if (
-        local_spec.row_range != z_spec.row_range
-        or local_spec.col_range != z_spec.col_range
-    ):
-        raise RuntimeError("replicated TriMul changed Fold-CP shard ownership.")
-    return local_result.contiguous()
+    if result is None:  # pragma: no cover
+        raise RuntimeError("replicated TriMul local computation returned no result.")
+    return result
 
 
 def distributed_triangle_multiplication_update(
@@ -2476,35 +3098,52 @@ def distributed_triangle_multiplication_update(
             z_spec,
         )
 
-    if z_local.ndim == 3:
-        z_in = z_local.unsqueeze(0)
-        squeeze_batch = True
-    elif z_local.ndim == 4:
-        z_in = z_local
-        squeeze_batch = False
-    else:
-        raise ValueError("z_local must be [N, N, C] or [B, N, N, C].")
+    def _prepare_triangle_inputs():
+        if z_local.ndim == 3:
+            prepared_z = z_local.unsqueeze(0)
+            prepared_squeeze_batch = True
+        elif z_local.ndim == 4:
+            prepared_z = z_local
+            prepared_squeeze_batch = False
+        else:
+            raise ValueError("z_local must be [N, N, C] or [B, N, N, C].")
 
-    if mask_local is None:
-        mask = None
-    elif mask_local.ndim == 2:
-        mask = mask_local.unsqueeze(0)
-    elif mask_local.ndim == 3:
-        mask = mask_local
-    else:
-        raise ValueError("mask_local must be [N, N] or [B, N, N].")
-    if mask is not None:
-        mask = mask.unsqueeze(-1)
+        if mask_local is None:
+            prepared_mask = None
+        elif mask_local.ndim == 2:
+            prepared_mask = mask_local.unsqueeze(0)
+        elif mask_local.ndim == 3:
+            prepared_mask = mask_local
+        else:
+            raise ValueError("mask_local must be [N, N] or [B, N, N].")
+        if prepared_mask is not None:
+            prepared_mask = prepared_mask.unsqueeze(-1)
 
-    if z_spec is None:
-        z_norm = module.layer_norm_in(z_in)
-    else:
-        z_norm = _triangle_layer_norm_source_row_slab(
-            module.layer_norm_in,
-            z_in,
-            mesh,
-            z_spec,
+        if z_spec is None:
+            prepared_z_norm = module.layer_norm_in(prepared_z)
+        else:
+            prepared_z_norm = _triangle_layer_norm_source_row_slab(
+                module.layer_norm_in,
+                prepared_z,
+                mesh,
+                z_spec,
+            )
+        return (
+            prepared_z,
+            prepared_squeeze_batch,
+            prepared_mask,
+            prepared_z_norm,
         )
+
+    prepared_inputs = run_group_rank_action_synchronized(
+        _prepare_triangle_inputs,
+        group=mesh.group_2d,
+        description="Fold-CP triangle-multiplication input preparation",
+    )
+    if prepared_inputs is None:  # pragma: no cover - every rank runs the action
+        raise RuntimeError("Fold-CP triangle-multiplication inputs were not prepared.")
+    z_in, squeeze_batch, mask, z_norm = prepared_inputs
+    del prepared_inputs
 
     direction = (
         TriangleMultiplicationDirection.OUTGOING
@@ -2539,24 +3178,55 @@ def distributed_triangle_multiplication_update(
         )
 
     if 0 < project_chunk_size < int(module.c_hidden):
-        update = z_in.new_empty(z_in.shape[:-1] + (int(module.c_hidden),))
+        update = run_group_rank_action_synchronized(
+            lambda: z_in.new_empty(z_in.shape[:-1] + (int(module.c_hidden),)),
+            group=mesh.group_2d,
+            description="Fold-CP triangle-multiplication channel output allocation",
+        )
+        if update is None:  # pragma: no cover
+            raise RuntimeError(
+                "Fold-CP triangle-multiplication channel output was not allocated."
+            )
         for channel_start in range(0, int(module.c_hidden), project_chunk_size):
             channel_end = min(channel_start + project_chunk_size, int(module.c_hidden))
             channel_slice = slice(channel_start, channel_end)
-            a_local = torch.sigmoid(
-                _linear_output_slice(module.linear_a_g, z_norm, channel_slice)
+
+            def _project_channel_inputs():
+                projected_a = torch.sigmoid(
+                    _linear_output_slice(module.linear_a_g, z_norm, channel_slice)
+                )
+                projected_a *= _linear_output_slice(
+                    module.linear_a_p,
+                    z_norm,
+                    channel_slice,
+                )
+                if mask is not None:
+                    projected_a *= mask
+                projected_b = torch.sigmoid(
+                    _linear_output_slice(module.linear_b_g, z_norm, channel_slice)
+                )
+                projected_b *= _linear_output_slice(
+                    module.linear_b_p,
+                    z_norm,
+                    channel_slice,
+                )
+                if mask is not None:
+                    projected_b *= mask
+                return projected_a, projected_b
+
+            projected_inputs = run_group_rank_action_synchronized(
+                _project_channel_inputs,
+                group=mesh.group_2d,
+                description="Fold-CP triangle-multiplication channel projection",
             )
-            a_local *= _linear_output_slice(module.linear_a_p, z_norm, channel_slice)
-            if mask is not None:
-                a_local *= mask
-            b_local = torch.sigmoid(
-                _linear_output_slice(module.linear_b_g, z_norm, channel_slice)
-            )
-            b_local *= _linear_output_slice(module.linear_b_p, z_norm, channel_slice)
-            if mask is not None:
-                b_local *= mask
+            if projected_inputs is None:  # pragma: no cover
+                raise RuntimeError(
+                    "Fold-CP triangle-multiplication channel inputs were not projected."
+                )
+            a_local, b_local = projected_inputs
+            del projected_inputs
             if z_spec is None:
-                update[..., channel_slice] = distributed_triangle_multiplication(
+                channel_update = distributed_triangle_multiplication(
                     a_local,
                     b_local,
                     mesh.ring_comm(),
@@ -2564,52 +3234,77 @@ def distributed_triangle_multiplication_update(
                 )
             else:
                 b_matmul = (
-                    b_local.cpu()
+                    _one_by_p_offload_trimul_b_synchronized(b_local, mesh)
                     if _one_by_p_should_offload_trimul_b(b_local, mesh)
                     else b_local
                 )
                 b_was_offloaded = b_matmul is not b_local
                 if b_was_offloaded:
                     del b_local
-                    torch.cuda.empty_cache()
-                update[..., channel_slice] = (
-                    _distributed_triangle_multiplication_source_matmul(
-                        a_local,
-                        b_matmul,
-                        mesh,
-                        direction,
-                        z_spec,
+                    run_group_rank_action_synchronized(
+                        torch.cuda.empty_cache,
+                        group=mesh.group_2d,
+                        description=(
+                            "Fold-CP triangle-multiplication B post-offload cleanup"
+                        ),
                     )
+                channel_update = _distributed_triangle_multiplication_source_matmul(
+                    a_local,
+                    b_matmul,
+                    mesh,
+                    direction,
+                    z_spec,
                 )
                 del b_matmul
                 if not b_was_offloaded:
                     del b_local
+
+            run_group_rank_action_synchronized(
+                lambda: update[..., channel_slice].copy_(channel_update),
+                group=mesh.group_2d,
+                description="Fold-CP triangle-multiplication channel assembly",
+            )
+            del channel_update
             del a_local
             if z_spec is None:
                 del b_local
         if z_spec is not None:
             del z_norm, mask
     else:
-        if z_spec is None:
-            a_local = torch.sigmoid(project_linear(module.linear_a_g, z_norm))
-            a_local *= project_linear(module.linear_a_p, z_norm)
-            if mask is not None:
-                a_local *= mask
-        else:
-            a_local = _triangle_a_projection_source_chunks(
+
+        def _project_a_and_compatibility_b():
+            if z_spec is None:
+                projected_a = torch.sigmoid(project_linear(module.linear_a_g, z_norm))
+                projected_a *= project_linear(module.linear_a_p, z_norm)
+                if mask is not None:
+                    projected_a *= mask
+                projected_b = torch.sigmoid(project_linear(module.linear_b_g, z_norm))
+                projected_b *= project_linear(module.linear_b_p, z_norm)
+                if mask is not None:
+                    projected_b *= mask
+                return projected_a, projected_b
+            projected_a = _triangle_a_projection_source_chunks(
                 module,
                 z_norm,
                 mask,
                 z_spec,
                 source_unbatched=squeeze_batch,
             )
-        if z_spec is None:
-            b_local = torch.sigmoid(project_linear(module.linear_b_g, z_norm))
-            b_local *= project_linear(module.linear_b_p, z_norm)
-            if mask is not None:
-                b_local *= mask
-            b_owned_rows = None
-        else:
+            return projected_a, None
+
+        projected_inputs = run_group_rank_action_synchronized(
+            _project_a_and_compatibility_b,
+            group=mesh.group_2d,
+            description="Fold-CP triangle-multiplication A/B projection",
+        )
+        if projected_inputs is None:  # pragma: no cover
+            raise RuntimeError(
+                "Fold-CP triangle-multiplication A/B inputs were not projected."
+            )
+        a_local, b_local = projected_inputs
+        del projected_inputs
+        b_owned_rows = None
+        if z_spec is not None:
             original_n = int(z_spec.original_shape[z_spec.pair_dims[0]])
             direct_b_owned_rows = _one_by_p_should_project_b_owned_rows(
                 z_norm,
@@ -2631,6 +3326,7 @@ def distributed_triangle_multiplication_update(
             )
             b_owned_rows = b_projection if direct_b_owned_rows else None
             b_local = None if direct_b_owned_rows else b_projection
+            del b_projection
         if z_spec is None:
             update = distributed_triangle_multiplication(
                 a_local,
@@ -2652,14 +3348,20 @@ def distributed_triangle_multiplication_update(
                 del b_owned_rows
             else:
                 b_matmul = (
-                    b_local.cpu()
+                    _one_by_p_offload_trimul_b_synchronized(b_local, mesh)
                     if _one_by_p_should_offload_trimul_b(b_local, mesh)
                     else b_local
                 )
                 b_was_offloaded = b_matmul is not b_local
                 if b_was_offloaded:
                     del b_local
-                    torch.cuda.empty_cache()
+                    run_group_rank_action_synchronized(
+                        torch.cuda.empty_cache,
+                        group=mesh.group_2d,
+                        description=(
+                            "Fold-CP triangle-multiplication B post-offload cleanup"
+                        ),
+                    )
                 update = _distributed_triangle_multiplication_source_matmul(
                     a_local,
                     b_matmul,
@@ -2673,24 +3375,54 @@ def distributed_triangle_multiplication_update(
         del a_local
         if z_spec is None:
             del b_local
-    if z_spec is None:
-        update = _triangle_multiplication_output_norm_gate(module, update, z_norm, mesh)
-    else:
-        update = _triangle_multiplication_output_norm_gate_source_slab(
+
+    if z_spec is not None and (
+        int(mesh.layout.shape[0]) * int(mesh.layout.shape[1]) > 1
+    ):
+        return _triangle_multiplication_output_norm_gate_source_slab(
             module,
             update,
             z_in,
             mesh,
             z_spec,
             source_unbatched=squeeze_batch,
+            squeeze_batch=squeeze_batch,
+            residual_local=residual_local,
         )
 
-    if squeeze_batch:
-        update = update.squeeze(0)
-    if residual_local is not None:
-        residual_local += update
-        return residual_local.contiguous()
-    return update.contiguous()
+    def _finish_triangle_multiplication_update() -> torch.Tensor:
+        if z_spec is None:
+            finished_update = _triangle_multiplication_output_norm_gate(
+                module,
+                update,
+                z_norm,
+                mesh,
+            )
+        else:
+            finished_update = _triangle_multiplication_output_norm_gate_source_slab(
+                module,
+                update,
+                z_in,
+                mesh,
+                z_spec,
+                source_unbatched=squeeze_batch,
+            )
+
+        if squeeze_batch:
+            finished_update = finished_update.squeeze(0)
+        if residual_local is not None:
+            residual_local.add_(finished_update)
+            return residual_local.contiguous()
+        return finished_update.contiguous()
+
+    result = run_group_rank_action_synchronized(
+        _finish_triangle_multiplication_update,
+        group=mesh.group_2d,
+        description="Fold-CP triangle-multiplication output finalization",
+    )
+    if result is None:  # pragma: no cover - every rank runs the action
+        raise RuntimeError("Fold-CP triangle-multiplication returned no final output.")
+    return result
 
 
 def distributed_pair_transition_update(
@@ -2713,45 +3445,68 @@ def distributed_pair_transition_update(
         col_start, col_end = z_spec.col_range
         valid_rows = max(0, min(row_end, original_n) - row_start)
         valid_cols = max(0, min(col_end, original_n) - col_start)
-        if valid_rows == 0 or valid_cols == 0:
+        flat_chunk_size = _pair_transition_source_flat_chunk_size(z_local)
+        if (valid_rows == 0 or valid_cols == 0) and flat_chunk_size > 0:
             update = z_local.new_zeros(z_local.shape)
             if residual_local is not None:
                 residual_local += update
                 return residual_local.contiguous()
             return update
 
-        flat_chunk_size = _pair_transition_source_flat_chunk_size(z_local)
         if flat_chunk_size <= 0:
             z_row_slab = _ring_gather_by_row(z_local, mesh, dim=-2, length=original_n)
-            row_pad = _pair_transition_row_pad_size(valid_rows, original_n)
-            source_launch_sensitive = valid_rows * original_n >= 2_097_152
-            if source_launch_sensitive and (
-                row_start > 0 or col_start > 0 or valid_rows > 1024
-            ):
-                row_pad = max(row_pad, original_n)
-            launch_row_start = row_start if row_pad == original_n else 0
-            if row_pad != z_row_slab.shape[-3]:
-                z_padded = z_row_slab.new_zeros(
-                    z_row_slab.shape[:-3]
-                    + (row_pad, z_row_slab.shape[-2], z_row_slab.shape[-1])
-                )
-                z_padded[
+
+            def _finish_row_slab_transition() -> torch.Tensor:
+                # A 1xP rank whose column tile is pure padding must still join
+                # the row gather above. It can skip only the communication-free
+                # transition after every peer has completed that collective.
+                if valid_rows == 0 or valid_cols == 0:
+                    update = z_local.new_zeros(z_local.shape)
+                    if residual_local is not None:
+                        residual_local.add_(update)
+                        return residual_local.contiguous()
+                    return update
+                row_pad = _pair_transition_row_pad_size(valid_rows, original_n)
+                source_launch_sensitive = valid_rows * original_n >= 2_097_152
+                if source_launch_sensitive and (
+                    row_start > 0 or col_start > 0 or valid_rows > 1024
+                ):
+                    row_pad = max(row_pad, original_n)
+                launch_row_start = row_start if row_pad == original_n else 0
+                if row_pad != z_row_slab.shape[-3]:
+                    z_padded = z_row_slab.new_zeros(
+                        z_row_slab.shape[:-3]
+                        + (row_pad, z_row_slab.shape[-2], z_row_slab.shape[-1])
+                    )
+                    z_padded[
+                        ...,
+                        launch_row_start : launch_row_start + valid_rows,
+                        :,
+                        :,
+                    ] = z_row_slab[..., :valid_rows, :, :]
+                else:
+                    z_padded = z_row_slab
+                update_row_slab = transition(z_padded)
+                update = z_local.new_zeros(z_local.shape)
+                update[..., :valid_rows, :valid_cols, :] = update_row_slab[
                     ...,
                     launch_row_start : launch_row_start + valid_rows,
+                    col_start : col_start + valid_cols,
                     :,
-                    :,
-                ] = z_row_slab[..., :valid_rows, :, :]
-            else:
-                z_padded = z_row_slab
-            update_row_slab = transition(z_padded)
-            update = z_local.new_zeros(z_local.shape)
-            update[..., :valid_rows, :valid_cols, :] = update_row_slab[
-                ...,
-                launch_row_start : launch_row_start + valid_rows,
-                col_start : col_start + valid_cols,
-                :,
-            ]
-            del z_row_slab, z_padded, update_row_slab
+                ]
+                if residual_local is not None:
+                    residual_local.add_(update)
+                    return residual_local.contiguous()
+                return update
+
+            result = run_group_rank_action_synchronized(
+                _finish_row_slab_transition,
+                group=mesh.group_2d,
+                description="Pairformer row-slab transition completion",
+            )
+            if result is None:  # pragma: no cover - every rank runs the action
+                raise RuntimeError("Pairformer row-slab transition returned no result.")
+            return result
         elif all(
             int(size) == 1 for size in z_local.shape[:-3]
         ) and _pair_transition_should_use_compact_source(
@@ -2941,41 +3696,23 @@ def _gather_single_update_by_2d_ring(
     mesh: FoldCPProcessMesh,
     pair_row_tile: int,
 ) -> torch.Tensor:
-    """Gather rank-sharded single updates with Fold-CP row then column rings."""
+    """Gather single updates over the only row of the maintained 1xP mesh."""
 
-    local_update = local_update.contiguous()
     ring = mesh.ring_comm()
     side_rows, side_cols = mesh.layout.shape
-
-    row_chunks: list[torch.Tensor | None] = [None for _ in range(side_cols)]
-    row_chunks[mesh.coord[1]] = local_update
-    ready = local_update
-    for step in range(1, side_cols):
-        ready = ring.comm_row.exchange(ready.contiguous())
-        source_col = (mesh.coord[1] + step) % side_cols
-        row_chunks[source_col] = ready
-    if any(item is None for item in row_chunks):
-        raise RuntimeError("failed to collect single update row chunks.")
-    row_block = torch.cat([item for item in row_chunks if item is not None], dim=-2)
-
-    col_blocks: list[torch.Tensor | None] = [None for _ in range(side_rows)]
-    col_blocks[mesh.coord[0]] = row_block.contiguous()
-    ready = row_block
-    for step in range(1, side_rows):
-        ready = ring.comm_col.exchange(ready.contiguous())
-        source_row = (mesh.coord[0] + step) % side_rows
-        col_blocks[source_row] = ready
-    if any(item is None for item in col_blocks):
-        raise RuntimeError("failed to collect single update column blocks.")
-    trimmed_blocks: list[torch.Tensor] = []
-    for row_index, item in enumerate(col_blocks):
-        if item is None:
-            raise RuntimeError("failed to collect single update column block.")
-        row_start = row_index * pair_row_tile
-        valid_rows = max(0, min(pair_row_tile, n_token - row_start))
-        trimmed_blocks.append(item[:valid_rows])
-    full_update = torch.cat(trimmed_blocks, dim=-2)
-    return full_update[:n_token].contiguous()
+    if side_rows != 1:  # pragma: no cover - rejected by mesh construction
+        raise RuntimeError("AttentionPairBias requires the maintained 1xP mesh.")
+    row_block = gather_tensor_by_ring(
+        local_update,
+        comm=ring.comm_row,
+        group=mesh.group_row,
+        local_index=mesh.coord[1],
+        side=side_cols,
+        dim=-2,
+        length=pair_row_tile,
+        description="AttentionPairBias single-update row ring",
+    )
+    return row_block.narrow(-2, 0, n_token).contiguous()
 
 
 def _gather_single_rows_by_col_ring(
@@ -3047,17 +3784,37 @@ def _attention_pair_bias_extra_rows(
 ) -> torch.Tensor | None:
     if extra_attn_bias_local is None:
         return None
-    if extra_attn_bias_local.ndim < 2:
-        raise ValueError("extra attention bias must carry pair row/column dimensions.")
+
+    def _validate_extra_bias() -> torch.Tensor:
+        if extra_attn_bias_local.ndim < 2:
+            raise ValueError(
+                "extra attention bias must carry pair row/column dimensions."
+            )
+        return extra_attn_bias_local
+
+    prepared_extra_bias = run_group_rank_action_synchronized(
+        _validate_extra_bias,
+        group=mesh.group_row,
+        description="AttentionPairBias extra-bias validation",
+    )
+    if prepared_extra_bias is None:  # pragma: no cover
+        raise RuntimeError("AttentionPairBias extra bias was not validated.")
     extra_rows = _ring_gather_by_row(
-        extra_attn_bias_local,
+        prepared_extra_bias,
         mesh,
         dim=-1,
         length=n_token,
     )
-    return extra_rows[
-        ..., local_row_offset : local_row_offset + valid_rows, :
-    ].contiguous()
+    result = run_group_rank_action_synchronized(
+        lambda: extra_rows[
+            ..., local_row_offset : local_row_offset + valid_rows, :
+        ].contiguous(),
+        group=mesh.group_row,
+        description="AttentionPairBias extra-bias row selection",
+    )
+    if result is None:  # pragma: no cover
+        raise RuntimeError("AttentionPairBias extra-bias rows were not selected.")
+    return result
 
 
 def _single_update_rank_range(
@@ -3125,29 +3882,113 @@ def distributed_attention_pair_bias_update(
 ) -> torch.Tensor:
     """Run Pairformer single attention while keeping pair bias as a CP tile."""
 
-    if getattr(attention_pair_bias, "has_s", False):
-        raise ValueError("Fold-CP AttentionPairBias currently supports has_s=False.")
-    if getattr(attention_pair_bias, "cross_attention_mode", False):
-        raise ValueError(
-            "Fold-CP AttentionPairBias currently supports self-attention only."
+    def _prepare_attention_pair_bias():
+        if getattr(attention_pair_bias, "has_s", False):
+            raise ValueError(
+                "Fold-CP AttentionPairBias currently supports has_s=False."
+            )
+        if getattr(attention_pair_bias, "cross_attention_mode", False):
+            raise ValueError(
+                "Fold-CP AttentionPairBias currently supports self-attention only."
+            )
+        if a.ndim != 2 or z_local.ndim != 3:
+            raise ValueError(
+                "Fold-CP AttentionPairBias expects a=[N,C] and z_local=[T,T,C]."
+            )
+
+        n_token = a.shape[-2]
+        tile = z_local.shape[-3]
+        a_norm = attention_pair_bias.layernorm_a(a)
+        row_start, valid_row_end, single_tile = _single_update_rank_range(
+            n_token,
+            mesh,
+            tile,
         )
-    if a.ndim != 2 or z_local.ndim != 3:
-        raise ValueError(
-            "Fold-CP AttentionPairBias expects a=[N,C] and z_local=[T,T,C]."
+        valid_rows = max(0, valid_row_end - row_start)
+        local_update = a.new_zeros((single_tile, a.shape[-1]))
+        pair_row_start = mesh.coord[0] * tile
+        q, k, v = attention_pair_bias.attention._prep_qkv(
+            q_x=a_norm,
+            kv_x=a_norm,
+            apply_scale=True,
+        )
+        source_shape_out = q.new_zeros((n_token, q.shape[0], q.shape[-1]))
+        row_chunk_size = _attention_pair_bias_row_launch_size(valid_rows, n_token)
+        pair_valid_row_end = min(pair_row_start + tile, n_token)
+        communication_segments = _attention_pair_bias_owned_chunk_segments(
+            owner_start=pair_row_start,
+            owner_end=pair_valid_row_end,
+            n_token=n_token,
+            row_chunk_size=row_chunk_size,
+        )
+        source_launch_bytes = (
+            int(n_token)
+            * int(n_token)
+            * int(z_local.shape[-1])
+            * int(z_local.element_size())
+        )
+        source_launch_budget = int(
+            os.environ.get(
+                "OPENDDE_FOLDCP_ATTN_PAIR_BIAS_SOURCE_GRID_MAX_BYTES",
+                str(32 * 1024**3),
+            )
+        )
+        use_chunked_source_launch = (
+            source_launch_budget >= 0 and source_launch_bytes > source_launch_budget
+        )
+        bias_source_chunks: dict[int, torch.Tensor] = {}
+
+        # Keep the z -> attention-bias GEMM launch identical to the ordinary
+        # single-device path while the source grid fits the configured budget.
+        z_source_launch = (
+            None
+            if use_chunked_source_launch
+            else z_local.new_zeros((n_token, n_token, z_local.shape[-1]))
+        )
+        return (
+            n_token,
+            tile,
+            a_norm,
+            row_start,
+            valid_row_end,
+            valid_rows,
+            local_update,
+            pair_row_start,
+            q,
+            k,
+            v,
+            source_shape_out,
+            communication_segments,
+            use_chunked_source_launch,
+            bias_source_chunks,
+            z_source_launch,
         )
 
-    n_token = a.shape[-2]
-    tile = z_local.shape[-3]
-
-    a_norm = attention_pair_bias.layernorm_a(a)
-    row_start, valid_row_end, single_tile = _single_update_rank_range(
-        n_token,
-        mesh,
-        tile,
+    prepared = run_group_rank_action_synchronized(
+        _prepare_attention_pair_bias,
+        group=mesh.group_2d,
+        description="AttentionPairBias pre-ring preparation",
     )
-    valid_rows = max(0, valid_row_end - row_start)
-    local_update = a.new_zeros((single_tile, a.shape[-1]))
-    pair_row_start = mesh.coord[0] * tile
+    if prepared is None:  # pragma: no cover
+        raise RuntimeError("AttentionPairBias pre-ring inputs were not prepared.")
+    (
+        n_token,
+        tile,
+        a_norm,
+        row_start,
+        valid_row_end,
+        valid_rows,
+        local_update,
+        pair_row_start,
+        q,
+        k,
+        v,
+        source_shape_out,
+        communication_segments,
+        use_chunked_source_launch,
+        bias_source_chunks,
+        z_source_launch,
+    ) = prepared
     local_row_offset = row_start - pair_row_start
     extra_bias_rows = _attention_pair_bias_extra_rows(
         extra_attn_bias_local,
@@ -3156,48 +3997,7 @@ def distributed_attention_pair_bias_update(
         valid_rows,
         n_token,
     )
-    q, k, v = attention_pair_bias.attention._prep_qkv(
-        q_x=a_norm,
-        kv_x=a_norm,
-        apply_scale=True,
-    )
-    source_shape_out = q.new_zeros((n_token, q.shape[0], q.shape[-1]))
-    row_chunk_size = _attention_pair_bias_row_launch_size(valid_rows, n_token)
-    pair_valid_row_end = min(pair_row_start + tile, n_token)
-    communication_segments = _attention_pair_bias_owned_chunk_segments(
-        owner_start=pair_row_start,
-        owner_end=pair_valid_row_end,
-        n_token=n_token,
-        row_chunk_size=row_chunk_size,
-    )
-
-    source_launch_bytes = (
-        int(n_token)
-        * int(n_token)
-        * int(z_local.shape[-1])
-        * int(z_local.element_size())
-    )
-    source_launch_budget = int(
-        os.environ.get(
-            "OPENDDE_FOLDCP_ATTN_PAIR_BIAS_SOURCE_GRID_MAX_BYTES",
-            str(32 * 1024**3),
-        )
-    )
-    use_chunked_source_launch = (
-        source_launch_budget >= 0 and source_launch_bytes > source_launch_budget
-    )
-    bias_source_chunks: dict[int, torch.Tensor] = {}
-
-    # Keep the z -> attention-bias GEMM launch identical to the ordinary
-    # single-device path while the source grid fits the configured budget. For
-    # larger grids, use globally aligned row chunks. Their launch geometry is
-    # independent of P and avoids materializing an otherwise unsharded N^2 C_z
-    # temporary on every rank.
-    z_source_launch = (
-        None
-        if use_chunked_source_launch
-        else z_local.new_zeros((n_token, n_token, z_local.shape[-1]))
-    )
+    ring_compute_error: Exception | None = None
     for (
         chunk_start,
         chunk_rows,
@@ -3212,95 +4012,135 @@ def distributed_attention_pair_bias_update(
             dim=-2,
             length=n_token,
         )
-        segment_start = max(row_start, pair_segment_start)
-        segment_end = min(valid_row_end, pair_segment_start + pair_segment_rows)
-        if segment_start < segment_end:
-            z_row_offset = segment_start - pair_segment_start
-            z_normalized = attention_pair_bias.layernorm_z(
-                z_rows[z_row_offset : z_row_offset + segment_end - segment_start]
-            )
-            if use_chunked_source_launch:
-                chunk_offset = segment_start - chunk_start
-                z_chunk_launch = z_local.new_zeros(
-                    (chunk_rows, n_token, z_local.shape[-1])
+        if ring_compute_error is None:
+            try:
+                segment_start = max(row_start, pair_segment_start)
+                segment_end = min(
+                    valid_row_end,
+                    pair_segment_start + pair_segment_rows,
                 )
-                z_chunk_launch[
-                    chunk_offset : chunk_offset + segment_end - segment_start
-                ] = z_normalized
-                bias_source_chunks[chunk_start] = permute_final_dims(
-                    attention_pair_bias.linear_nobias_z(z_chunk_launch),
-                    [2, 0, 1],
-                ).contiguous()
-                del z_chunk_launch
-            else:
-                z_source_launch[segment_start:segment_end] = z_normalized
-            del z_normalized
+                if segment_start < segment_end:
+                    z_row_offset = segment_start - pair_segment_start
+                    z_normalized = attention_pair_bias.layernorm_z(
+                        z_rows[
+                            z_row_offset : z_row_offset + segment_end - segment_start
+                        ]
+                    )
+                    if use_chunked_source_launch:
+                        chunk_offset = segment_start - chunk_start
+                        z_chunk_launch = z_local.new_zeros(
+                            (chunk_rows, n_token, z_local.shape[-1])
+                        )
+                        z_chunk_launch[
+                            chunk_offset : chunk_offset + segment_end - segment_start
+                        ] = z_normalized
+                        bias_source_chunks[chunk_start] = permute_final_dims(
+                            attention_pair_bias.linear_nobias_z(z_chunk_launch),
+                            [2, 0, 1],
+                        ).contiguous()
+                        del z_chunk_launch
+                    else:
+                        z_source_launch[segment_start:segment_end] = z_normalized
+                    del z_normalized
+            except Exception as exc:
+                # Every row group has the same gather schedule. Keep draining
+                # it after a local normalization/projection failure, then
+                # propagate the original failure before final communication.
+                ring_compute_error = detach_rank_local_error_traceback(exc)
         del z_rows
-    # Normalizing only populated rows avoids a second full [N, N, C_z]
-    # temporary. LayerNorm is row-local; the following Linear is the operation
-    # whose complete source shape is required for BF16 bitwise parity.
-    if use_chunked_source_launch:
-        bias_source = None
-    else:
-        bias_source = attention_pair_bias.linear_nobias_z(z_source_launch)
-        del z_source_launch
-        bias_source = permute_final_dims(bias_source, [2, 0, 1]).contiguous()
 
-    for (
-        chunk_start,
-        chunk_rows,
-        pair_chunk_offset,
-        pair_segment_rows,
-    ) in communication_segments:
-        pair_segment_start = chunk_start + pair_chunk_offset
-        pair_segment_end = pair_segment_start + pair_segment_rows
-        segment_start = max(row_start, pair_segment_start)
-        segment_end = min(valid_row_end, pair_segment_end)
-        if segment_start >= segment_end:
-            continue
-        segment_rows = segment_end - segment_start
-        chunk_offset = segment_start - chunk_start
+    def _finish_attention_pair_bias_local() -> torch.Tensor:
+        nonlocal z_source_launch
+        if ring_compute_error is not None:
+            raise ring_compute_error
+
+        # Normalizing only populated rows avoids a second full [N, N, C_z]
+        # temporary. The Linear retains the complete source launch shape used
+        # by the single-device BF16 path.
         if use_chunked_source_launch:
-            bias_launch = bias_source_chunks[chunk_start]
+            bias_source = None
         else:
-            bias_launch = bias_source[
-                :, chunk_start : chunk_start + chunk_rows, :
-            ].contiguous()
-        if extra_bias_rows is not None:
-            owner_offset = segment_start - row_start
-            extra_bias = extra_bias_rows[
-                ..., owner_offset : owner_offset + segment_rows, :
-            ]
-            if extra_bias.ndim == 2:
-                extra_bias = extra_bias.unsqueeze(0)
-            bias_launch[:, chunk_offset : chunk_offset + segment_rows, :] += (
-                extra_bias.to(dtype=bias_launch.dtype, device=bias_launch.device)
-            )
+            bias_source = attention_pair_bias.linear_nobias_z(z_source_launch)
+            z_source_launch = None
+            bias_source = permute_final_dims(bias_source, [2, 0, 1]).contiguous()
 
-        q_launch = q.new_zeros((q.shape[0], chunk_rows, q.shape[-1]))
-        q_launch[:, chunk_offset : chunk_offset + segment_rows, :] = q[
-            :, segment_start:segment_end, :
-        ]
-        row_out_launch = _single_feature_attention(
-            q=q_launch.contiguous(),
-            k=k.contiguous(),
-            v=v.contiguous(),
-            attn_bias=bias_launch.contiguous(),
-            use_efficient_implementation=attention_pair_bias.attention.use_efficient_implementation,
-            inplace_safe=False,
+        for (
+            chunk_start,
+            chunk_rows,
+            pair_chunk_offset,
+            pair_segment_rows,
+        ) in communication_segments:
+            pair_segment_start = chunk_start + pair_chunk_offset
+            pair_segment_end = pair_segment_start + pair_segment_rows
+            segment_start = max(row_start, pair_segment_start)
+            segment_end = min(valid_row_end, pair_segment_end)
+            if segment_start >= segment_end:
+                continue
+            segment_rows = segment_end - segment_start
+            chunk_offset = segment_start - chunk_start
+            if use_chunked_source_launch:
+                # This chunk is consumed exactly once. Transfer ownership out
+                # of the staging dictionary before allocating attention
+                # workspaces so completed bias chunks do not remain resident.
+                bias_launch = bias_source_chunks.pop(chunk_start)
+            else:
+                bias_launch = bias_source[
+                    :, chunk_start : chunk_start + chunk_rows, :
+                ].contiguous()
+            if extra_bias_rows is not None:
+                owner_offset = segment_start - row_start
+                extra_bias = extra_bias_rows[
+                    ..., owner_offset : owner_offset + segment_rows, :
+                ]
+                if extra_bias.ndim == 2:
+                    extra_bias = extra_bias.unsqueeze(0)
+                bias_launch[:, chunk_offset : chunk_offset + segment_rows, :] += (
+                    extra_bias.to(dtype=bias_launch.dtype, device=bias_launch.device)
+                )
+
+            q_launch = q.new_zeros((q.shape[0], chunk_rows, q.shape[-1]))
+            q_launch[:, chunk_offset : chunk_offset + segment_rows, :] = q[
+                :, segment_start:segment_end, :
+            ]
+            row_out_launch = _single_feature_attention(
+                q=q_launch.contiguous(),
+                k=k.contiguous(),
+                v=v.contiguous(),
+                attn_bias=bias_launch.contiguous(),
+                use_efficient_implementation=(
+                    attention_pair_bias.attention.use_efficient_implementation
+                ),
+                inplace_safe=False,
+            )
+            row_out = row_out_launch[:, chunk_offset : chunk_offset + segment_rows, :]
+            source_shape_out[segment_start:segment_end] = row_out.to(
+                dtype=q.dtype
+            ).transpose(-2, -3)
+            del q_launch, row_out_launch, row_out, bias_launch
+
+        bias_source_chunks.clear()
+        bias_source = None
+        source_shape_update = attention_pair_bias.attention._wrap_up(
+            source_shape_out,
+            a_norm,
         )
-        row_out = row_out_launch[:, chunk_offset : chunk_offset + segment_rows, :]
-        source_shape_out[segment_start:segment_end] = row_out.to(
-            dtype=q.dtype
-        ).transpose(-2, -3)
-    del bias_source, bias_source_chunks
-    source_shape_update = attention_pair_bias.attention._wrap_up(
-        source_shape_out,
-        a_norm,
+        if valid_rows > 0:
+            local_update[:valid_rows] = source_shape_update[row_start:valid_row_end]
+        return local_update
+
+    completed_local_update = run_group_rank_action_synchronized(
+        _finish_attention_pair_bias_local,
+        group=mesh.group_2d,
+        description="AttentionPairBias local computation",
     )
-    if valid_rows > 0:
-        local_update[:valid_rows] = source_shape_update[row_start:valid_row_end]
-    return _gather_single_update_by_2d_ring(local_update, a.shape[-2], mesh, tile)
+    if completed_local_update is None:  # pragma: no cover
+        raise RuntimeError("AttentionPairBias local update was not completed.")
+    return _gather_single_update_by_2d_ring(
+        completed_local_update,
+        a.shape[-2],
+        mesh,
+        tile,
+    )
 
 
 def _local_triangle_bias(
@@ -3362,27 +4202,23 @@ def _starting_triangle_bias_full_key_from_source_slab(
 ) -> torch.Tensor:
     """Project starting triangle bias from source-layout query-row slabs."""
 
+    synchronize_failures = int(mesh.layout.shape[0]) * int(mesh.layout.shape[1]) > 1
     if source_grid_launch:
         row_side = mesh.layout.shape[0]
         if row_side == 1:
             x_stack = x_local.unsqueeze(0).contiguous()
         else:
             ring = mesh.ring_comm()
-            gathered_x: list[torch.Tensor | None] = [None for _ in range(row_side)]
-            gathered_x[mesh.coord[0]] = x_local.contiguous()
-            ready_x = gathered_x[mesh.coord[0]]
-            for step in range(1, row_side):
-                ready_x = ring.comm_col.exchange(ready_x.contiguous())
-                source_row = (mesh.coord[0] + step) % row_side
-                gathered_x[source_row] = ready_x
-            if any(item is None for item in gathered_x):
-                raise RuntimeError(
-                    "failed to collect starting triangle bias source rows."
-                )
-            x_stack = torch.stack(
-                [item for item in gathered_x if item is not None],
+            x_stack = gather_tensor_by_ring(
+                x_local.unsqueeze(0),
+                comm=ring.comm_col,
+                group=mesh.group_col,
+                local_index=mesh.coord[0],
+                side=row_side,
                 dim=0,
-            ).contiguous()
+                length=row_side,
+                description="starting triangle-bias source-row ring",
+            )
 
         x_source_row_slab = _select_query_row_stack(
             _ring_gather_by_row(
@@ -3393,61 +4229,85 @@ def _starting_triangle_bias_full_key_from_source_slab(
             ),
             mesh,
         )
-        exact_source_launch = _triatt_exact_source_launch(original_n)
-        source_rows = int(original_n) * int(original_n)
-        source_launch_boundary = _triatt_bias_source_launch_boundary(source_rows)
-        query_offset = query_start if x_source_row_slab.shape[-3] == original_n else 0
-        if x_source_row_slab.shape[-3] != original_n and (
-            exact_source_launch or source_launch_boundary
-        ):
-            x_padded = x_source_row_slab.new_zeros(
-                x_source_row_slab.shape[:-3]
-                + (original_n, x_source_row_slab.shape[-2], x_source_row_slab.shape[-1])
-            )
-            x_padded[..., query_start : query_start + valid_query, :, :] = (
-                x_source_row_slab[..., :valid_query, :, :]
-            )
-            x_source_row_slab = x_padded
-            query_offset = query_start
-        linear_bias = (
-            _linear_with_exact_source_launch_shape(
-                triangle_attention.linear,
-                x_source_row_slab,
-                source_rows=source_rows,
-            )
-            if exact_source_launch or source_launch_boundary
-            else triangle_attention.linear(x_source_row_slab)
-        )
-        triangle_bias = permute_final_dims(linear_bias, (2, 0, 1))
-        return triangle_bias[
-            :, query_offset : query_offset + valid_query, :
-        ].contiguous()
 
-    local_triangle_bias = _project_starting_triangle_bias_local_tile(
-        triangle_attention,
-        x_local,
-        mesh,
-        original_n,
+        def _finish_source_grid_bias() -> torch.Tensor:
+            exact_source_launch = _triatt_exact_source_launch(original_n)
+            source_rows = int(original_n) * int(original_n)
+            source_launch_boundary = _triatt_bias_source_launch_boundary(source_rows)
+            query_offset = (
+                query_start if x_source_row_slab.shape[-3] == original_n else 0
+            )
+            projection_input = x_source_row_slab
+            if x_source_row_slab.shape[-3] != original_n and (
+                exact_source_launch or source_launch_boundary
+            ):
+                projection_input = x_source_row_slab.new_zeros(
+                    x_source_row_slab.shape[:-3]
+                    + (
+                        original_n,
+                        x_source_row_slab.shape[-2],
+                        x_source_row_slab.shape[-1],
+                    )
+                )
+                projection_input[..., query_start : query_start + valid_query, :, :] = (
+                    x_source_row_slab[..., :valid_query, :, :]
+                )
+                query_offset = query_start
+            linear_bias = (
+                _linear_with_exact_source_launch_shape(
+                    triangle_attention.linear,
+                    projection_input,
+                    source_rows=source_rows,
+                )
+                if exact_source_launch or source_launch_boundary
+                else triangle_attention.linear(projection_input)
+            )
+            triangle_bias = permute_final_dims(linear_bias, (2, 0, 1))
+            return triangle_bias[
+                :, query_offset : query_offset + valid_query, :
+            ].contiguous()
+
+        if not synchronize_failures:
+            return _finish_source_grid_bias()
+        result = run_group_rank_action_synchronized(
+            _finish_source_grid_bias,
+            group=mesh.group_2d,
+            description="starting triangle-bias source projection completion",
+        )
+        if result is None:  # pragma: no cover - every rank runs the action
+            raise RuntimeError("starting triangle-bias source projection failed.")
+        return result
+
+    project_local = lambda: _project_starting_triangle_bias_local_tile(
+        triangle_attention, x_local, mesh, original_n
     )
+    local_triangle_bias = (
+        run_group_rank_action_synchronized(
+            project_local,
+            group=mesh.group_2d,
+            description="starting triangle-bias local projection",
+        )
+        if synchronize_failures
+        else project_local()
+    )
+    if local_triangle_bias is None:  # pragma: no cover
+        raise RuntimeError("starting triangle-bias local projection failed.")
 
     row_side = mesh.layout.shape[0]
     if row_side == 1:
         triangle_bias_stack = local_triangle_bias.unsqueeze(0).contiguous()
     else:
         ring = mesh.ring_comm()
-        gathered: list[torch.Tensor | None] = [None for _ in range(row_side)]
-        gathered[mesh.coord[0]] = local_triangle_bias.contiguous()
-        ready = gathered[mesh.coord[0]]
-        for step in range(1, row_side):
-            ready = ring.comm_col.exchange(ready.contiguous())
-            source_row = (mesh.coord[0] + step) % row_side
-            gathered[source_row] = ready
-        if any(item is None for item in gathered):
-            raise RuntimeError("failed to collect starting triangle bias source rows.")
-        triangle_bias_stack = torch.stack(
-            [item for item in gathered if item is not None],
+        triangle_bias_stack = gather_tensor_by_ring(
+            local_triangle_bias.unsqueeze(0),
+            comm=ring.comm_col,
+            group=mesh.group_col,
+            local_index=mesh.coord[0],
+            side=row_side,
             dim=0,
-        ).contiguous()
+            length=row_side,
+            description="starting triangle-bias projected-row ring",
+        )
 
     triangle_bias_source_row_slab = _select_query_row_stack(
         _ring_gather_by_row(
@@ -3458,14 +4318,27 @@ def _starting_triangle_bias_full_key_from_source_slab(
         ),
         mesh,
     )
-    # A 1 x P shard retains all global source rows; a 2D shard's selected
-    # row slab already begins at the query owner's row block.
-    query_offset = (
-        query_start if triangle_bias_source_row_slab.shape[-2] == original_n else 0
+
+    def _finish_projected_bias() -> torch.Tensor:
+        # A 1 x P shard retains all global source rows; a 2D shard's selected
+        # row slab already begins at the query owner's row block.
+        query_offset = (
+            query_start if triangle_bias_source_row_slab.shape[-2] == original_n else 0
+        )
+        return triangle_bias_source_row_slab[
+            :, query_offset : query_offset + valid_query, :
+        ].contiguous()
+
+    if not synchronize_failures:
+        return _finish_projected_bias()
+    result = run_group_rank_action_synchronized(
+        _finish_projected_bias,
+        group=mesh.group_2d,
+        description="starting triangle-bias projected completion",
     )
-    return triangle_bias_source_row_slab[
-        :, query_offset : query_offset + valid_query, :
-    ].contiguous()
+    if result is None:  # pragma: no cover
+        raise RuntimeError("starting triangle-bias projected output failed.")
+    return result
 
 
 def _project_starting_triangle_bias_local_tile(
@@ -3562,6 +4435,7 @@ def _wrap_up_triangle_attention_output(
         row_slice = slice(row_start, row_end)
         o_chunk = out_by_row_head_query[row_slice].transpose(-2, -3)
         x_chunk = x_local[row_slice]
+        g = None
         if mha.linear_g is not None:
             g = mha.sigmoid(mha.linear_g(x_chunk))
             g = g.view(g.shape[:-1] + (mha.no_heads, -1))
@@ -3572,6 +4446,7 @@ def _wrap_up_triangle_attention_output(
             wrapped[row_slice] += update_chunk
         else:
             wrapped[row_slice] = update_chunk
+        del o_chunk, x_chunk, g, update_chunk
     return wrapped.contiguous()
 
 
@@ -4037,6 +4912,297 @@ def _wrap_up_triangle_attention_output_chunk(
     return mha.linear_o(o_chunk)
 
 
+def _compute_triangle_attention_canonical_row_chunk(
+    triangle_attention: torch.nn.Module,
+    x_row_batch: torch.Tensor,
+    mask_row_batch: torch.Tensor,
+    triangle_bias: torch.Tensor,
+    out_local: torch.Tensor,
+    *,
+    residual_local: torch.Tensor | None,
+    canonical_batch_rows: int,
+    chunk_size: int,
+    query_pad: int,
+    valid_query: int,
+    local_query: slice,
+    valid_row_start: int,
+    valid_row_end: int,
+) -> None:
+    """Compute one communication-free canonical starting-attention batch."""
+
+    q_batch, k_batch, v_batch = _prep_triangle_attention_qkv_canonical_batch(
+        triangle_attention.mha,
+        x_row_batch,
+        canonical_rows=chunk_size,
+    )
+    q_chunk = q_batch.new_zeros(
+        (
+            canonical_batch_rows,
+            q_batch.shape[1],
+            query_pad,
+            q_batch.shape[-1],
+        )
+    )
+    q_chunk[:, :, :valid_query, :] = q_batch[:, :, local_query, :]
+    mask_bias = (triangle_attention.inf * (mask_row_batch - 1))[:, None, None, :]
+    # Keep the score/softmax workspace at the original canonical-row size.
+    attention_parts = []
+    for canonical_start in range(0, canonical_batch_rows, chunk_size):
+        canonical_end = canonical_start + chunk_size
+        score_bytes_per_head = (
+            chunk_size
+            * int(q_chunk.shape[-2])
+            * int(k_batch.shape[-2])
+            * int(q_chunk.element_size())
+            * 2
+        )
+        head_ranges = _triatt_attention_head_ranges(
+            q_chunk.shape[1],
+            score_bytes_per_head=score_bytes_per_head,
+        )
+        if len(head_ranges) > 1:
+            out_heads = []
+            for head_start, head_end in head_ranges:
+                out_heads.append(
+                    _foldcp_attention(
+                        q_chunk[
+                            canonical_start:canonical_end,
+                            head_start:head_end,
+                        ].contiguous(),
+                        k_batch[
+                            canonical_start:canonical_end,
+                            head_start:head_end,
+                        ].contiguous(),
+                        v_batch[
+                            canonical_start:canonical_end,
+                            head_start:head_end,
+                        ].contiguous(),
+                        [
+                            mask_bias[canonical_start:canonical_end].contiguous(),
+                            triangle_bias[None, head_start:head_end].contiguous(),
+                        ],
+                    )
+                )
+            attention_parts.append(torch.cat(out_heads, dim=1))
+        else:
+            attention_parts.append(
+                _foldcp_attention(
+                    q_chunk[canonical_start:canonical_end].contiguous(),
+                    k_batch[canonical_start:canonical_end].contiguous(),
+                    v_batch[canonical_start:canonical_end].contiguous(),
+                    [
+                        mask_bias[canonical_start:canonical_end].contiguous(),
+                        triangle_bias.unsqueeze(0).contiguous(),
+                    ],
+                )
+            )
+    out_chunk = torch.cat(attention_parts, dim=0)
+    update = _wrap_up_triangle_attention_canonical_batch(
+        triangle_attention.mha,
+        out_chunk[:, :, :valid_query, :].to(dtype=x_row_batch.dtype),
+        x_row_batch[:, local_query, :].contiguous(),
+        canonical_rows=chunk_size,
+    )[:, :valid_query]
+    if residual_local is not None:
+        out_local[valid_row_start:valid_row_end, :valid_query] += update
+    else:
+        out_local[valid_row_start:valid_row_end, :valid_query] = update
+
+
+def _compute_triangle_attention_regular_row_chunk(
+    triangle_attention: torch.nn.Module,
+    x_row_chunk: torch.Tensor,
+    mask_row_chunk: torch.Tensor,
+    triangle_bias: torch.Tensor,
+    out_local: torch.Tensor,
+    *,
+    residual_local: torch.Tensor | None,
+    exact_source_launch: bool,
+    projection_source_grid_launch: bool,
+    original_n: int,
+    row_start: int,
+    col_start: int,
+    valid_row_start: int,
+    valid_row_end: int,
+    valid_query: int,
+    local_query: slice,
+    query_pad: int,
+    row_chunk_size: int,
+    valid_rows: int,
+    chunk_size: int | None,
+    source_chunk_rows: int,
+    source_chunk_row_start: int,
+) -> None:
+    """Compute one communication-free starting-attention row chunk."""
+
+    current_rows = valid_row_end - valid_row_start
+    source_grid_qkv = not exact_source_launch and projection_source_grid_launch
+    source_chunk_qkv = not exact_source_launch and not source_grid_qkv
+    source_grid_wrap_launch = chunk_size is None and _triatt_wrap_source_grid_launch(
+        original_n,
+        x_row_chunk.shape[-1],
+        x_row_chunk.element_size(),
+    )
+    source_chunk_wrap_launch = chunk_size is not None
+    qkv_row_pad = (
+        original_n
+        if exact_source_launch
+        else _triatt_qkv_row_pad_size(current_rows, original_n)
+    )
+    streamed_row_launch = row_chunk_size < valid_rows
+    row_pad = (
+        current_rows
+        if source_chunk_qkv or (source_grid_qkv and streamed_row_launch)
+        else qkv_row_pad
+    )
+    launch_row_start = row_start + valid_row_start if exact_source_launch else 0
+    if source_grid_qkv:
+        x_row_source = x_row_chunk
+        q_row, k_row, v_row = _prep_triangle_attention_qkv_source_grid_chunks(
+            triangle_attention.mha,
+            x_row_chunk,
+            original_n=original_n,
+            row_start=row_start + valid_row_start,
+        )
+    elif source_chunk_qkv:
+        x_row_source = x_row_chunk
+        q_row, k_row, v_row = _prep_triangle_attention_qkv_source_chunk_chunks(
+            triangle_attention.mha,
+            x_row_chunk,
+            original_n=original_n,
+            source_rows=source_chunk_rows,
+            row_start=source_chunk_row_start,
+        )
+    else:
+        if qkv_row_pad != current_rows:
+            x_row_source = x_row_chunk.new_zeros(
+                (qkv_row_pad, x_row_chunk.shape[-2], x_row_chunk.shape[-1])
+            )
+            x_row_source[
+                launch_row_start : launch_row_start + current_rows,
+                :,
+                :,
+            ] = x_row_chunk
+        else:
+            x_row_source = x_row_chunk
+        q_row, k_row, v_row = _prep_triangle_attention_qkv_chunks(
+            triangle_attention.mha,
+            x_row_source,
+            x_row_source,
+            apply_scale=True,
+            source_rows=_triatt_qkv_source_rows(original_n),
+            exact_source_launch=exact_source_launch,
+        )
+
+    q_chunk = q_row.new_zeros((row_pad, q_row.shape[1], query_pad, q_row.shape[3]))
+    k_chunk = k_row.new_zeros((row_pad, k_row.shape[1], original_n, k_row.shape[3]))
+    v_chunk = v_row.new_zeros((row_pad, v_row.shape[1], original_n, v_row.shape[3]))
+    x_chunk = x_row_chunk.new_zeros((row_pad, query_pad, x_row_chunk.shape[-1]))
+    mask_bias = mask_row_chunk.new_zeros((row_pad, 1, 1, original_n))
+
+    if exact_source_launch:
+        row_slice = slice(launch_row_start, launch_row_start + current_rows)
+        q_chunk[row_slice, :, local_query, :] = q_row[row_slice, :, local_query, :]
+        k_chunk[row_slice] = k_row[row_slice]
+        v_chunk[row_slice] = v_row[row_slice]
+        x_chunk[row_slice, local_query, :] = x_row_source[row_slice, local_query, :]
+        mask_bias[row_slice] = (triangle_attention.inf * (mask_row_chunk - 1))[
+            :, None, None, :
+        ]
+    else:
+        q_chunk[:current_rows, :, :valid_query, :] = q_row[
+            launch_row_start : launch_row_start + current_rows,
+            :,
+            local_query,
+            :,
+        ]
+        k_chunk[:current_rows] = k_row[
+            launch_row_start : launch_row_start + current_rows
+        ]
+        v_chunk[:current_rows] = v_row[
+            launch_row_start : launch_row_start + current_rows
+        ]
+        x_chunk[:current_rows, :valid_query, :] = x_row_source[
+            launch_row_start : launch_row_start + current_rows,
+            local_query,
+            :,
+        ]
+        mask_bias[:current_rows] = (triangle_attention.inf * (mask_row_chunk - 1))[
+            :, None, None, :
+        ]
+
+    score_bytes_per_head = (
+        int(q_chunk.shape[0])
+        * int(q_chunk.shape[-2])
+        * int(k_chunk.shape[-2])
+        * int(q_chunk.element_size())
+        * 2
+    )
+    head_ranges = _triatt_attention_head_ranges(
+        q_chunk.shape[1],
+        score_bytes_per_head=score_bytes_per_head,
+    )
+    if len(head_ranges) > 1:
+        out_heads = []
+        for head_start, head_end in head_ranges:
+            out_heads.append(
+                _foldcp_attention(
+                    q_chunk[:, head_start:head_end].contiguous(),
+                    k_chunk[:, head_start:head_end].contiguous(),
+                    v_chunk[:, head_start:head_end].contiguous(),
+                    [
+                        mask_bias.contiguous(),
+                        triangle_bias[None, head_start:head_end].contiguous(),
+                    ],
+                )
+            )
+        out_chunk = torch.cat(out_heads, dim=1)
+    else:
+        out_chunk = _foldcp_attention(
+            q_chunk.contiguous(),
+            k_chunk.contiguous(),
+            v_chunk.contiguous(),
+            [
+                mask_bias.contiguous(),
+                triangle_bias.unsqueeze(0).contiguous(),
+            ],
+        )
+    if exact_source_launch:
+        out_for_wrap = out_chunk[
+            launch_row_start : launch_row_start + current_rows,
+            :,
+            local_query,
+            :,
+        ]
+        x_for_wrap = x_chunk[
+            launch_row_start : launch_row_start + current_rows,
+            local_query,
+            :,
+        ]
+    else:
+        out_for_wrap = out_chunk
+        x_for_wrap = x_chunk
+    update = _wrap_up_triangle_attention_output_chunk(
+        triangle_attention.mha,
+        out_for_wrap.to(dtype=x_row_chunk.dtype),
+        x_for_wrap.contiguous(),
+        source_grid_wrap_launch=source_grid_wrap_launch,
+        source_chunk_wrap_launch=source_chunk_wrap_launch,
+        preserve_source_projection=projection_source_grid_launch,
+        original_n=original_n,
+        row_start=row_start + valid_row_start,
+        col_start=col_start,
+        valid_rows=current_rows,
+        valid_query=valid_query,
+        source_chunk_rows=source_chunk_rows,
+        source_chunk_row_start=source_chunk_row_start,
+    )[:current_rows, :valid_query]
+    if residual_local is not None:
+        out_local[valid_row_start:valid_row_end, :valid_query] += update
+    else:
+        out_local[valid_row_start:valid_row_end, :valid_query] = update
+
+
 def _distributed_triangle_attention_starting_update(
     triangle_attention: torch.nn.Module,
     z_local: torch.Tensor,
@@ -4047,37 +5213,104 @@ def _distributed_triangle_attention_starting_update(
     chunk_size: int | None = None,
     triangle_bias_full_key_override: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    if mask_local is None:
-        mask = z_local.new_ones(z_local.shape[:-1])
-    else:
-        mask = mask_local
-
+    synchronize_failures = int(mesh.layout.shape[0]) * int(mesh.layout.shape[1]) > 1
     if z_spec is None:
-        x_local = triangle_attention.layer_norm(z_local)
+
+        def _prepare_legacy_starting_triangle_attention():
+            prepared_mask = (
+                z_local.new_ones(z_local.shape[:-1])
+                if mask_local is None
+                else mask_local
+            )
+            prepared_x = triangle_attention.layer_norm(z_local)
+            prepared_out = (
+                residual_local
+                if residual_local is not None
+                else prepared_x.new_zeros(prepared_x.shape)
+            )
+            return prepared_mask, prepared_x, prepared_out
+
+        legacy_prepared = (
+            run_group_rank_action_synchronized(
+                _prepare_legacy_starting_triangle_attention,
+                group=mesh.group_2d,
+                description="legacy starting triangle-attention input preparation",
+            )
+            if synchronize_failures
+            else _prepare_legacy_starting_triangle_attention()
+        )
+        if legacy_prepared is None:  # pragma: no cover - every rank runs the action
+            raise RuntimeError("legacy starting triangle-attention inputs failed.")
+        mask, x_local, out_local = legacy_prepared
         original_n = _ring_gather_by_row(x_local, mesh, dim=-2).shape[-2]
         row_start = mesh.coord[0] * x_local.shape[-3]
         col_start = mesh.coord[1] * x_local.shape[-2]
         valid_rows = x_local.shape[-3]
         valid_query = x_local.shape[-2]
     else:
-        x_local = _triangle_layer_norm_source_row_slab(
-            triangle_attention.layer_norm,
-            z_local,
-            mesh,
-            z_spec,
-        )
-        original_n = z_spec.original_shape[z_spec.pair_dims[0]]
-        row_start, row_end = z_spec.row_range
-        col_start, col_end = z_spec.col_range
-        valid_rows = max(0, min(row_end, original_n) - row_start)
-        valid_query = max(0, min(col_end, original_n) - col_start)
 
-    out_local = (
-        residual_local
-        if residual_local is not None
-        else x_local.new_zeros(x_local.shape)
-    )
-    if valid_rows == 0 or valid_query == 0:
+        def _prepare_starting_triangle_attention():
+            prepared_mask = (
+                z_local.new_ones(z_local.shape[:-1])
+                if mask_local is None
+                else mask_local
+            )
+            prepared_x = _triangle_layer_norm_source_row_slab(
+                triangle_attention.layer_norm,
+                z_local,
+                mesh,
+                z_spec,
+            )
+            prepared_original_n = z_spec.original_shape[z_spec.pair_dims[0]]
+            prepared_row_start, prepared_row_end = z_spec.row_range
+            prepared_col_start, prepared_col_end = z_spec.col_range
+            prepared_valid_rows = max(
+                0,
+                min(prepared_row_end, prepared_original_n) - prepared_row_start,
+            )
+            prepared_valid_query = max(
+                0,
+                min(prepared_col_end, prepared_original_n) - prepared_col_start,
+            )
+            prepared_out = (
+                residual_local
+                if residual_local is not None
+                else prepared_x.new_zeros(prepared_x.shape)
+            )
+            return (
+                prepared_mask,
+                prepared_x,
+                prepared_original_n,
+                prepared_row_start,
+                prepared_col_start,
+                prepared_valid_rows,
+                prepared_valid_query,
+                prepared_out,
+            )
+
+        prepared = (
+            run_group_rank_action_synchronized(
+                _prepare_starting_triangle_attention,
+                group=mesh.group_2d,
+                description="starting triangle-attention input preparation",
+            )
+            if synchronize_failures
+            else _prepare_starting_triangle_attention()
+        )
+        if prepared is None:  # pragma: no cover - every rank runs the action
+            raise RuntimeError("starting triangle-attention inputs were not prepared.")
+        (
+            mask,
+            x_local,
+            original_n,
+            row_start,
+            col_start,
+            valid_rows,
+            valid_query,
+            out_local,
+        ) = prepared
+
+    if (valid_rows == 0 or valid_query == 0) and not synchronize_failures:
         return out_local.contiguous()
 
     bias_source_grid_launch = _triatt_projection_source_grid_launch(
@@ -4104,20 +5337,48 @@ def _distributed_triangle_attention_starting_update(
             source_grid_launch=bias_source_grid_launch,
         )
 
-    exact_source_launch = projection_source_grid_launch and _triatt_exact_source_launch(
-        original_n
+    def _prepare_starting_triangle_bias(
+        triangle_bias_full_key: torch.Tensor = triangle_bias_full_key,
+    ):
+        prepared_exact_source_launch = (
+            projection_source_grid_launch and _triatt_exact_source_launch(original_n)
+        )
+        prepared_query_pad = (
+            original_n
+            if prepared_exact_source_launch
+            else _triatt_query_pad_size(valid_query)
+        )
+        prepared_local_query = slice(col_start, col_start + valid_query)
+        prepared_bias = triangle_bias_full_key.new_zeros(
+            (triangle_bias_full_key.shape[0], prepared_query_pad, original_n)
+        )
+        if prepared_exact_source_launch:
+            prepared_bias[:, prepared_local_query, :] = triangle_bias_full_key[
+                :, :valid_query, :
+            ]
+        else:
+            prepared_bias[:, :valid_query, :] = triangle_bias_full_key[
+                :, :valid_query, :
+            ]
+        return (
+            prepared_exact_source_launch,
+            prepared_query_pad,
+            prepared_local_query,
+            prepared_bias,
+        )
+
+    prepared_bias = (
+        run_group_rank_action_synchronized(
+            _prepare_starting_triangle_bias,
+            group=mesh.group_2d,
+            description="starting triangle-attention bias preparation",
+        )
+        if synchronize_failures
+        else _prepare_starting_triangle_bias()
     )
-    query_pad = (
-        original_n if exact_source_launch else _triatt_query_pad_size(valid_query)
-    )
-    local_query = slice(col_start, col_start + valid_query)
-    triangle_bias = triangle_bias_full_key.new_zeros(
-        (triangle_bias_full_key.shape[0], query_pad, original_n)
-    )
-    if exact_source_launch:
-        triangle_bias[:, local_query, :] = triangle_bias_full_key[:, :valid_query, :]
-    else:
-        triangle_bias[:, :valid_query, :] = triangle_bias_full_key[:, :valid_query, :]
+    if prepared_bias is None:  # pragma: no cover - every rank runs the action
+        raise RuntimeError("starting triangle-attention bias was not prepared.")
+    exact_source_launch, query_pad, local_query, triangle_bias = prepared_bias
     del triangle_bias_full_key
 
     collective_query_width = _triatt_collective_query_width(
@@ -4132,6 +5393,8 @@ def _distributed_triangle_attention_starting_update(
         valid_query=collective_query_width,
         element_size=x_local.element_size(),
     )
+    synchronize_row_failures = int(mesh.layout.shape[0]) * int(mesh.layout.shape[1]) > 1
+    row_compute_error: Exception | None = None
     valid_row_start = 0
     while valid_row_start < valid_rows:
         global_row_start = row_start + valid_row_start
@@ -4153,6 +5416,7 @@ def _distributed_triangle_attention_starting_update(
         )
         can_run_canonical_batch = (
             _triatt_canonical_batch_enabled()
+            and valid_query > 0
             and not exact_source_launch
             and not torch.is_grad_enabled()
             and x_local.dtype == torch.bfloat16
@@ -4179,111 +5443,28 @@ def _distributed_triangle_attention_starting_update(
                 dim=-1,
                 length=original_n,
             )
-            q_batch, k_batch, v_batch = _prep_triangle_attention_qkv_canonical_batch(
-                triangle_attention.mha,
-                x_row_batch,
-                canonical_rows=int(chunk_size),
-            )
-            q_chunk = q_batch.new_zeros(
-                (
-                    canonical_batch_rows,
-                    q_batch.shape[1],
-                    query_pad,
-                    q_batch.shape[-1],
-                )
-            )
-            q_chunk[:, :, :valid_query, :] = q_batch[
-                :,
-                :,
-                local_query,
-                :,
-            ]
-            mask_bias = (triangle_attention.inf * (mask_row_batch - 1))[
-                :, None, None, :
-            ]
-            # Keep the score/softmax workspace at the original canonical-row
-            # size. QKV and wrap-up still use batched GEMMs, while the largest
-            # attention temporary never doubles.
-            attention_parts = []
-            for canonical_start in range(
-                0,
-                canonical_batch_rows,
-                int(chunk_size),
-            ):
-                canonical_end = canonical_start + int(chunk_size)
-                score_bytes_per_head = (
-                    int(chunk_size)
-                    * int(q_chunk.shape[-2])
-                    * int(k_batch.shape[-2])
-                    * int(q_chunk.element_size())
-                    * 2
-                )
-                head_ranges = _triatt_attention_head_ranges(
-                    q_chunk.shape[1],
-                    score_bytes_per_head=score_bytes_per_head,
-                )
-                if len(head_ranges) > 1:
-                    out_heads = []
-                    for head_start, head_end in head_ranges:
-                        out_heads.append(
-                            _foldcp_attention(
-                                q_chunk[
-                                    canonical_start:canonical_end,
-                                    head_start:head_end,
-                                ].contiguous(),
-                                k_batch[
-                                    canonical_start:canonical_end,
-                                    head_start:head_end,
-                                ].contiguous(),
-                                v_batch[
-                                    canonical_start:canonical_end,
-                                    head_start:head_end,
-                                ].contiguous(),
-                                [
-                                    mask_bias[
-                                        canonical_start:canonical_end
-                                    ].contiguous(),
-                                    triangle_bias[
-                                        None,
-                                        head_start:head_end,
-                                    ].contiguous(),
-                                ],
-                            )
-                        )
-                    attention_parts.append(torch.cat(out_heads, dim=1))
-                    del out_heads
-                else:
-                    attention_parts.append(
-                        _foldcp_attention(
-                            q_chunk[canonical_start:canonical_end].contiguous(),
-                            k_batch[canonical_start:canonical_end].contiguous(),
-                            v_batch[canonical_start:canonical_end].contiguous(),
-                            [
-                                mask_bias[canonical_start:canonical_end].contiguous(),
-                                triangle_bias.unsqueeze(0).contiguous(),
-                            ],
-                        )
+            if row_compute_error is None:
+                try:
+                    _compute_triangle_attention_canonical_row_chunk(
+                        triangle_attention,
+                        x_row_batch,
+                        mask_row_batch,
+                        triangle_bias,
+                        out_local,
+                        residual_local=residual_local,
+                        canonical_batch_rows=canonical_batch_rows,
+                        chunk_size=int(chunk_size),
+                        query_pad=query_pad,
+                        valid_query=valid_query,
+                        local_query=local_query,
+                        valid_row_start=valid_row_start,
+                        valid_row_end=valid_row_end,
                     )
-            out_chunk = torch.cat(attention_parts, dim=0)
-            del attention_parts
-            update = _wrap_up_triangle_attention_canonical_batch(
-                triangle_attention.mha,
-                out_chunk[:, :, :valid_query, :].to(dtype=x_local.dtype),
-                x_row_batch[:, local_query, :].contiguous(),
-                canonical_rows=int(chunk_size),
-            )[:, :valid_query]
-            if residual_local is not None:
-                out_local[
-                    valid_row_start:valid_row_end,
-                    :valid_query,
-                ] += update
-            else:
-                out_local[
-                    valid_row_start:valid_row_end,
-                    :valid_query,
-                ] = update
-            del q_batch, k_batch, v_batch, q_chunk, mask_bias
-            del x_row_batch, mask_row_batch, out_chunk, update
+                except Exception as exc:
+                    if not synchronize_row_failures:
+                        raise
+                    row_compute_error = detach_rank_local_error_traceback(exc)
+            del x_row_batch, mask_row_batch
             valid_row_start = valid_row_end
             continue
         valid_row_end = min(
@@ -4304,187 +5485,53 @@ def _distributed_triangle_attention_starting_update(
             dim=-1,
             length=original_n,
         )
-        source_grid_qkv = not exact_source_launch and projection_source_grid_launch
-        source_chunk_qkv = not exact_source_launch and not source_grid_qkv
-        source_grid_wrap_launch = (
-            chunk_size is None
-            and _triatt_wrap_source_grid_launch(
-                original_n,
-                x_local.shape[-1],
-                x_local.element_size(),
-            )
-        )
-        source_chunk_wrap_launch = chunk_size is not None
-        qkv_row_pad = (
-            original_n
-            if exact_source_launch
-            else _triatt_qkv_row_pad_size(current_rows, original_n)
-        )
-        streamed_row_launch = row_chunk_size < valid_rows
-        row_pad = (
-            current_rows
-            if source_chunk_qkv or (source_grid_qkv and streamed_row_launch)
-            else qkv_row_pad
-        )
-        launch_row_start = row_start + valid_row_start if exact_source_launch else 0
-        if source_grid_qkv:
-            x_row_source = x_row_chunk
-            q_row, k_row, v_row = _prep_triangle_attention_qkv_source_grid_chunks(
-                triangle_attention.mha,
-                x_row_chunk,
-                original_n=original_n,
-                row_start=row_start + valid_row_start,
-            )
-        elif source_chunk_qkv:
-            x_row_source = x_row_chunk
-            q_row, k_row, v_row = _prep_triangle_attention_qkv_source_chunk_chunks(
-                triangle_attention.mha,
-                x_row_chunk,
-                original_n=original_n,
-                source_rows=source_chunk_rows,
-                row_start=source_chunk_row_start,
-            )
-        else:
-            if qkv_row_pad != current_rows:
-                x_row_source = x_row_chunk.new_zeros(
-                    (qkv_row_pad, x_row_chunk.shape[-2], x_row_chunk.shape[-1])
+        if row_compute_error is None and valid_query > 0:
+            try:
+                _compute_triangle_attention_regular_row_chunk(
+                    triangle_attention,
+                    x_row_chunk,
+                    mask_row_chunk,
+                    triangle_bias,
+                    out_local,
+                    residual_local=residual_local,
+                    exact_source_launch=exact_source_launch,
+                    projection_source_grid_launch=projection_source_grid_launch,
+                    original_n=original_n,
+                    row_start=row_start,
+                    col_start=col_start,
+                    valid_row_start=valid_row_start,
+                    valid_row_end=valid_row_end,
+                    valid_query=valid_query,
+                    local_query=local_query,
+                    query_pad=query_pad,
+                    row_chunk_size=row_chunk_size,
+                    valid_rows=valid_rows,
+                    chunk_size=chunk_size,
+                    source_chunk_rows=source_chunk_rows,
+                    source_chunk_row_start=source_chunk_row_start,
                 )
-                x_row_source[
-                    launch_row_start : launch_row_start + current_rows,
-                    :,
-                    :,
-                ] = x_row_chunk
-            else:
-                x_row_source = x_row_chunk
-            q_row, k_row, v_row = _prep_triangle_attention_qkv_chunks(
-                triangle_attention.mha,
-                x_row_source,
-                x_row_source,
-                apply_scale=True,
-                source_rows=_triatt_qkv_source_rows(original_n),
-                exact_source_launch=exact_source_launch,
-            )
-
-        q_chunk = q_row.new_zeros((row_pad, q_row.shape[1], query_pad, q_row.shape[3]))
-        k_chunk = k_row.new_zeros((row_pad, k_row.shape[1], original_n, k_row.shape[3]))
-        v_chunk = v_row.new_zeros((row_pad, v_row.shape[1], original_n, v_row.shape[3]))
-        x_chunk = x_row_chunk.new_zeros((row_pad, query_pad, x_row_chunk.shape[-1]))
-        mask_bias = mask_row_chunk.new_zeros((row_pad, 1, 1, original_n))
-
-        if exact_source_launch:
-            row_slice = slice(launch_row_start, launch_row_start + current_rows)
-            q_chunk[row_slice, :, local_query, :] = q_row[row_slice, :, local_query, :]
-            k_chunk[row_slice] = k_row[row_slice]
-            v_chunk[row_slice] = v_row[row_slice]
-            x_chunk[row_slice, local_query, :] = x_row_source[row_slice, local_query, :]
-            mask_bias[row_slice] = (triangle_attention.inf * (mask_row_chunk - 1))[
-                :, None, None, :
-            ]
-        else:
-            q_chunk[:current_rows, :, :valid_query, :] = q_row[
-                launch_row_start : launch_row_start + current_rows,
-                :,
-                local_query,
-                :,
-            ]
-            k_chunk[:current_rows] = k_row[
-                launch_row_start : launch_row_start + current_rows
-            ]
-            v_chunk[:current_rows] = v_row[
-                launch_row_start : launch_row_start + current_rows
-            ]
-            x_chunk[:current_rows, :valid_query, :] = x_row_source[
-                launch_row_start : launch_row_start + current_rows,
-                local_query,
-                :,
-            ]
-            mask_bias[:current_rows] = (triangle_attention.inf * (mask_row_chunk - 1))[
-                :, None, None, :
-            ]
-
-        score_bytes_per_head = (
-            int(q_chunk.shape[0])
-            * int(q_chunk.shape[-2])
-            * int(k_chunk.shape[-2])
-            * int(q_chunk.element_size())
-            * 2
-        )
-        head_ranges = _triatt_attention_head_ranges(
-            q_chunk.shape[1],
-            score_bytes_per_head=score_bytes_per_head,
-        )
-        if len(head_ranges) > 1:
-            out_heads = []
-            for head_start, head_end in head_ranges:
-                out_heads.append(
-                    _foldcp_attention(
-                        q_chunk[:, head_start:head_end].contiguous(),
-                        k_chunk[:, head_start:head_end].contiguous(),
-                        v_chunk[:, head_start:head_end].contiguous(),
-                        [
-                            mask_bias.contiguous(),
-                            triangle_bias[None, head_start:head_end].contiguous(),
-                        ],
-                    )
-                )
-            out_chunk = torch.cat(out_heads, dim=1)
-            del out_heads
-        else:
-            out_chunk = _foldcp_attention(
-                q_chunk.contiguous(),
-                k_chunk.contiguous(),
-                v_chunk.contiguous(),
-                [
-                    mask_bias.contiguous(),
-                    triangle_bias.unsqueeze(0).contiguous(),
-                ],
-            )
-        if exact_source_launch:
-            out_for_wrap = out_chunk[
-                launch_row_start : launch_row_start + current_rows,
-                :,
-                local_query,
-                :,
-            ]
-            x_for_wrap = x_chunk[
-                launch_row_start : launch_row_start + current_rows,
-                local_query,
-                :,
-            ]
-        else:
-            out_for_wrap = out_chunk
-            x_for_wrap = x_chunk
-        update = _wrap_up_triangle_attention_output_chunk(
-            triangle_attention.mha,
-            out_for_wrap.to(dtype=x_local.dtype),
-            x_for_wrap.contiguous(),
-            source_grid_wrap_launch=source_grid_wrap_launch,
-            source_chunk_wrap_launch=source_chunk_wrap_launch,
-            preserve_source_projection=projection_source_grid_launch,
-            original_n=original_n,
-            row_start=row_start + valid_row_start,
-            col_start=col_start,
-            valid_rows=current_rows,
-            valid_query=valid_query,
-            source_chunk_rows=source_chunk_rows,
-            source_chunk_row_start=source_chunk_row_start,
-        )[:current_rows, :valid_query]
-        if residual_local is not None:
-            out_local[valid_row_start:valid_row_end, :valid_query] += update
-        else:
-            out_local[valid_row_start:valid_row_end, :valid_query] = update
-        del q_row, k_row, v_row, q_chunk, k_chunk, v_chunk
-        del (
-            x_row_chunk,
-            mask_row_chunk,
-            x_row_source,
-            x_chunk,
-            mask_bias,
-            out_chunk,
-            update,
-        )
+            except Exception as exc:
+                if not synchronize_row_failures:
+                    raise
+                row_compute_error = detach_rank_local_error_traceback(exc)
+        del x_row_chunk, mask_row_chunk
         valid_row_start = valid_row_end
-    return out_local.contiguous()
+
+    def _finish_starting_triangle_attention() -> torch.Tensor:
+        if row_compute_error is not None:
+            raise row_compute_error
+        return out_local.contiguous()
+
+    if not synchronize_row_failures:
+        return _finish_starting_triangle_attention()
+    result = run_group_rank_action_synchronized(
+        _finish_starting_triangle_attention,
+        group=mesh.group_2d,
+        description="starting triangle-attention completion",
+    )
+    if result is None:  # pragma: no cover - every rank runs the action
+        raise RuntimeError("starting triangle-attention returned no result.")
+    return result
 
 
 def _project_one_by_p_ending_triangle_bias_local(
@@ -4635,49 +5682,62 @@ def _one_by_p_triangle_attention_ending_update(
         alignment=launch_alignment,
     )
 
-    local_bias_chunks = []
-    for local_row_start in range(0, physical_rows, transpose_row_chunk):
-        local_row_end = min(
-            local_row_start + transpose_row_chunk,
-            physical_rows,
-        )
-        global_row_start = row_start + local_row_start
-        current_valid_rows = max(
-            0,
-            min(row_start + valid_rows, row_start + local_row_end) - global_row_start,
-        )
-        z_transposed_chunk = _one_by_p_ending_transpose_row_chunk(
-            z_local,
-            local_row_start,
-            local_row_end,
-        )
-        chunk_spec = replace(
-            transposed_spec,
-            row_range=(
-                global_row_start,
-                row_start + local_row_end,
-            ),
-        )
-        x_transposed_chunk = _triangle_layer_norm_source_row_slab(
-            triangle_attention.layer_norm,
-            z_transposed_chunk,
-            local_mesh,
-            chunk_spec,
-        )
-        local_bias_chunks.append(
-            _project_one_by_p_ending_triangle_bias_local(
-                triangle_attention,
-                x_transposed_chunk,
-                original_n=original_n,
-                row_start=global_row_start,
-                valid_rows=current_valid_rows,
-                chunk_size=chunk_size,
+    def _prepare_ending_triangle_bias() -> torch.Tensor:
+        local_bias_chunks = []
+        for local_row_start in range(0, physical_rows, transpose_row_chunk):
+            local_row_end = min(
+                local_row_start + transpose_row_chunk,
+                physical_rows,
             )
-        )
-        del z_transposed_chunk, x_transposed_chunk
+            global_row_start = row_start + local_row_start
+            current_valid_rows = max(
+                0,
+                min(row_start + valid_rows, row_start + local_row_end)
+                - global_row_start,
+            )
+            z_transposed_chunk = _one_by_p_ending_transpose_row_chunk(
+                z_local,
+                local_row_start,
+                local_row_end,
+            )
+            chunk_spec = replace(
+                transposed_spec,
+                row_range=(
+                    global_row_start,
+                    row_start + local_row_end,
+                ),
+            )
+            x_transposed_chunk = _triangle_layer_norm_source_row_slab(
+                triangle_attention.layer_norm,
+                z_transposed_chunk,
+                local_mesh,
+                chunk_spec,
+            )
+            local_bias_chunks.append(
+                _project_one_by_p_ending_triangle_bias_local(
+                    triangle_attention,
+                    x_transposed_chunk,
+                    original_n=original_n,
+                    row_start=global_row_start,
+                    valid_rows=current_valid_rows,
+                    chunk_size=chunk_size,
+                )
+            )
+            del z_transposed_chunk, x_transposed_chunk, chunk_spec
+        return torch.cat(local_bias_chunks, dim=-2)
 
-    local_triangle_bias = torch.cat(local_bias_chunks, dim=-2)
-    del local_bias_chunks
+    synchronize_failures = int(mesh.layout.shape[1]) > 1
+    local_triangle_bias = (
+        run_group_rank_action_synchronized(
+            _prepare_ending_triangle_bias,
+            group=mesh.group_2d,
+            description="ending triangle-attention bias preparation",
+        )
+        if synchronize_failures
+        else _prepare_ending_triangle_bias()
+    )
+    if local_triangle_bias is None:  # pragma: no cover
+        raise RuntimeError("ending triangle-attention bias was not prepared.")
     triangle_bias_full_key = _ring_gather_by_row(
         local_triangle_bias,
         mesh,
@@ -4686,50 +5746,63 @@ def _one_by_p_triangle_attention_ending_update(
     )
     del local_triangle_bias
 
-    for local_row_start in range(0, physical_rows, transpose_row_chunk):
-        local_row_end = min(
-            local_row_start + transpose_row_chunk,
-            physical_rows,
-        )
-        global_row_start = row_start + local_row_start
-        z_transposed_chunk = _one_by_p_ending_transpose_row_chunk(
-            z_local,
-            local_row_start,
-            local_row_end,
-        )
-        mask_transposed_chunk = (
-            None
-            if mask_local is None
-            else mask_local[..., :, local_row_start:local_row_end]
-            .transpose(-2, -1)
-            .contiguous()
-        )
-        chunk_spec = replace(
-            transposed_spec,
-            row_range=(
-                global_row_start,
-                row_start + local_row_end,
-            ),
-        )
-        updated_transposed_chunk = _distributed_triangle_attention_starting_update(
-            triangle_attention,
-            z_transposed_chunk,
-            local_mesh,
-            mask_transposed_chunk,
-            residual_local=z_transposed_chunk,
-            z_spec=chunk_spec,
-            chunk_size=chunk_size,
-            triangle_bias_full_key_override=triangle_bias_full_key,
-        )
-        z_local[..., :, local_row_start:local_row_end, :].copy_(
-            updated_transposed_chunk.transpose(-3, -2)
-        )
-        del z_transposed_chunk, updated_transposed_chunk
-        if mask_transposed_chunk is not None:
-            del mask_transposed_chunk
+    def _finish_ending_triangle_attention() -> torch.Tensor:
+        for local_row_start in range(0, physical_rows, transpose_row_chunk):
+            local_row_end = min(
+                local_row_start + transpose_row_chunk,
+                physical_rows,
+            )
+            global_row_start = row_start + local_row_start
+            z_transposed_chunk = _one_by_p_ending_transpose_row_chunk(
+                z_local,
+                local_row_start,
+                local_row_end,
+            )
+            mask_transposed_chunk = (
+                None
+                if mask_local is None
+                else mask_local[..., :, local_row_start:local_row_end]
+                .transpose(-2, -1)
+                .contiguous()
+            )
+            chunk_spec = replace(
+                transposed_spec,
+                row_range=(
+                    global_row_start,
+                    row_start + local_row_end,
+                ),
+            )
+            updated_transposed_chunk = _distributed_triangle_attention_starting_update(
+                triangle_attention,
+                z_transposed_chunk,
+                local_mesh,
+                mask_transposed_chunk,
+                residual_local=z_transposed_chunk,
+                z_spec=chunk_spec,
+                chunk_size=chunk_size,
+                triangle_bias_full_key_override=triangle_bias_full_key,
+            )
+            z_local[..., :, local_row_start:local_row_end, :].copy_(
+                updated_transposed_chunk.transpose(-3, -2)
+            )
+            del (
+                z_transposed_chunk,
+                mask_transposed_chunk,
+                chunk_spec,
+                updated_transposed_chunk,
+            )
+        return z_local.contiguous()
 
-    del triangle_bias_full_key
-    return z_local.contiguous()
+    if not synchronize_failures:
+        return _finish_ending_triangle_attention()
+    result = run_group_rank_action_synchronized(
+        _finish_ending_triangle_attention,
+        group=mesh.group_2d,
+        description="ending triangle-attention local update completion",
+    )
+    if result is None:  # pragma: no cover
+        raise RuntimeError("ending triangle-attention local update failed.")
+    return result
 
 
 def distributed_triangle_attention_update(
@@ -4761,11 +5834,23 @@ def distributed_triangle_attention_update(
         )
 
     ring = mesh.ring_comm()
-    z_t_local = ring.comm_2d_trans.exchange(z_local.transpose(-2, -3).contiguous())
+    z_t_local = exchange_tensor_synchronized(
+        z_local,
+        comm=ring.comm_2d_trans,
+        group=mesh.group_2d,
+        description="ending triangle-attention input transpose",
+        prepare=lambda tensor: tensor.transpose(-2, -3),
+    )
     mask_t_local = (
         None
         if mask_local is None
-        else ring.comm_2d_trans.exchange(mask_local.transpose(-1, -2).contiguous())
+        else exchange_tensor_synchronized(
+            mask_local,
+            comm=ring.comm_2d_trans,
+            group=mesh.group_2d,
+            description="ending triangle-attention mask transpose",
+            prepare=lambda tensor: tensor.transpose(-1, -2),
+        )
     )
     out_t_local = _distributed_triangle_attention_starting_update(
         triangle_attention,
@@ -4775,11 +5860,30 @@ def distributed_triangle_attention_update(
         z_spec=z_spec,
         chunk_size=chunk_size,
     )
-    out_local = ring.comm_2d_trans.exchange(out_t_local.transpose(-2, -3).contiguous())
-    if residual_local is not None:
-        residual_local += out_local
-        return residual_local.contiguous()
-    return out_local
+    out_local = exchange_tensor_synchronized(
+        out_t_local,
+        comm=ring.comm_2d_trans,
+        group=mesh.group_2d,
+        description="ending triangle-attention output transpose",
+        prepare=lambda tensor: tensor.transpose(-2, -3),
+    )
+
+    def _finish_legacy_ending_triangle_attention() -> torch.Tensor:
+        if residual_local is not None:
+            residual_local.add_(out_local)
+            return residual_local.contiguous()
+        return out_local.contiguous()
+
+    if int(mesh.layout.shape[0]) * int(mesh.layout.shape[1]) <= 1:
+        return _finish_legacy_ending_triangle_attention()
+    result = run_group_rank_action_synchronized(
+        _finish_legacy_ending_triangle_attention,
+        group=mesh.group_2d,
+        description="legacy ending triangle-attention completion",
+    )
+    if result is None:  # pragma: no cover
+        raise RuntimeError("legacy ending triangle-attention returned no result.")
+    return result
 
 
 def _distributed_pairformer_block_pair_ops(
@@ -4789,6 +5893,7 @@ def _distributed_pairformer_block_pair_ops(
     pair_mask_local: torch.Tensor | None = None,
     z_spec: FoldCPPairShardSpec | None = None,
     chunk_size: int | None = None,
+    release_cache: bool = False,
 ) -> torch.Tensor:
     z_local = distributed_triangle_multiplication_update(
         block.tri_mul_out,
@@ -4827,12 +5932,22 @@ def _distributed_pairformer_block_pair_ops(
         )
     else:
         ring = mesh.ring_comm()
-        z_t_local = ring.comm_2d_trans.exchange(z_local.transpose(-2, -3).contiguous())
+        z_t_local = exchange_tensor_synchronized(
+            z_local,
+            comm=ring.comm_2d_trans,
+            group=mesh.group_2d,
+            description="Pairformer ending-attention input transpose",
+            prepare=lambda tensor: tensor.transpose(-2, -3),
+        )
         mask_t_local = (
             None
             if pair_mask_local is None
-            else ring.comm_2d_trans.exchange(
-                pair_mask_local.transpose(-1, -2).contiguous()
+            else exchange_tensor_synchronized(
+                pair_mask_local,
+                comm=ring.comm_2d_trans,
+                group=mesh.group_2d,
+                description="Pairformer ending-attention mask transpose",
+                prepare=lambda tensor: tensor.transpose(-1, -2),
             )
         )
         del z_local
@@ -4855,17 +5970,65 @@ def _distributed_pairformer_block_pair_ops(
                 z_spec=z_spec,
                 chunk_size=chunk_size,
             )
-        z_local = ring.comm_2d_trans.exchange(z_t_local.transpose(-2, -3).contiguous())
+        z_local = exchange_tensor_synchronized(
+            z_t_local,
+            comm=ring.comm_2d_trans,
+            group=mesh.group_2d,
+            description="Pairformer ending-attention output transpose",
+            prepare=lambda tensor: tensor.transpose(-2, -3),
+        )
         del z_t_local, mask_t_local
 
-    z_local = distributed_pair_transition_update(
-        block.pair_transition,
-        z_local,
-        mesh,
-        residual_local=z_local,
-        z_spec=z_spec,
+    def _finish_pairformer_block():
+        updated = distributed_pair_transition_update(
+            block.pair_transition,
+            z_local,
+            mesh,
+            residual_local=z_local,
+            z_spec=z_spec,
+        )
+        if release_cache:
+            _foldcp_release_pairformer_block_cache()
+        return updated.contiguous()
+
+    if torch.is_grad_enabled():
+        return _finish_pairformer_block()
+    transition_uses_row_gather = (
+        z_spec is not None and _pair_transition_source_flat_chunk_size(z_local) <= 0
     )
-    return z_local.contiguous()
+    if transition_uses_row_gather:
+        # The transition owns a hardened row gather followed by its own local
+        # completion boundary. Do not nest that collective inside the generic
+        # block rank action.
+        updated = distributed_pair_transition_update(
+            block.pair_transition,
+            z_local,
+            mesh,
+            residual_local=z_local,
+            z_spec=z_spec,
+        )
+
+        def _finish_row_gather_block() -> torch.Tensor:
+            if release_cache:
+                _foldcp_release_pairformer_block_cache()
+            return updated.contiguous()
+
+        result = run_group_rank_action_synchronized(
+            _finish_row_gather_block,
+            group=mesh.group_2d,
+            description="Fold-CP Pairformer row-gather block finalization",
+        )
+        if result is None:  # pragma: no cover
+            raise RuntimeError("Fold-CP Pairformer row-gather block was not finalized.")
+        return result
+    result = run_group_rank_action_synchronized(
+        _finish_pairformer_block,
+        group=mesh.group_2d,
+        description="Fold-CP Pairformer block finalization",
+    )
+    if result is None:  # pragma: no cover
+        raise RuntimeError("Fold-CP Pairformer block was not finalized.")
+    return result
 
 
 def distributed_pairformer_block_pair_update(
@@ -4942,15 +6105,15 @@ def distributed_pairformer_stack_pair_update(
     """Run a real c_s=0 PairformerStack while keeping pair activations sharded."""
 
     for block in stack.blocks:
-        z_local = distributed_pairformer_block_pair_update(
+        z_local = _distributed_pairformer_block_pair_ops(
             block,
             z_local,
             mesh,
             pair_mask_local,
             z_spec,
             chunk_size,
+            release_cache=True,
         )
-        _foldcp_release_pairformer_block_cache()
     return z_local.contiguous()
 
 
@@ -4981,26 +6144,65 @@ def distributed_pairformer_stack_single_bridge_update(
     if getattr(stack.blocks[0], "c_s", 0) <= 0:
         raise ValueError("single bridge requires a PairformerStack with c_s > 0.")
 
+    def _prepare_mask_and_bias():
+        if pair_mask is None:
+            prepared_mask = None
+        else:
+            prepared_mask, _ = shard_pair_tensor(
+                pair_mask,
+                mesh,
+                pair_dims=(-2, -1),
+            )
+        if extra_attn_bias is None:
+            prepared_extra_bias = None
+        elif extra_attn_bias_is_local:
+            prepared_extra_bias = extra_attn_bias.contiguous()
+        else:
+            prepared_extra_bias, _ = shard_pair_tensor(
+                extra_attn_bias,
+                mesh,
+                pair_dims=(-2, -1),
+            )
+        return prepared_mask, prepared_extra_bias
+
     if z_spec is None:
-        z_local, z_spec = shard_pair_tensor(z, mesh, pair_dims=(-3, -2))
-        del z
-        torch.cuda.empty_cache()
-    else:
-        z_local = z.contiguous()
-    if pair_mask is None:
-        mask_local = None
-    else:
-        mask_local, _ = shard_pair_tensor(pair_mask, mesh, pair_dims=(-2, -1))
-    if extra_attn_bias is None:
-        extra_attn_bias_local = None
-    elif extra_attn_bias_is_local:
-        extra_attn_bias_local = extra_attn_bias.contiguous()
-    else:
-        extra_attn_bias_local, _ = shard_pair_tensor(
-            extra_attn_bias,
-            mesh,
-            pair_dims=(-2, -1),
+        sharded_pair = run_group_rank_action_synchronized(
+            lambda z=z: shard_pair_tensor(z, mesh, pair_dims=(-3, -2)),
+            group=mesh.group_2d,
+            description="Fold-CP single-bridge pair sharding",
         )
+        if sharded_pair is None:  # pragma: no cover
+            raise RuntimeError("Fold-CP single-bridge pair was not sharded.")
+        z_local, z_spec = sharded_pair
+        del z
+
+        def _prepare_after_pair_release():
+            torch.cuda.empty_cache()
+            mask_local, extra_attn_bias_local = _prepare_mask_and_bias()
+            return z_local, mask_local, extra_attn_bias_local
+
+        prepared_inputs = run_group_rank_action_synchronized(
+            _prepare_after_pair_release,
+            group=mesh.group_2d,
+            description="Fold-CP single-bridge input preparation",
+        )
+        if prepared_inputs is None:  # pragma: no cover
+            raise RuntimeError("Fold-CP single-bridge inputs were not prepared.")
+        z_local, mask_local, extra_attn_bias_local = prepared_inputs
+    else:
+
+        def _prepare_local_inputs():
+            mask_local, extra_attn_bias_local = _prepare_mask_and_bias()
+            return z.contiguous(), mask_local, extra_attn_bias_local
+
+        prepared_inputs = run_group_rank_action_synchronized(
+            _prepare_local_inputs,
+            group=mesh.group_2d,
+            description="Fold-CP single-bridge local input preparation",
+        )
+        if prepared_inputs is None:  # pragma: no cover
+            raise RuntimeError("Fold-CP single-bridge inputs were not prepared.")
+        z_local, mask_local, extra_attn_bias_local = prepared_inputs
 
     for block_index, block in enumerate(stack.blocks):
         z_local = _distributed_pairformer_block_pair_ops(
@@ -5011,7 +6213,7 @@ def distributed_pairformer_stack_single_bridge_update(
             z_spec,
             chunk_size,
         )
-        s = s + distributed_attention_pair_bias_update(
+        single_update = distributed_attention_pair_bias_update(
             block.attention_pair_bias,
             s,
             z_local,
@@ -5019,8 +6221,33 @@ def distributed_pairformer_stack_single_bridge_update(
             z_spec=z_spec,
             extra_attn_bias_local=extra_attn_bias_local,
         )
-        s = s + block.single_transition(s)
-        _foldcp_release_pairformer_block_cache()
+
+        def _finish_single_update(
+            s: torch.Tensor = s,
+            single_update: torch.Tensor = single_update,
+        ) -> torch.Tensor:
+            updated_s = s + single_update
+            updated_s = updated_s + block.single_transition(updated_s)
+            _foldcp_release_pairformer_block_cache()
+            return updated_s
+
+        if torch.is_grad_enabled():
+            s = _finish_single_update()
+        else:
+            finalized_single = run_group_rank_action_synchronized(
+                _finish_single_update,
+                group=mesh.group_2d,
+                description=(
+                    f"Fold-CP Pairformer block {block_index} single finalization"
+                ),
+            )
+            if finalized_single is None:  # pragma: no cover
+                raise RuntimeError(
+                    f"Fold-CP Pairformer block {block_index} single update "
+                    "was not finalized."
+                )
+            s = finalized_single
+        del _finish_single_update, single_update
 
     if return_local_pair:
         return s, z_local.contiguous(), z_spec

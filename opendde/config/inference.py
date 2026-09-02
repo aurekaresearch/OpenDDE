@@ -69,6 +69,12 @@ def build_inference_config(
         fill_required_with_null=fill_required_with_null,
     )
     selected_model_name = first_pass.model_name
+    if selected_model_name not in model_configs:
+        supported = ", ".join(sorted(model_configs))
+        raise ValueError(
+            f"Unsupported model_name {selected_model_name!r}. "
+            f"Available models: {supported}."
+        )
 
     base_configs = make_base_inference_config(model_name=model_name)
     deep_update(base_configs, model_configs[selected_model_name])
@@ -99,6 +105,58 @@ def validate_config_triangle_kernels(configs: OpenDDEConfig) -> None:
         configs.triangle_multiplicative,
         configs.triangle_attention,
     )
+
+
+def validate_inference_schedule(configs: OpenDDEConfig) -> None:
+    """Reject empty/negative inference schedules before model initialization."""
+
+    for option, value in (
+        ("model.N_cycle", configs.model.N_cycle),
+        ("model.N_model_seed", configs.model.N_model_seed),
+        ("sample_diffusion.N_step", configs.sample_diffusion.N_step),
+        ("sample_diffusion.N_sample", configs.sample_diffusion.N_sample),
+    ):
+        if value < 1:
+            raise ValueError(f"{option} must be at least 1, got {value}.")
+
+    for option, value in (
+        ("infer_setting.chunk_size", configs.infer_setting.chunk_size),
+        (
+            "infer_setting.sample_diffusion_chunk_size",
+            configs.infer_setting.sample_diffusion_chunk_size,
+        ),
+    ):
+        if value is not None and value < 1:
+            raise ValueError(f"{option} must be at least 1 or null, got {value}.")
+
+    seen_thresholds: set[int] = set()
+    for (
+        raw_threshold,
+        chunk_size,
+    ) in configs.infer_setting.chunk_size_thresholds.items():
+        try:
+            threshold = int(raw_threshold)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "infer_setting.chunk_size_thresholds keys must be positive integers; "
+                f"got {raw_threshold!r}."
+            ) from exc
+        if threshold < 1:
+            raise ValueError(
+                "infer_setting.chunk_size_thresholds keys must be positive integers; "
+                f"got {raw_threshold!r}."
+            )
+        if threshold in seen_thresholds:
+            raise ValueError(
+                "infer_setting.chunk_size_thresholds contains duplicate numeric "
+                f"threshold {threshold}."
+            )
+        seen_thresholds.add(threshold)
+        if chunk_size != -1 and chunk_size < 1:
+            raise ValueError(
+                "infer_setting.chunk_size_thresholds values must be -1 or at "
+                f"least 1; got {chunk_size} for threshold {raw_threshold!r}."
+            )
 
 
 def resolve_auto_triangle_kernels(
@@ -145,7 +203,31 @@ def apply_runtime_compatibility(
     if not isinstance(device, torch.device):
         raise TypeError("device must be an already-resolved torch.device")
 
+    validate_inference_schedule(configs)
     validate_config_triangle_kernels(configs)
+
+    # The maintained 1 x P implementation owns the distributed triangle
+    # schedule and is validated only with its PyTorch kernels.  Leaving the CLI
+    # default at ``auto`` previously selected cuEquivariance whenever its
+    # packages imported successfully, despite the Fold-CP documentation saying
+    # that backend is unsupported.  That silently changed P=1/P>1 numerics and
+    # could enter an unsupported collective/kernel combination.
+    if getattr(configs, "foldcp_mode", "single") == "distributed":
+        explicit_cueq = {
+            configs.triangle_multiplicative,
+            configs.triangle_attention,
+        } & {"cuequivariance"}
+        if explicit_cueq:
+            raise ValueError(
+                "Distributed 1 x P Fold-CP does not support cuEquivariance "
+                "triangle kernels. Use --trimul_kernel torch "
+                "--triatt_kernel torch."
+            )
+        if configs.triangle_multiplicative == "auto":
+            configs.triangle_multiplicative = "torch"
+        if configs.triangle_attention == "auto":
+            configs.triangle_attention = "torch"
+
     requested_kernels = {
         configs.triangle_multiplicative,
         configs.triangle_attention,

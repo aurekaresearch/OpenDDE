@@ -23,6 +23,56 @@ def test_distributed_config_uses_one_by_p_for_any_cp_size(monkeypatch, p):
     assert config.cp_mesh_shape == (1, p)
 
 
+@pytest.mark.parametrize("p", [2, 3, 5, 8])
+def test_distributed_environment_infers_cp_size_from_initialized_world(
+    monkeypatch,
+    p,
+):
+    """Direct model integration must not silently fall back to historical CP=4."""
+
+    from opendde.distributed.foldcp import config as config_module
+
+    monkeypatch.setenv("OPENDDE_FOLDCP_MODE", "distributed")
+    monkeypatch.delenv("OPENDDE_FOLDCP_SIZE_DP", raising=False)
+    monkeypatch.delenv("OPENDDE_FOLDCP_SIZE_CP", raising=False)
+    monkeypatch.setattr(config_module.dist, "is_available", lambda: True)
+    monkeypatch.setattr(config_module.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(config_module.dist, "get_world_size", lambda: p)
+
+    config = FoldCPConfig.from_environment()
+
+    assert config.size_dp == 1
+    assert config.size_cp == p
+    assert config.cp_mesh_shape == (1, p)
+
+
+def test_explicit_environment_cp_size_wins_over_world_size(monkeypatch):
+    from opendde.distributed.foldcp import config as config_module
+
+    monkeypatch.setenv("OPENDDE_FOLDCP_MODE", "distributed")
+    monkeypatch.setenv("OPENDDE_FOLDCP_SIZE_CP", "3")
+    monkeypatch.setattr(config_module.dist, "is_available", lambda: True)
+    monkeypatch.setattr(config_module.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(config_module.dist, "get_world_size", lambda: 8)
+
+    assert FoldCPConfig.from_environment().size_cp == 3
+
+
+@pytest.mark.parametrize("rank,expected", [(0, False), (1, True), (4, True)])
+def test_output_rank_uses_inferred_arbitrary_cp_size(monkeypatch, rank, expected):
+    from opendde.distributed.foldcp import config as config_module
+    from opendde.model import opendde as model_module
+
+    monkeypatch.setenv("OPENDDE_FOLDCP_MODE", "distributed")
+    monkeypatch.delenv("OPENDDE_FOLDCP_SIZE_CP", raising=False)
+    monkeypatch.setattr(config_module.dist, "is_available", lambda: True)
+    monkeypatch.setattr(config_module.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(config_module.dist, "get_world_size", lambda: 5)
+    monkeypatch.setattr(config_module.dist, "get_rank", lambda: rank)
+
+    assert model_module.OpenDDE._foldcp_is_non_output_rank() is expected
+
+
 @pytest.mark.parametrize("p", range(2, 9))
 def test_one_by_p_layout_keeps_transpose_on_the_same_rank(p):
     """Catch treating a 1 x P column shard as a square-mesh transpose."""
@@ -34,19 +84,12 @@ def test_one_by_p_layout_keeps_transpose_on_the_same_rank(p):
     )
 
 
-def test_square_layout_remains_compatible_with_public_cp4():
-    """Catch breaking the original public 2 x 2 layout contract."""
+@pytest.mark.parametrize("shape", [(2, 2), (2, 3), (4, 4)])
+def test_layout_rejects_removed_multirow_topologies(shape):
+    """Direct library callers cannot bypass the runtime 1 x P boundary."""
 
-    layout = FoldCP2DLayout((2, 2))
-
-    assert layout.transpose_rank((0, 1)) == layout.to_linear((1, 0))
-
-
-@pytest.mark.parametrize("p", range(1, 9))
-def test_foldcp_does_not_limit_the_cuda_allocator_by_default(p):
-    from runner.inference import _default_foldcp_cuda_memory_fraction
-
-    assert _default_foldcp_cuda_memory_fraction(p) == 0.0
+    with pytest.raises(ValueError, match="1 x P"):
+        FoldCP2DLayout(shape)
 
 
 @pytest.mark.parametrize("n,p", [(7, 2), (7, 3), (10, 5), (17, 8)])

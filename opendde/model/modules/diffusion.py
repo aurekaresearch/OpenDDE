@@ -9,11 +9,13 @@ import torch.nn as nn
 
 from opendde.distributed.foldcp.config import FoldCPConfig
 from opendde.distributed.foldcp.atom_window import FoldCPWindowShardSpec
+from opendde.distributed.foldcp.comm import run_group_rank_action_synchronized
 from opendde.distributed.foldcp.mesh import FoldCPProcessMesh
 from opendde.distributed.foldcp.launch import (
     foldcp_linear_with_source_launch_shape,
     foldcp_pair_row_slab_linear_with_source_launch_policy,
 )
+from opendde.distributed.foldcp.msa_pair_weighted import collect_msa_pair_row_slab
 from opendde.distributed.foldcp.pair_sharding import (
     FoldCPPairShardSpec,
     gather_pair_tensor,
@@ -213,36 +215,11 @@ class DiffusionConditioning(nn.Module):
         mesh: FoldCPProcessMesh,
         n_token: int,
     ) -> torch.Tensor:
-        side = mesh.layout.shape[1]
-        if side == 1:
-            return z_pair_local[..., :n_token, :].contiguous()
-        ring = mesh.ring_comm()
-        local_cols = z_pair_local.shape[-2]
-        out = z_pair_local.new_empty(
-            *z_pair_local.shape[:-2],
-            int(n_token),
-            z_pair_local.shape[-1],
+        return collect_msa_pair_row_slab(
+            z_pair_local,
+            mesh,
+            original_tokens=int(n_token),
         )
-
-        def copy_source_tile(tile: torch.Tensor, source_col: int) -> None:
-            target_col_start = int(source_col) * local_cols
-            target_col_end = min(target_col_start + local_cols, int(n_token))
-            if target_col_start >= target_col_end:
-                return
-            source_width = target_col_end - target_col_start
-            out[..., target_col_start:target_col_end, :] = tile[
-                ...,
-                :source_width,
-                :,
-            ]
-
-        ready = z_pair_local.contiguous()
-        copy_source_tile(ready, mesh.coord[1])
-        for step in range(1, side):
-            ready = ring.comm_row.exchange(ready.contiguous())
-            source_col = (mesh.coord[1] + step) % side
-            copy_source_tile(ready, source_col)
-        return out.contiguous()
 
     @staticmethod
     def _linear_pair_row_slab_source_grid_launch(
@@ -797,7 +774,15 @@ class DiffusionConditioning(nn.Module):
             launch.index_copy_(0, source_offsets, flat.index_select(0, tile_index))
             update = transition(launch).index_select(0, source_offsets)
             flat.index_copy_(0, tile_index, flat.index_select(0, tile_index) + update)
-            del launch, update, source_offsets, tile_index
+            del (
+                launch,
+                update,
+                source_offsets,
+                tile_index,
+                global_rows,
+                source_index,
+                mask,
+            )
 
     def _apply_pair_z_transitions_foldcp_tile(
         self,
@@ -918,6 +903,27 @@ class DiffusionConditioning(nn.Module):
         mesh: FoldCPProcessMesh,
         inplace_safe: bool = False,
     ) -> tuple[torch.Tensor, FoldCPPairShardSpec]:
+        prepared = run_group_rank_action_synchronized(
+            lambda: self._prepare_cache_foldcp_local_impl(
+                relp_feature,
+                z_trunk_local,
+                z_spec,
+                inplace_safe,
+            ),
+            group=mesh.group_2d,
+            description="Fold-CP diffusion pair-cache preparation",
+        )
+        if prepared is None:  # pragma: no cover
+            raise RuntimeError("Fold-CP diffusion pair cache was not prepared.")
+        return prepared
+
+    def _prepare_cache_foldcp_local_impl(
+        self,
+        relp_feature: Union[torch.Tensor, LazyRelativePositionEncodingFeatures],
+        z_trunk_local: torch.Tensor,
+        z_spec: FoldCPPairShardSpec,
+        inplace_safe: bool = False,
+    ) -> tuple[torch.Tensor, FoldCPPairShardSpec]:
         del inplace_safe
         n_token = z_spec.original_shape[z_spec.pair_dims[0]]
         row_start, row_end = z_spec.row_range
@@ -938,7 +944,6 @@ class DiffusionConditioning(nn.Module):
         if valid_rows == 0 or valid_cols == 0:
             return pair_z_local.contiguous(), pair_spec
 
-        del mesh
         source_rows = n_token * n_token
         row_chunk_size = _foldcp_diffusion_cache_trunk_row_chunk_size(valid_rows)
         for local_row_start in range(0, valid_rows, row_chunk_size):
@@ -1227,13 +1232,7 @@ class DiffusionModule(nn.Module):
             return None
         if self._foldcp_mesh is not None:
             return self._foldcp_mesh
-        foldcp = FoldCPConfig.from_runtime_args(
-            mode="distributed",
-            size_dp=int(os.environ.get("OPENDDE_FOLDCP_SIZE_DP", "1")),
-            size_cp=int(os.environ.get("OPENDDE_FOLDCP_SIZE_CP", "4")),
-            devices=os.environ.get("OPENDDE_FOLDCP_DEVICES", ""),
-            metrics_jsonl=os.environ.get("OPENDDE_FOLDCP_METRICS_JSONL", ""),
-        )
+        foldcp = FoldCPConfig.from_environment()
         self._foldcp_mesh = FoldCPProcessMesh.create(foldcp)
         return self._foldcp_mesh
 
@@ -1309,12 +1308,24 @@ class DiffusionModule(nn.Module):
         if pair_z is None and foldcp_mesh is not None and pair_z_spec is not None:
             z_trunk_for_cache = z_trunk
             if not use_conditioning:
-                if inplace_safe:
-                    s_trunk *= 0
-                    z_trunk *= 0
-                else:
-                    s_trunk = 0 * s_trunk
-                    z_trunk_for_cache = 0 * z_trunk
+
+                def _zero_foldcp_conditioning_inputs():
+                    if inplace_safe:
+                        s_trunk.mul_(0)
+                        z_trunk.mul_(0)
+                        return s_trunk, z_trunk
+                    return 0 * s_trunk, 0 * z_trunk
+
+                zeroed_inputs = run_group_rank_action_synchronized(
+                    _zero_foldcp_conditioning_inputs,
+                    group=foldcp_mesh.group_2d,
+                    description="Fold-CP diffusion conditioning-input zeroing",
+                )
+                if zeroed_inputs is None:  # pragma: no cover
+                    raise RuntimeError(
+                        "Fold-CP diffusion conditioning inputs were not zeroed."
+                    )
+                s_trunk, z_trunk_for_cache = zeroed_inputs
             pair_z, pair_z_spec = (
                 self.diffusion_conditioning.prepare_cache_foldcp_local(
                     input_feature_dict["relp"],
@@ -1324,38 +1335,54 @@ class DiffusionModule(nn.Module):
                     inplace_safe,
                 )
             )
+
         # Conditioning, shared across difference samples
         # Diffusion_conditioning consumes 7-8G when token num is 768,
         # use checkpoint here if blocks_per_ckpt is not None.
-        if blocks_per_ckpt:
-            checkpoint_fn = get_checkpoint_fn()
-            s_single, z_pair = checkpoint_fn(
-                self.diffusion_conditioning,
-                t_hat_noise_level,
-                input_feature_dict["relp"],
-                s_inputs,
-                s_trunk,
-                z_trunk,
-                pair_z,
-                inplace_safe,
-                use_conditioning,
-            )
-        else:
-            s_single, z_pair = self.diffusion_conditioning(
-                t_hat_noise_level,
-                input_feature_dict["relp"],
-                s_inputs=s_inputs,
-                s_trunk=s_trunk,
-                z_trunk=z_trunk,
-                pair_z=pair_z,
-                inplace_safe=inplace_safe,
-                use_conditioning=use_conditioning,
-            )  # [..., N_sample, N_token, c_s], [..., N_token, N_token, c_z]
+        def _prepare_diffusion_conditioning():
+            if blocks_per_ckpt:
+                checkpoint_fn = get_checkpoint_fn()
+                prepared_s_single, prepared_z_pair = checkpoint_fn(
+                    self.diffusion_conditioning,
+                    t_hat_noise_level,
+                    input_feature_dict["relp"],
+                    s_inputs,
+                    s_trunk,
+                    z_trunk,
+                    pair_z,
+                    inplace_safe,
+                    use_conditioning,
+                )
+            else:
+                prepared_s_single, prepared_z_pair = self.diffusion_conditioning(
+                    t_hat_noise_level,
+                    input_feature_dict["relp"],
+                    s_inputs=s_inputs,
+                    s_trunk=s_trunk,
+                    z_trunk=z_trunk,
+                    pair_z=pair_z,
+                    inplace_safe=inplace_safe,
+                    use_conditioning=use_conditioning,
+                )
+            # Pair conditioning is shared across diffusion samples and is
+            # broadcast inside attention/local atom pair paths.
+            expanded_s_trunk = expand_at_dim(s_trunk, dim=-3, n=1)
+            return prepared_s_single, prepared_z_pair, expanded_s_trunk
 
-        # Expand single embeddings to match N_sample. Pair conditioning is shared
-        # across diffusion samples and is broadcast inside attention/local atom pair
-        # paths to avoid materializing [N_sample, N_token, N_token, c_z].
-        s_trunk = expand_at_dim(s_trunk, dim=-3, n=1)  # [..., N_sample, N_token, c_s]
+        prepared_conditioning = (
+            run_group_rank_action_synchronized(
+                _prepare_diffusion_conditioning,
+                group=foldcp_mesh.group_2d,
+                description="Fold-CP diffusion conditioning completion",
+            )
+            if foldcp_mesh is not None
+            and int(foldcp_mesh.layout.shape[0]) == 1
+            and int(foldcp_mesh.layout.shape[1]) > 1
+            else _prepare_diffusion_conditioning()
+        )
+        if prepared_conditioning is None:  # pragma: no cover
+            raise RuntimeError("Fold-CP diffusion conditioning returned no result.")
+        s_single, z_pair, s_trunk = prepared_conditioning
         # Fine-grained checkpoint for finetuning stage 2 (token num: 768) for avoiding OOM
         if blocks_per_ckpt and self.use_fine_grained_checkpoint:
             checkpoint_fn = get_checkpoint_fn()
@@ -1426,25 +1453,36 @@ class DiffusionModule(nn.Module):
                     inplace_safe=inplace_safe,
                     chunk_size=chunk_size,
                 )
-        # Upcast
-        a_token = a_token.to(dtype=torch.float32)
-        # Full self-attention on token level.
-        if inplace_safe:
-            a_token += self.linear_no_bias_s(
-                self.layernorm_s(s_single)
-            )  # [..., N_sample, N_token, c_token]
-        else:
-            a_token = a_token + self.linear_no_bias_s(
-                self.layernorm_s(s_single)
-            )  # [..., N_sample, N_token, c_token]
         if foldcp_mesh is not None and pair_z_spec is not None:
-            if enable_efficient_fusion:
-                z = self.normalize(z_pair.to(dtype=torch.float32))
-            else:
-                z = z_pair.to(dtype=torch.float32)
+
+            def _prepare_foldcp_token_transformer_inputs():
+                prepared_a_token = a_token.to(dtype=torch.float32)
+                if inplace_safe:
+                    prepared_a_token += self.linear_no_bias_s(
+                        self.layernorm_s(s_single)
+                    )
+                else:
+                    prepared_a_token = prepared_a_token + self.linear_no_bias_s(
+                        self.layernorm_s(s_single)
+                    )
+                prepared_z = z_pair.to(dtype=torch.float32)
+                if enable_efficient_fusion:
+                    prepared_z = self.normalize(prepared_z)
+                return prepared_a_token, s_single.to(dtype=torch.float32), prepared_z
+
+            transformer_inputs = run_group_rank_action_synchronized(
+                _prepare_foldcp_token_transformer_inputs,
+                group=foldcp_mesh.group_2d,
+                description="Fold-CP token-transformer input preparation",
+            )
+            if transformer_inputs is None:  # pragma: no cover
+                raise RuntimeError(
+                    "Fold-CP token transformer inputs were not prepared."
+                )
+            a_token, s_single_float, z = transformer_inputs
             a_token = self.diffusion_transformer.forward_foldcp_local_z(
-                a=a_token.to(dtype=torch.float32),
-                s=s_single.to(dtype=torch.float32),
+                a=a_token,
+                s=s_single_float,
                 z_local=z,
                 z_spec=pair_z_spec,
                 mesh=foldcp_mesh,
@@ -1455,24 +1493,27 @@ class DiffusionModule(nn.Module):
                 enable_efficient_fusion=enable_efficient_fusion,
                 projected_bias_local=foldcp_attention_bias,
             )
-        elif enable_efficient_fusion:
-            z = self.normalize(z_pair.to(dtype=torch.float32))
-            z = permute_final_dims(z, [2, 0, 1]).contiguous()
-            a_token = self.diffusion_transformer(
-                a=a_token.to(dtype=torch.float32),  # Upcast all inputs
-                s=s_single.to(dtype=torch.float32),
-                z=z,
-                inplace_safe=inplace_safe,
-                chunk_size=chunk_size,
-                enable_efficient_fusion=enable_efficient_fusion,
-                extra_attn_bias=input_feature_dict.get(
-                    "structural_pair_attn_bias", None
-                ),
-            )
+            # The FP32 token-transformer pair input is no longer consumed after
+            # this call.  Keeping both its local name and the preparation tuple
+            # alive through atom-decoder execution adds one complete local
+            # N x ceil(N/P) x C pair slab to the decoder peak on every rank.
+            # Autograd, when enabled, retains anything required for backward;
+            # inference can release these Python owners immediately.
+            del transformer_inputs, s_single_float, z
         else:
-            z = z_pair.to(dtype=torch.float32)
+            # Upcast and add the full self-attention single conditioning.
+            a_token = a_token.to(dtype=torch.float32)
+            if inplace_safe:
+                a_token += self.linear_no_bias_s(self.layernorm_s(s_single))
+            else:
+                a_token = a_token + self.linear_no_bias_s(self.layernorm_s(s_single))
+            if enable_efficient_fusion:
+                z = self.normalize(z_pair.to(dtype=torch.float32))
+                z = permute_final_dims(z, [2, 0, 1]).contiguous()
+            else:
+                z = z_pair.to(dtype=torch.float32)
             a_token = self.diffusion_transformer(
-                a=a_token.to(dtype=torch.float32),  # Upcast all inputs
+                a=a_token,
                 s=s_single.to(dtype=torch.float32),
                 z=z,
                 inplace_safe=inplace_safe,
@@ -1483,7 +1524,19 @@ class DiffusionModule(nn.Module):
                 ),
             )
 
-        a_token = self.layernorm_a(a_token)
+        a_token = (
+            run_group_rank_action_synchronized(
+                lambda: self.layernorm_a(a_token),
+                group=foldcp_mesh.group_2d,
+                description="Fold-CP atom-decoder input normalization",
+            )
+            if foldcp_mesh is not None
+            and int(foldcp_mesh.layout.shape[0]) == 1
+            and int(foldcp_mesh.layout.shape[1]) > 1
+            else self.layernorm_a(a_token)
+        )
+        if a_token is None:  # pragma: no cover
+            raise RuntimeError("Fold-CP atom decoder input was not normalized.")
         # Fine-grained checkpoint for finetuning stage 2 (token num: 768) for avoiding OOM
         if blocks_per_ckpt and self.use_fine_grained_checkpoint:
             checkpoint_fn = get_checkpoint_fn()
@@ -1573,14 +1626,36 @@ class DiffusionModule(nn.Module):
             torch.Tensor: the denoised coordinates of x
                 [..., N_sample, N_atom,3]
         """
+        foldcp_mesh = self._maybe_foldcp_mesh()
+        synchronize_one_by_p = (
+            foldcp_mesh is not None
+            and int(foldcp_mesh.layout.shape[0]) == 1
+            and int(foldcp_mesh.layout.shape[1]) > 1
+        )
+
         # Scale positions to dimensionless vectors with approximately unit variance
         # As in EDM:
         #     r_noisy = (c_in * x_noisy)
         #     where c_in = 1 / sqrt(sigma_data^2 + sigma^2)
+        def _prepare_scaled_coordinates():
+            return (
+                x_noisy
+                / torch.sqrt(self.sigma_data**2 + t_hat_noise_level**2)[..., None, None]
+            )
+
         r_noisy = (
-            x_noisy
-            / torch.sqrt(self.sigma_data**2 + t_hat_noise_level**2)[..., None, None]
+            run_group_rank_action_synchronized(
+                _prepare_scaled_coordinates,
+                group=foldcp_mesh.group_2d,
+                description="Fold-CP diffusion scaled-coordinate preparation",
+            )
+            if synchronize_one_by_p
+            else _prepare_scaled_coordinates()
         )
+        if r_noisy is None:  # pragma: no cover
+            raise RuntimeError(
+                "Fold-CP diffusion scaled coordinates were not prepared."
+            )
 
         # Compute the update given r_noisy (the scaled x_noisy)
         # As in EDM:
@@ -1614,12 +1689,27 @@ class DiffusionModule(nn.Module):
         #     c_skip = 1 / (1 + s_ratio^2)
         #     c_out = sigma / sqrt(1 + s_ratio^2)
 
-        s_ratio = (t_hat_noise_level / self.sigma_data)[..., None, None].to(
-            r_update.dtype
-        )
+        def _rescale_denoised_coordinates():
+            s_ratio = (t_hat_noise_level / self.sigma_data)[..., None, None].to(
+                r_update.dtype
+            )
+            return (
+                1 / (1 + s_ratio**2) * x_noisy
+                + t_hat_noise_level[..., None, None]
+                / torch.sqrt(1 + s_ratio**2)
+                * r_update
+            ).to(r_update.dtype)
+
         x_denoised = (
-            1 / (1 + s_ratio**2) * x_noisy
-            + t_hat_noise_level[..., None, None] / torch.sqrt(1 + s_ratio**2) * r_update
-        ).to(r_update.dtype)
+            run_group_rank_action_synchronized(
+                _rescale_denoised_coordinates,
+                group=foldcp_mesh.group_2d,
+                description="Fold-CP diffusion denoised-coordinate rescaling",
+            )
+            if synchronize_one_by_p
+            else _rescale_denoised_coordinates()
+        )
+        if x_denoised is None:  # pragma: no cover
+            raise RuntimeError("Fold-CP diffusion coordinates were not rescaled.")
 
         return x_denoised

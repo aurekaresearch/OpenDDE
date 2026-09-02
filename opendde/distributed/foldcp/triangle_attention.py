@@ -6,7 +6,11 @@ from __future__ import annotations
 
 import torch
 
-from opendde.distributed.foldcp.comm import Ring2DComm
+from opendde.distributed.foldcp.comm import (
+    Ring2DComm,
+    exchange_tensor_synchronized,
+    run_group_rank_action_synchronized,
+)
 from opendde.distributed.foldcp.online_softmax import (
     attention_block,
     online_softmax_update,
@@ -23,6 +27,7 @@ def distributed_ring_attention(
 ) -> torch.Tensor:
     """Compute local query-tile attention while rotating key/value tiles."""
 
+    synchronize_failures = int(ring.layout.numel) > 1
     k_ready = k_local
     v_ready = v_local
     bias_ready = bias_local
@@ -31,23 +36,64 @@ def distributed_ring_attention(
     lse = None
     amax = None
     for step in range(ring.layout.shape[1]):
-        block_out, block_lse, block_amax = attention_block(
-            q_local,
-            k_ready,
-            v_ready,
-            bias_ready,
+
+        def _compute_attention_block():
+            block_out, block_lse, block_amax = attention_block(
+                q_local,
+                k_ready,
+                v_ready,
+                bias_ready,
+            )
+            return online_softmax_update(
+                block_out, block_lse, block_amax, out, lse, amax
+            )
+
+        completed = (
+            run_group_rank_action_synchronized(
+                _compute_attention_block,
+                group=ring.group_2d,
+                description=f"reference ring attention step {step} computation",
+            )
+            if synchronize_failures
+            else _compute_attention_block()
         )
-        out, lse, amax = online_softmax_update(
-            block_out, block_lse, block_amax, out, lse, amax
-        )
+        if completed is None:  # pragma: no cover - every rank runs the action
+            raise RuntimeError("reference ring attention returned no step output.")
+        out, lse, amax = completed
         if step < ring.layout.shape[1] - 1:
-            k_ready = ring.comm_row.exchange(k_ready)
-            v_ready = ring.comm_row.exchange(v_ready)
+            k_ready = exchange_tensor_synchronized(
+                k_ready,
+                comm=ring.comm_row,
+                group=ring.group_2d,
+                description=f"reference ring attention step {step} K exchange",
+            )
+            v_ready = exchange_tensor_synchronized(
+                v_ready,
+                comm=ring.comm_row,
+                group=ring.group_2d,
+                description=f"reference ring attention step {step} V exchange",
+            )
             if bias_ready is not None:
-                bias_ready = ring.comm_row.exchange(bias_ready)
+                bias_ready = exchange_tensor_synchronized(
+                    bias_ready,
+                    comm=ring.comm_row,
+                    group=ring.group_2d,
+                    description=f"reference ring attention step {step} bias exchange",
+                )
     if out is None:
         raise RuntimeError("ring attention did not process any blocks.")
-    return out.contiguous()
+
+    finish = out.contiguous
+    if not synchronize_failures:
+        return finish()
+    result = run_group_rank_action_synchronized(
+        finish,
+        group=ring.group_2d,
+        description="reference ring attention completion",
+    )
+    if result is None:  # pragma: no cover
+        raise RuntimeError("reference ring attention returned no result.")
+    return result
 
 
 def _triangle_attention_block(
@@ -71,6 +117,7 @@ def distributed_triangle_attention_starting(
 ) -> torch.Tensor:
     """Triangle attention over each row while keeping a local pair tile output."""
 
+    synchronize_failures = int(ring.layout.numel) > 1
     q_local = z_local
     k_ready = z_local
     v_ready = z_local
@@ -78,25 +125,67 @@ def distributed_triangle_attention_starting(
     lse = None
     amax = None
     for step in range(ring.layout.shape[1]):
-        block_out, block_lse, block_amax = _triangle_attention_block(
-            q_local,
-            k_ready,
-            v_ready,
+
+        def _compute_triangle_block():
+            block_out, block_lse, block_amax = _triangle_attention_block(
+                q_local,
+                k_ready,
+                v_ready,
+            )
+            return online_softmax_update(
+                block_out,
+                block_lse,
+                block_amax,
+                out,
+                lse,
+                amax,
+            )
+
+        completed = (
+            run_group_rank_action_synchronized(
+                _compute_triangle_block,
+                group=ring.group_2d,
+                description=(
+                    f"reference starting triangle attention step {step} computation"
+                ),
+            )
+            if synchronize_failures
+            else _compute_triangle_block()
         )
-        out, lse, amax = online_softmax_update(
-            block_out,
-            block_lse,
-            block_amax,
-            out,
-            lse,
-            amax,
-        )
+        if completed is None:  # pragma: no cover
+            raise RuntimeError("reference triangle attention returned no step output.")
+        out, lse, amax = completed
         if step < ring.layout.shape[1] - 1:
-            k_ready = ring.comm_row.exchange(k_ready)
-            v_ready = ring.comm_row.exchange(v_ready)
+            k_ready = exchange_tensor_synchronized(
+                k_ready,
+                comm=ring.comm_row,
+                group=ring.group_2d,
+                description=(
+                    f"reference starting triangle attention step {step} K exchange"
+                ),
+            )
+            v_ready = exchange_tensor_synchronized(
+                v_ready,
+                comm=ring.comm_row,
+                group=ring.group_2d,
+                description=(
+                    f"reference starting triangle attention step {step} V exchange"
+                ),
+            )
     if out is None:
         raise RuntimeError("triangle attention did not process any blocks.")
-    return out.contiguous()
+
+    finish = out.contiguous
+    if not synchronize_failures:
+        return finish()
+    result = run_group_rank_action_synchronized(
+        finish,
+        group=ring.group_2d,
+        description="reference starting triangle attention completion",
+    )
+    if result is None:  # pragma: no cover
+        raise RuntimeError("reference triangle attention returned no result.")
+    return result
 
 
 def distributed_triangle_attention_ending(
@@ -105,9 +194,21 @@ def distributed_triangle_attention_ending(
 ) -> torch.Tensor:
     """Triangle attention over each column via transpose-starting-transpose."""
 
-    z_t_local = ring.comm_2d_trans.exchange(z_local.transpose(1, 2).contiguous())
+    z_t_local = exchange_tensor_synchronized(
+        z_local,
+        comm=ring.comm_2d_trans,
+        group=ring.group_2d,
+        description="reference ending triangle attention input transpose",
+        prepare=lambda tensor: tensor.transpose(1, 2),
+    )
     out_t_local = distributed_triangle_attention_starting(z_t_local, ring)
-    return ring.comm_2d_trans.exchange(out_t_local.transpose(1, 2).contiguous())
+    return exchange_tensor_synchronized(
+        out_t_local,
+        comm=ring.comm_2d_trans,
+        group=ring.group_2d,
+        description="reference ending triangle attention output transpose",
+        prepare=lambda tensor: tensor.transpose(1, 2),
+    )
 
 
 def serial_triangle_attention_starting(z: torch.Tensor) -> torch.Tensor:

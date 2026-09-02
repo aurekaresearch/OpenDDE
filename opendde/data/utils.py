@@ -25,7 +25,7 @@ from opendde.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-_MIN_TERMINAL_C_OXT_DISTANCE = 0.8
+_MIN_TERMINAL_C_OXT_DISTANCE = 1.0
 _MAX_TERMINAL_C_OXT_DISTANCE = 1.7
 _MIN_TERMINAL_C_CA_DISTANCE = 1.3
 _MAX_TERMINAL_C_CA_DISTANCE = 1.7
@@ -411,7 +411,11 @@ def _repair_terminal_oxt_coordinates(atom_array: AtomArray) -> int:
 
         if bonds is not None:
             has_external_bond = False
-            for atom_index in (atom_indices["C"], atom_indices["OXT"]):
+            for atom_index in (
+                atom_indices["C"],
+                atom_indices["O"],
+                atom_indices["OXT"],
+            ):
                 atom_bonds = bonds[np.any(bonds[:, :2] == atom_index, axis=1), :2]
                 bonded_indices = atom_bonds[atom_bonds != atom_index]
                 if np.any(~terminal_mask[bonded_indices]):

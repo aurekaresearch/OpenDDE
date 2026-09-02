@@ -84,6 +84,10 @@ User-facing changes to OpenDDE are documented here.
 
 ### Fixed
 
+- Inference now rebuilds detached, coincident, or non-finite OXT coordinates at
+  free protein C termini before writing CIF output, while leaving valid and
+  covalently linked termini unchanged. Repair is skipped when the predicted
+  C/CA/O anchor geometry is not chemically plausible.
 - Best-effort CUDA cleanup after a failed batch no longer raises a second error,
   and a failed synchronize no longer prevents the allocator from releasing its
   cached blocks. Normal seed-boundary synchronization still surfaces

@@ -12,6 +12,7 @@ import torch.nn as nn
 
 from opendde.model.triangular.layers import Attention, LayerNorm, OpenfoldLinear
 from opendde.model.utils import chunk_layer, is_fp16_enabled, permute_final_dims
+from opendde.utils.torch_utils import disabled_autocast
 
 
 def kernel_triangular_mult(
@@ -552,7 +553,7 @@ class TriangleMultiplicativeUpdate(BaseTriangleMultiplicativeUpdate):
                 b = b / b.std()
 
             if is_fp16_enabled():
-                with torch.amp.autocast("cuda", enabled=False):
+                with disabled_autocast():
                     x = self._combine_projections(a.float(), b.float())
             else:
                 x = self._combine_projections(a, b)

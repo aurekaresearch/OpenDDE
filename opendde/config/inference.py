@@ -155,6 +155,16 @@ def apply_runtime_compatibility(
         probe_packages=requested_kernels != {"torch"},
     )
 
+    if device.type == "mps" and configs.dtype == "bf16":
+        # MPS autocast rejects BF16 below macOS 14 and silently disables itself.
+        # Resolve that here so the run reports the precision it actually uses.
+        if not torch.backends.mps.is_macos_or_newer(14, 0):
+            logger.info(
+                "Enforcing FP32 on the Apple MPS device; BF16 autocast needs "
+                "macOS 14 or newer."
+            )
+            configs.dtype = "fp32"
+
     if runtime_status.requires_cc7_fallback:
         configs.dtype = "fp32"
         configs.triangle_attention = "torch"

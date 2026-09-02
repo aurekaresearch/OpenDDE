@@ -164,6 +164,138 @@ def test_cpu_cleanup_does_not_touch_visible_cuda(monkeypatch):
     torch_utils.cleanup_device_memory("cpu", collect_garbage=False)
 
 
+@pytest.mark.skipif(
+    not torch.backends.mps.is_available(),
+    reason="requires an Apple silicon Mac with a usable MPS backend",
+)
+def test_mps_attention_matches_cpu_for_batched_local_trunks():
+    """MPS SDPA folds high ranks with a layout-sensitive view.
+
+    Sampled local attention feeds it rank-5 trunks with a bias that broadcasts
+    over samples and heads, which requires explicit materialization.
+    """
+    from opendde.model.modules.primitives import _attention
+
+    torch.manual_seed(0)
+    n_sample, n_trunks, n_heads, n_queries, n_keys, c_hidden = 5, 3, 4, 8, 16, 32
+    q = torch.randn(1, n_trunks, n_heads, n_queries, c_hidden).expand(
+        n_sample, n_trunks, n_heads, n_queries, c_hidden
+    )
+    k = torch.randn(n_sample, n_trunks, n_heads, n_keys, c_hidden)
+    v = torch.randn_like(k)
+    attn_bias = torch.randn(1, n_trunks, 1, n_queries, n_keys)
+
+    expected = _attention(q, k, v, attn_bias)
+    actual = _attention(
+        q.to("mps"), k.to("mps"), v.to("mps"), attn_bias.to("mps")
+    ).cpu()
+
+    assert actual.shape == expected.shape
+    torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
+
+    # Rank-4 inputs take the native kernel path, broadcast bias included.
+    q4, k4, v4 = q[0], k[0], v[0]
+    bias4 = attn_bias[0]
+    expected4 = _attention(q4, k4, v4, bias4)
+    actual4 = _attention(
+        q4.to("mps"), k4.to("mps"), v4.to("mps"), bias4.to("mps")
+    ).cpu()
+    torch.testing.assert_close(actual4, expected4, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.skipif(
+    not torch.backends.mps.is_available(),
+    reason="requires an Apple silicon Mac with a usable MPS backend",
+)
+def test_mps_attention_broadcasts_rank4_qkv_batch_dimensions():
+    """MPS SDPA silently skips Q/K/V batch broadcasting at rank 4."""
+    from opendde.model.modules.primitives import _attention
+
+    torch.manual_seed(1)
+    q = torch.randn(1, 3, 4, 8)
+    k = torch.randn(2, 3, 5, 8)
+    v = torch.randn_like(k)
+    attn_bias = torch.randn(1, 3, 4, 5)
+
+    expected = _attention(q, k, v, attn_bias)
+    actual = _attention(
+        q.to("mps"), k.to("mps"), v.to("mps"), attn_bias.to("mps")
+    ).cpu()
+
+    assert actual.shape == expected.shape
+    torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.skipif(
+    not torch.backends.mps.is_available(),
+    reason="requires an Apple silicon Mac with a usable MPS backend",
+)
+def test_fp32_guard_clears_mps_autocast():
+    """MPS keeps an autocast state of its own, separate from CUDA's."""
+    from opendde.utils.torch_utils import (
+        autocasting_disable_decorator,
+        disabled_autocast,
+    )
+
+    a = torch.randn(8, 8, device="mps")
+    with torch.autocast("mps", dtype=torch.bfloat16):
+        assert (a @ a).dtype == torch.bfloat16
+        with disabled_autocast():
+            assert (a @ a).dtype == torch.float32
+        matmul = autocasting_disable_decorator(True)(lambda x: x @ x)
+        assert matmul(a).dtype == torch.float32
+
+
+def test_mps_cleanup_uses_the_mps_allocator(monkeypatch):
+    from opendde.utils import torch_utils
+
+    calls = []
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+    monkeypatch.setattr(
+        torch.cuda,
+        "empty_cache",
+        lambda: pytest.fail("MPS cleanup touched the CUDA allocator"),
+    )
+    monkeypatch.setattr(
+        torch.mps, "synchronize", lambda: calls.append(("synchronize", None))
+    )
+    monkeypatch.setattr(torch.mps, "empty_cache", lambda: calls.append(("empty", None)))
+
+    torch_utils.cleanup_device_memory("mps", collect_garbage=False)
+    torch_utils.cleanup_device_memory("mps", collect_garbage=False, synchronize=True)
+
+    assert calls == [
+        ("empty", None),
+        ("synchronize", None),
+        ("empty", None),
+    ]
+
+    def failing_synchronize():
+        raise RuntimeError("previous MPS failure")
+
+    monkeypatch.setattr(torch.mps, "synchronize", failing_synchronize)
+    torch_utils.cleanup_device_memory(
+        "mps",
+        collect_garbage=False,
+        synchronize=True,
+        suppress_errors=True,
+    )
+    assert calls[-1] == ("empty", None)
+
+
+def test_cpu_cleanup_does_not_touch_visible_mps(monkeypatch):
+    from opendde.utils import torch_utils
+
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+    monkeypatch.setattr(
+        torch.mps,
+        "empty_cache",
+        lambda: pytest.fail("CPU cleanup touched the MPS allocator"),
+    )
+
+    torch_utils.cleanup_device_memory("cpu", collect_garbage=False)
+
+
 def test_cuda_cleanup_synchronizes_only_when_requested(monkeypatch):
     from opendde.utils import torch_utils
 
@@ -186,6 +318,71 @@ def test_cuda_cleanup_synchronizes_only_when_requested(monkeypatch):
         ("synchronize", torch.device("cuda:0")),
         ("empty", None),
     ]
+
+
+def test_cuda_cleanup_suppresses_errors_during_failure_recovery(monkeypatch):
+    from opendde.utils import torch_utils
+
+    def failing_synchronize(*, device):
+        raise RuntimeError("previous CUDA failure")
+
+    calls = []
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "synchronize", failing_synchronize)
+    monkeypatch.setattr(
+        torch.cuda, "empty_cache", lambda: calls.append(("empty", None))
+    )
+
+    torch_utils.cleanup_device_memory(
+        "cuda:0",
+        collect_garbage=False,
+        synchronize=True,
+        suppress_errors=True,
+    )
+
+    # A failed synchronize must not stop the allocator from releasing blocks.
+    assert calls == [("empty", None)]
+
+
+def test_cuda_cleanup_propagates_synchronize_error_after_releasing_cache(monkeypatch):
+    from opendde.utils import torch_utils
+
+    error = RuntimeError("asynchronous CUDA failure")
+    calls = []
+
+    def failing_synchronize(*, device):
+        assert device == torch.device("cuda:0")
+        raise error
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "synchronize", failing_synchronize)
+    monkeypatch.setattr(
+        torch.cuda, "empty_cache", lambda: calls.append(("empty", None))
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        torch_utils.cleanup_device_memory(
+            "cuda:0", collect_garbage=False, synchronize=True
+        )
+
+    assert exc_info.value is error
+    assert calls == [("empty", None)]
+
+
+def test_cuda_cleanup_suppresses_failing_empty_cache_during_recovery(monkeypatch):
+    from opendde.utils import torch_utils
+
+    def failing_empty_cache():
+        raise RuntimeError("previous CUDA failure")
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "empty_cache", failing_empty_cache)
+
+    # A sticky CUDA context re-reports the original error from every CUDA call,
+    # so the non-synchronizing cleanup must swallow it too.
+    torch_utils.cleanup_device_memory(
+        "cuda:0", collect_garbage=False, suppress_errors=True
+    )
 
 
 def test_fused_layer_norm_uses_torch_fallback_for_cpu(monkeypatch):

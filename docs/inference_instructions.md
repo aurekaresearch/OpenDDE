@@ -67,9 +67,10 @@ mounts, and a complete `docker run` example.
 > [!NOTE]
 > `--torch-backend` selects the PyTorch build, while `[gpu]` adds the optional
 > cuEquivariance kernels. Linux wheels require glibc 2.28 or newer. Apple
-> Silicon runs on CPU (MPS is not supported); Intel macOS is unsupported, and
-> Windows has not been validated. At runtime, `--device auto` uses CUDA when
-> available and otherwise falls back to CPU.
+> Silicon runs on CPU or on the Metal (MPS) backend with `--device mps`; Intel
+> macOS is unsupported, and Windows has not been validated. At runtime,
+> `--device auto` uses CUDA when available, then MPS, and otherwise falls back
+> to CPU.
 
 ## Runtime data
 
@@ -237,9 +238,17 @@ opendde pred \
 ```
 
 Inference defaults to `--device auto`, `fp32`, and `auto` triangle kernels.
-Device auto-selection uses NVIDIA CUDA when available and otherwise CPU.
+Device auto-selection uses NVIDIA CUDA when available, then the Apple Metal
+(MPS) backend on Apple Silicon, and otherwise CPU.
 cuEquivariance is selected only when its Linux CUDA packages import successfully;
-otherwise the model uses PyTorch triangle kernels.
+otherwise the model uses PyTorch triangle kernels. MPS always uses PyTorch
+triangle kernels and defaults to FP32. `--dtype bf16` also works there and
+follows the same dynamic policy as CUDA: the trunk uses BF16; by default,
+diffusion and the confidence head stay FP32 through 2560 tokens, confidence
+uses BF16 above 2560, and diffusion uses BF16 above 3840 to reduce memory.
+BF16 performance varies by Apple GPU and workload, so compare it with FP32 for
+your inputs. BF16 autocast needs macOS 14 or newer and is downgraded to FP32
+below that.
 
 ## Multi-GPU Fold-CP inference
 
@@ -337,7 +346,7 @@ Outputs are written to:
 | `--foldcp_devices` | Optional visible-device list recorded in Fold-CP metrics; actual GPU visibility is controlled by `CUDA_VISIBLE_DEVICES`. |
 | `--foldcp_metrics_jsonl` | Optional JSONL path for Fold-CP timing and memory metrics. |
 | `--dtype` | `bf16` or `fp32`. |
-| `--device` | `auto`, `cpu`, or `cuda`; auto uses CUDA when available and otherwise CPU. |
+| `--device` | `auto`, `cpu`, `cuda`, or `mps`; auto uses CUDA when available, then Apple MPS, and otherwise CPU. |
 | `--trimul_kernel`, `--triatt_kernel` | `auto`, `cuequivariance`, or `torch`. |
 
 Run `opendde <command> --help` for the full option list.

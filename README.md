@@ -89,9 +89,10 @@ for GPU setup, runtime-data mounts, and a complete `docker run` example.
 > [!NOTE]
 > `--torch-backend` selects the PyTorch build, while `[gpu]` adds the optional
 > cuEquivariance kernels. Linux wheels require glibc 2.28 or newer. Apple
-> Silicon runs on CPU (MPS is not supported); Intel macOS is unsupported, and
-> Windows has not been validated. At runtime, `--device auto` uses CUDA when
-> available and otherwise falls back to CPU.
+> Silicon runs on CPU or on the Metal (MPS) backend with `--device mps`; Intel
+> macOS is unsupported, and Windows has not been validated. At runtime,
+> `--device auto` uses CUDA when available, then MPS, and otherwise falls back
+> to CPU.
 
 For runtime-data setup and additional installation details, see the
 [inference instructions](https://github.com/aurekaresearch/OpenDDE/blob/main/docs/inference_instructions.md).

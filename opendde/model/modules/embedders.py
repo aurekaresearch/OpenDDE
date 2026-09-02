@@ -147,7 +147,20 @@ class LazyRelativePositionEncodingFeatures:
             min=0,
             max=2 * self.r_max,
         ) * b_same_chain + (1 - b_same_chain) * (2 * self.r_max + 1)
-        a_rel_pos = F.one_hot(d_residue, 2 * (self.r_max + 1))
+        # Fill a single pre-allocated float buffer section by section instead of
+        # concatenating int64 one-hots: ``torch.cat`` would hold every operand
+        # plus the joined result plus its float copy alive at once.
+        relp = torch.empty(
+            (*d_residue.shape, self.feature_dim),
+            dtype=torch.float32,
+            device=d_residue.device,
+        )
+        offset = 0
+        position_dim = 2 * (self.r_max + 1)
+        position = F.one_hot(d_residue, position_dim)
+        relp[..., offset : offset + position_dim].copy_(position)
+        del d_residue, position
+        offset += position_dim
 
         d_token = torch.clip(
             input=token_row[..., :, None] - token_col[..., None, :] + self.r_max,
@@ -156,19 +169,22 @@ class LazyRelativePositionEncodingFeatures:
         ) * b_same_chain * b_same_residue + (1 - b_same_chain * b_same_residue) * (
             2 * self.r_max + 1
         )
-        a_rel_token = F.one_hot(d_token, 2 * (self.r_max + 1))
+        token = F.one_hot(d_token, position_dim)
+        relp[..., offset : offset + position_dim].copy_(token)
+        del d_token, token
+        offset += position_dim
+
+        relp[..., offset].copy_(b_same_entity)
+        offset += 1
 
         d_chain = torch.clip(
             input=sym_row[..., :, None] - sym_col[..., None, :] + self.s_max,
             min=0,
             max=2 * self.s_max,
         ) * b_same_entity + (1 - b_same_entity) * (2 * self.s_max + 1)
-        a_rel_chain = F.one_hot(d_chain, 2 * (self.s_max + 1))
-
-        relp = torch.cat(
-            [a_rel_pos, a_rel_token, b_same_entity[..., None], a_rel_chain],
-            dim=-1,
-        ).float()
+        chain_dim = 2 * (self.s_max + 1)
+        chain = F.one_hot(d_chain, chain_dim)
+        relp[..., offset : offset + chain_dim].copy_(chain)
         return relp[..., feature_slice]
 
     def __getitem__(self, index: Any) -> torch.Tensor:

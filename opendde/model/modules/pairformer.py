@@ -56,6 +56,7 @@ from opendde.model.utils import (
     expand_at_dim,
     is_fp16_enabled,
 )
+from opendde.utils.torch_utils import disabled_autocast
 
 
 _TEMPLATE_REPLICATED_SERIAL_MAX_PAIR_ELEMENTS = 2_100_000
@@ -940,7 +941,7 @@ class MSABlock(nn.Module):
                     channel_start * c_hidden : channel_end * c_hidden,
                 ]
                 if outer_chunk.dtype is torch.bfloat16:
-                    with torch.amp.autocast("cuda", enabled=False):
+                    with disabled_autocast():
                         local_update = local_update + F.linear(
                             outer_chunk,
                             weight_slice.to(dtype=outer_chunk.dtype),
@@ -1028,7 +1029,7 @@ class MSABlock(nn.Module):
                     channel_start * c_hidden : channel_end * c_hidden,
                 ]
                 if outer_chunk.dtype is torch.bfloat16:
-                    with torch.amp.autocast("cuda", enabled=False):
+                    with disabled_autocast():
                         z_local += F.linear(
                             outer_chunk,
                             weight_slice.to(dtype=outer_chunk.dtype),

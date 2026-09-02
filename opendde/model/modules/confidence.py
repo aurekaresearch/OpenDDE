@@ -24,7 +24,7 @@ from opendde.model.modules.pairformer import PairformerStack
 from opendde.model.modules.primitives import LinearNoBias
 from opendde.model.triangular.layers import LayerNorm
 from opendde.model.utils import broadcast_token_to_atom, one_hot
-from opendde.utils.torch_utils import cdist, cleanup_device_memory
+from opendde.utils.torch_utils import cdist, cleanup_device_memory, disabled_autocast
 
 
 class ConfidenceHead(nn.Module):
@@ -442,7 +442,7 @@ class ConfidenceHead(nn.Module):
             torch.Tensor, input_feature_dict["atom_to_tokatom_idx"]
         )
 
-        with torch.amp.autocast("cuda", enabled=False):
+        with disabled_autocast():
             pae_pred, pde_pred = distributed_confidence_pair_logits(
                 z_pair_local=z_pair_local,
                 z_pair_spec=z_pair_spec,
@@ -545,7 +545,7 @@ class ConfidenceHead(nn.Module):
             )
 
         # Embed pair distances of representative atoms:
-        with torch.amp.autocast("cuda", enabled=False):
+        with disabled_autocast():
             x_pred_rep_coords = x_pred_rep_coords.to(torch.float32)
             distance_pred = cdist(
                 x_pred_rep_coords, x_pred_rep_coords
@@ -601,7 +601,7 @@ class ConfidenceHead(nn.Module):
             torch.Tensor, input_feature_dict["atom_to_tokatom_idx"]
         )  # in range [0, max_atoms_per_token-1] shape: [N_atom] # influenced by crop
 
-        with torch.amp.autocast("cuda", enabled=False):
+        with disabled_autocast():
             pae_pred = (
                 self.linear_no_bias_pae(self.pae_ln(z_pair)) if compute_pae else None
             )

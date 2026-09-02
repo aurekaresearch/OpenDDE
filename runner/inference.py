@@ -182,12 +182,20 @@ class InferenceRunner(object):
             self._configure_foldcp_cuda_memory_fraction()
 
         self.configs = apply_runtime_compatibility(self.configs, self.device)
+        if self.device.type == "mps":
+            logging.info(
+                "Apple MPS backend selected; dtype=%s, triangle kernels: "
+                "multiplicative=%s, attention=%s.",
+                self.configs.dtype,
+                self.configs.triangle_multiplicative,
+                self.configs.triangle_attention,
+            )
 
         if DIST_WRAPPER.world_size > 1:
             if not self.use_cuda:
                 raise RuntimeError(
                     "Distributed Fold-CP inference requires NVIDIA CUDA; CPU "
-                    "supports single-process inference only."
+                    "and Apple MPS support single-process inference only."
                 )
             if not dist.is_nccl_available():
                 raise RuntimeError(
@@ -353,11 +361,12 @@ class InferenceRunner(object):
             "bf16": torch.bfloat16,
         }[self.configs.dtype]
 
-        enable_amp = (
-            torch.autocast(device_type="cuda", dtype=eval_precision)
-            if self.use_cuda and eval_precision != torch.float32
-            else nullcontext()
-        )
+        if eval_precision == torch.float32 or self.device.type not in {"cuda", "mps"}:
+            enable_amp = nullcontext()
+        else:
+            enable_amp = torch.autocast(
+                device_type=self.device.type, dtype=eval_precision
+            )
 
         sample_name = "unknown"
         if isinstance(data, Mapping):
@@ -492,6 +501,7 @@ def infer_predict(runner: InferenceRunner, configs: Any) -> None:
                 data = None
                 atom_array = None
                 prediction = None
+                batch_failed = False
                 try:
                     t2_start = time.time()
                     data, atom_array, data_error_message = batch[0]
@@ -544,6 +554,7 @@ def infer_predict(runner: InferenceRunner, configs: Any) -> None:
                         f"Results saved to {configs.dump_dir}"
                     )
                 except Exception as e:
+                    batch_failed = True
                     error_message = (
                         f"[Rank {DIST_WRAPPER.rank}] {sample_name} failed: {e}\n"
                         f"{traceback.format_exc()}"
@@ -560,7 +571,11 @@ def infer_predict(runner: InferenceRunner, configs: Any) -> None:
                     # drop it here to release them on every path, including the
                     # unpacking above failing.
                     del batch, data, atom_array, prediction
-                    cleanup_device_memory(runner.device, collect_garbage=False)
+                    cleanup_device_memory(
+                        runner.device,
+                        collect_garbage=False,
+                        suppress_errors=batch_failed,
+                    )
             cleanup_device_memory(runner.device, synchronize=True)
             t1_end = time.time()
             logger.info(

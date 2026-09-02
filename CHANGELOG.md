@@ -4,7 +4,37 @@ User-facing changes to OpenDDE are documented here.
 
 ## [Unreleased]
 
-No changes yet.
+### Added
+
+- Apple silicon (Metal/MPS) inference. `--device mps` runs the model on the
+  Metal backend, and `--device auto` now picks CUDA first, then MPS, then CPU.
+  MPS uses PyTorch triangle kernels and defaults to FP32; `--dtype bf16` opts
+  into the same dynamic mixed-precision policy CUDA uses. The trunk uses BF16;
+  by default, diffusion and the confidence head stay FP32 through 2560 tokens,
+  while confidence uses BF16 above 2560 and diffusion above 3840 to reduce
+  memory. Regions the model pins to FP32 now clear the autocast state of every
+  accelerator instead of CUDA's alone, since MPS keeps its own. Per-seed memory
+  cleanup releases the Metal allocator cache, and `opendde doctor` reports the
+  MPS build/availability flags. Distributed Fold-CP stays CUDA-only. Attention
+  explicitly broadcasts mismatched Q/K/V batch dimensions and folds
+  higher-rank inputs before calling the layout-sensitive Metal scaled-dot-product
+  kernel, and chain pLDDT accumulates in FP32 there because Metal has no FP64.
+
+### Changed
+
+- Lowered the memory peak of lazily materialized relative position encodings,
+  used by Fold-CP to build its pair tiles. The one-hot sections are now filled
+  into a single pre-allocated buffer instead of being concatenated, which
+  avoids holding the intermediate tensors, the joined result, and its float
+  copy at the same time. Predictions are unchanged: the filled buffer is
+  bit-for-bit identical to the concatenated one.
+
+### Fixed
+
+- Best-effort CUDA cleanup after a failed batch no longer raises a second error,
+  and a failed synchronize no longer prevents the allocator from releasing its
+  cached blocks. Normal seed-boundary synchronization still surfaces
+  asynchronous CUDA failures instead of reporting success.
 
 ## [1.1.0] - 2026-08-16
 

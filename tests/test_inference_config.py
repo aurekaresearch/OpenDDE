@@ -180,6 +180,33 @@ def test_apply_runtime_compatibility_consumes_resolved_device(monkeypatch):
     assert result.triangle_multiplicative == "torch"
 
 
+def test_mps_device_uses_torch_kernels_and_keeps_supported_bf16(monkeypatch):
+    monkeypatch.setattr(
+        torch.backends.mps, "is_macos_or_newer", lambda major, minor: True
+    )
+    cfg = build_inference_config(
+        arg_str=(
+            "--dtype bf16 --triangle_attention auto --triangle_multiplicative auto"
+        ),
+        fill_required_with_null=True,
+    )
+
+    result = apply_runtime_compatibility(cfg, torch.device("mps"))
+
+    assert result.dtype == "bf16"
+    assert result.triangle_attention == "torch"
+    assert result.triangle_multiplicative == "torch"
+
+
+def test_mps_device_downgrades_bf16_below_macos_14(monkeypatch):
+    monkeypatch.setattr(
+        torch.backends.mps, "is_macos_or_newer", lambda major, minor: False
+    )
+    cfg = build_inference_config(arg_str="--dtype bf16", fill_required_with_null=True)
+
+    assert apply_runtime_compatibility(cfg, torch.device("mps")).dtype == "fp32"
+
+
 def test_explicit_torch_kernels_skip_optional_package_probe(monkeypatch):
     import opendde.config.inference as inference_config
 
@@ -763,7 +790,9 @@ def test_main_closes_runner_when_inference_fails(monkeypatch):
     assert len(closed) == 1
 
 
-def test_infer_predict_releases_batch_before_seed_cleanup(monkeypatch, tmp_path):
+def test_infer_predict_releases_batch_and_scopes_cleanup_suppression(
+    monkeypatch, tmp_path
+):
     from runner import inference
 
     class WeakrefableData(dict):
@@ -809,14 +838,22 @@ def test_infer_predict_releases_batch_before_seed_cleanup(monkeypatch, tmp_path)
         if references:
             cleanup_states.append(all(reference() is None for reference in references))
 
+    def predict(data):
+        seed = data["input_feature_dict"]["inference_seed"].item()
+        if seed == 1:
+            raise RuntimeError("model failure")
+        return {}
+
     input_path = tmp_path / "input.json"
     input_path.write_text('[{"modelSeeds": [1, 2]}]', encoding="utf-8")
+    error_dir = tmp_path / "errors"
+    error_dir.mkdir()
     runner = SimpleNamespace(
         device=torch.device("cpu"),
-        error_dir=str(tmp_path / "errors"),
+        error_dir=str(error_dir),
         foldcp_config=SimpleNamespace(enabled=False),
         update_model_configs=lambda _configs: None,
-        predict=lambda _data: {},
+        predict=predict,
         dumper=SimpleNamespace(dump=lambda **_kwargs: None),
     )
     configs = SimpleNamespace(
@@ -843,9 +880,9 @@ def test_infer_predict_releases_batch_before_seed_cleanup(monkeypatch, tmp_path)
     # collection, then a synchronizing cleanup at the seed boundary.
     assert cleanup_kwargs == [
         {},
-        {"collect_garbage": False},
+        {"collect_garbage": False, "suppress_errors": True},
         {"synchronize": True},
         {},
-        {"collect_garbage": False},
+        {"collect_garbage": False, "suppress_errors": False},
         {"synchronize": True},
     ]

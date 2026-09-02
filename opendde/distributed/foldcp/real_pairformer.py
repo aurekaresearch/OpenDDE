@@ -35,6 +35,7 @@ from opendde.model.modules import primitives as _primitives
 from opendde.model.modules.primitives import _attention as _single_feature_attention
 from opendde.model.triangular.layers import _attention, softmax_no_cast
 from opendde.model.utils import permute_final_dims
+from opendde.utils.torch_utils import disabled_autocast
 
 
 _TRIATT_BIAS_SOURCE_LAUNCH_MIN_ROWS = 1_048_576
@@ -453,7 +454,7 @@ def _linear_output_slice(
     bias = None if linear.bias is None else linear.bias[output_slice]
     if getattr(linear, "precision", None) is not None:
         precision = linear.precision
-        with torch.amp.autocast("cuda", enabled=False):
+        with disabled_autocast():
             x_precision = x.to(dtype=precision)
             weight_precision = weight.to(dtype=precision)
             bias = None if bias is None else bias.to(dtype=precision)
@@ -463,7 +464,7 @@ def _linear_output_slice(
                 bias,
             ).to(dtype=x.dtype)
     if x.dtype is torch.bfloat16:
-        with torch.amp.autocast("cuda", enabled=False):
+        with disabled_autocast():
             bias = None if bias is None else bias.to(dtype=x.dtype)
             return torch.nn.functional.linear(x, weight.to(dtype=x.dtype), bias)
     return torch.nn.functional.linear(x, weight, bias)

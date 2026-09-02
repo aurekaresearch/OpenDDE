@@ -20,8 +20,55 @@ def test_auto_device_prefers_cuda(monkeypatch):
 
 def test_auto_device_falls_back_to_cpu(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.backends.mps, "is_built", lambda: False)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
 
     assert environment.select_torch_device("auto") == torch.device("cpu")
+
+
+def test_auto_device_prefers_mps_when_cuda_is_missing(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.backends.mps, "is_built", lambda: True)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+
+    assert environment.select_torch_device("auto") == torch.device("mps")
+
+
+def test_auto_device_prefers_cuda_over_mps(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+    monkeypatch.setattr(torch.backends.mps, "is_built", lambda: True)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+
+    assert environment.select_torch_device("auto") == torch.device("cuda:0")
+
+
+def test_explicit_unavailable_mps_has_actionable_error(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.backends.mps, "is_built", lambda: False)
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
+
+    with pytest.raises(RuntimeError, match="MPS was requested"):
+        environment.select_torch_device("mps")
+
+
+def test_mps_triangle_kernel_does_not_probe_optional_packages(monkeypatch):
+    def unexpected_probe(module_name):
+        raise AssertionError(f"MPS selection must not probe {module_name}")
+
+    monkeypatch.setattr(environment, "probe_optional_module", unexpected_probe)
+
+    status = environment.get_cuequivariance_runtime_status(torch.device("mps"))
+    assert not status.usable
+    assert status.auto_triangle_kernel == "torch"
+
+
+@pytest.mark.skipif(
+    not torch.backends.mps.is_available(),
+    reason="requires an Apple silicon Mac with a usable MPS backend",
+)
+def test_mps_device_is_selectable_on_apple_silicon():
+    assert environment.select_torch_device("mps") == torch.device("mps")
 
 
 def test_explicit_unavailable_cuda_has_actionable_error(monkeypatch):

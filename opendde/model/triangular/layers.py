@@ -20,6 +20,7 @@ from opendde.model.utils import (
     is_fp16_enabled,
     permute_final_dims,
 )
+from opendde.utils.torch_utils import disabled_autocast
 
 _use_fast_layer_norm = os.getenv("LAYERNORM_TYPE", "torch") == "fast_layernorm"
 if _use_fast_layer_norm:
@@ -202,7 +203,7 @@ class OpenfoldLinear(nn.Linear):
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         d = input.dtype
         if self.precision is not None:
-            with torch.amp.autocast("cuda", enabled=False):
+            with disabled_autocast():
                 precision_input = input.to(dtype=self.precision)
                 precision_weight = self.weight.to(dtype=self.precision)
                 bias = (
@@ -217,7 +218,7 @@ class OpenfoldLinear(nn.Linear):
                 ).to(dtype=d)
 
         if d is torch.bfloat16:
-            with torch.amp.autocast("cuda", enabled=False):
+            with disabled_autocast():
                 bias = self.bias.to(dtype=d) if self.bias is not None else None
                 return nn.functional.linear(input, self.weight.to(dtype=d), bias)
 
@@ -251,7 +252,7 @@ class OpenFoldLayerNorm(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         d = x.dtype
         if d is torch.bfloat16:
-            with torch.amp.autocast("cuda", enabled=False):
+            with disabled_autocast():
                 out = nn.functional.layer_norm(
                     x,
                     self.c_in,
@@ -291,7 +292,7 @@ def softmax_no_cast(t: torch.Tensor, dim: int = -1) -> torch.Tensor:
     """
     d = t.dtype
     if d is torch.bfloat16:
-        with torch.amp.autocast("cuda", enabled=False):
+        with disabled_autocast():
             s = torch.nn.functional.softmax(t, dim=dim)
     else:
         s = torch.nn.functional.softmax(t, dim=dim)
@@ -622,7 +623,7 @@ class OuterProductMean(nn.Module):
         inplace_safe: bool = False,
     ) -> torch.Tensor:
         if is_fp16_enabled():
-            with torch.amp.autocast("cuda", enabled=False):
+            with disabled_autocast():
                 return self._forward(m.float(), mask, chunk_size, inplace_safe)
         else:
             return self._forward(m, mask, chunk_size, inplace_safe)

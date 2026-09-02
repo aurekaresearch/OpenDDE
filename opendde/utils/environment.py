@@ -75,6 +75,8 @@ class TorchRuntimeInfo:
     device_name: Optional[str] = None
     import_error: Optional[str] = None
     cuda_probe_error: Optional[str] = None
+    mps_built: bool = False
+    mps_available: bool = False
 
     @property
     def usable(self) -> bool:
@@ -139,6 +141,19 @@ def probe_optional_module(module_name: str) -> OptionalModuleStatus:
     return OptionalModuleStatus(name=module_name, installed=True, version=version)
 
 
+def _probe_mps(torch_module) -> tuple[bool, bool]:
+    """Return ``(built, available)`` for the Apple Metal (MPS) backend."""
+    backend = getattr(getattr(torch_module, "backends", None), "mps", None)
+    if backend is None:
+        return False, False
+    try:
+        built = bool(backend.is_built())
+        available = bool(backend.is_available())
+    except Exception:
+        return False, False
+    return built, available
+
+
 def get_torch_runtime_info() -> TorchRuntimeInfo:
     if not module_available("torch"):
         return TorchRuntimeInfo(installed=False)
@@ -160,6 +175,7 @@ def get_torch_runtime_info() -> TorchRuntimeInfo:
     device_count = 0
     device_name = None
     cuda_version = getattr(getattr(torch_module, "version", None), "cuda", None)
+    mps_built, mps_available = _probe_mps(torch_module)
     try:
         cuda_available = bool(torch_module.cuda.is_available())
         device_count = int(torch_module.cuda.device_count()) if cuda_available else 0
@@ -173,6 +189,8 @@ def get_torch_runtime_info() -> TorchRuntimeInfo:
             device_count=device_count,
             device_name=device_name,
             cuda_probe_error=_format_exception(exc),
+            mps_built=mps_built,
+            mps_available=mps_available,
         )
 
     return TorchRuntimeInfo(
@@ -182,13 +200,15 @@ def get_torch_runtime_info() -> TorchRuntimeInfo:
         cuda_version=cuda_version,
         device_count=device_count,
         device_name=device_name,
+        mps_built=mps_built,
+        mps_available=mps_available,
     )
 
 
 def select_torch_device(
     requested_device: InferenceDevice = "auto", local_rank: int = 0
 ) -> torch.device:
-    """Resolve an inference device, preferring CUDA and otherwise using CPU."""
+    """Resolve an inference device, preferring CUDA, then Apple MPS, then CPU."""
     if requested_device not in INFERENCE_DEVICE_CHOICES:
         choices = ", ".join(INFERENCE_DEVICE_CHOICES)
         raise ValueError(
@@ -203,8 +223,24 @@ def select_torch_device(
         ) from exc
 
     cuda_available = torch.cuda.is_available()
+    _, mps_available = _probe_mps(torch)
     if requested_device == "auto":
-        requested_device = "cuda" if cuda_available else "cpu"
+        if cuda_available:
+            requested_device = "cuda"
+        elif mps_available:
+            requested_device = "mps"
+        else:
+            requested_device = "cpu"
+
+    if requested_device == "mps":
+        if not mps_available:
+            raise RuntimeError(
+                "MPS was requested, but torch.backends.mps.is_available() is "
+                "false. Apple Metal inference needs an Apple silicon Mac with "
+                "macOS 12.3+ and an MPS-enabled PyTorch build; otherwise use "
+                "'--device cpu'."
+            )
+        return torch.device("mps")
 
     if requested_device == "cuda":
         if not cuda_available:
@@ -344,6 +380,12 @@ def _runtime_recommendation(
             f"({torch_info.cuda_probe_error}). CPU inference remains available; "
             "use --device cpu."
         )
+    if selected_device is not None and selected_device.type == "mps":
+        return (
+            "Apple Metal (MPS) inference is available. OpenDDE defaults to FP32 "
+            "and torch triangle kernels; BF16 is opt-in, and the cuEquivariance "
+            "extra is CUDA-only."
+        )
     if selected_device is not None and selected_device.type == "cuda":
         if platform.system() == "Windows":
             return (
@@ -364,7 +406,14 @@ def _runtime_recommendation(
             'pip install "opendde[gpu]", or select the validated CUDA 12.6 '
             'backend with: uv pip install --torch-backend cu126 "opendde[gpu]".'
         )
-    return "No supported CUDA runtime is visible; OpenDDE will use CPU inference."
+    if torch_info.mps_built and not torch_info.mps_available:
+        return (
+            "PyTorch was built with MPS, but torch.backends.mps.is_available() "
+            "is false; OpenDDE will use CPU inference."
+        )
+    return (
+        "No supported CUDA or MPS runtime is visible; OpenDDE will use CPU inference."
+    )
 
 
 def format_doctor_report() -> str:
@@ -403,6 +452,8 @@ def format_doctor_report() -> str:
         f"- CUDA device count: {torch_info.device_count}",
         f"- CUDA device 0: {torch_info.device_name or 'none'}",
         f"- CUDA probe error: {torch_info.cuda_probe_error or 'none'}",
+        f"- torch.backends.mps.is_built: {torch_info.mps_built}",
+        f"- torch.backends.mps.is_available: {torch_info.mps_available}",
         f"- nvidia-smi: {nvidia_smi_info or ('found' if nvidia_smi_found else 'not found')}",
         "- GPU optional packages:",
         *(f"- {status.name}: {status.summary}" for status in optional_modules),

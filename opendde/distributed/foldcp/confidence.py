@@ -17,7 +17,7 @@ from opendde.distributed.foldcp.pair_sharding import (
     gather_pair_tensor_like,
 )
 from opendde.model.utils import one_hot
-from opendde.utils.torch_utils import cdist
+from opendde.utils.torch_utils import cdist, disabled_autocast
 
 
 _CONFIDENCE_TRANSPOSE_CPU_OFFLOAD_MIN_BYTES = 2 * 1024**3
@@ -200,7 +200,7 @@ def add_confidence_distance_embedding_local(
         local_row_start = global_row_start - row_start
         local_row_end = global_row_end - row_start
         row_coords = coords[global_row_start:global_row_end]
-        with torch.amp.autocast("cuda", enabled=False):
+        with disabled_autocast():
             distance_pred = cdist(row_coords, col_coords)
         local_target = out[local_row_start:local_row_end, :local_col_count, :]
         onehot_input = one_hot(

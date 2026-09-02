@@ -246,7 +246,7 @@ raise SystemExit(doctor_result.exit_code)
         device_option = device_options[0]
         device_type = device_option.type
         assert isinstance(device_type, click.Choice)
-        self.assertEqual(set(device_type.choices), {"auto", "cpu", "cuda"})
+        self.assertEqual(set(device_type.choices), {"auto", "cpu", "cuda", "mps"})
         self.assertEqual(device_option.default, "auto")
 
         dtype_options = [

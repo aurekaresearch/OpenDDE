@@ -16,6 +16,7 @@ from opendde.model.utils import (
     pad_at_dim,
     reshape_at_dim,
 )
+from opendde.utils.torch_utils import disabled_autocast
 
 
 _TRANSITION_FLAT_CHUNK_ROWS = 262_144
@@ -74,7 +75,7 @@ class Linear(nn.Linear):
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         if self.precision is not None:
             input_dtype = input.dtype
-            with torch.amp.autocast("cuda", enabled=False):
+            with disabled_autocast():
                 precision_input = input.to(dtype=self.precision)
                 precision_weight = self.weight.to(dtype=self.precision)
                 bias = (
@@ -217,6 +218,53 @@ class Transition(nn.Module):
         return outputs
 
 
+def _mps_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    attn_bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Run scaled dot-product attention on Apple MPS for any batch rank.
+
+    The MPS backend folds higher-rank inputs with ``view``, which rejects the
+    strided trunks produced by local attention, and it does not broadcast Q/K/V
+    batch dimensions against each other. Explicitly broadcast and fold those
+    cases so the kernel always sees matching rank-3 inputs. Lower-rank Q/K/V
+    with identical batch shapes can use the native path directly, including
+    native attention-mask broadcasting.
+    """
+    ranks = [q.dim(), k.dim(), v.dim()]
+    if attn_bias is not None:
+        ranks.append(attn_bias.dim())
+    qkv_batch_shapes_match = q.shape[:-2] == k.shape[:-2] == v.shape[:-2]
+    if max(ranks) <= 4 and qkv_batch_shapes_match:
+        return F.scaled_dot_product_attention(
+            query=q,
+            key=k,
+            value=v,
+            attn_mask=attn_bias,
+            scale=1.0,
+        )
+
+    batch_shapes = [q.shape[:-2], k.shape[:-2], v.shape[:-2]]
+    if attn_bias is not None:
+        batch_shapes.append(attn_bias.shape[:-2])
+    batch_shape = torch.broadcast_shapes(*batch_shapes)
+
+    def fold(tensor: torch.Tensor) -> torch.Tensor:
+        rows, cols = tensor.shape[-2:]
+        return tensor.expand(*batch_shape, rows, cols).reshape(-1, rows, cols)
+
+    attn_output = F.scaled_dot_product_attention(
+        query=fold(q),
+        key=fold(k),
+        value=fold(v),
+        attn_mask=None if attn_bias is None else fold(attn_bias),
+        scale=1.0,
+    )
+    return attn_output.reshape(*batch_shape, *attn_output.shape[-2:])
+
+
 def _attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -248,16 +296,19 @@ def _attention(
         attn_bias = attn_bias.to(dtype=torch.float32)
 
     if use_efficient_implementation:
-        attn_output = F.scaled_dot_product_attention(
-            query=q,
-            key=k,
-            value=v,
-            attn_mask=attn_bias,
-            scale=1.0,
-        )
+        if q.device.type == "mps":
+            attn_output = _mps_attention(q=q, k=k, v=v, attn_bias=attn_bias)
+        else:
+            attn_output = F.scaled_dot_product_attention(
+                query=q,
+                key=k,
+                value=v,
+                attn_mask=attn_bias,
+                scale=1.0,
+            )
         return attn_output.to(dtype=input_dtype)
 
-    with torch.amp.autocast("cuda", enabled=False):
+    with disabled_autocast():
         # [..., n_kv, d] -> [..., d, n_kv]
         k = k.transpose(-1, -2)
 

@@ -18,11 +18,12 @@ from pydantic import BaseModel, ConfigDict
 
 InferenceDtype = Literal["bf16", "fp32"]
 INFERENCE_DTYPE_CHOICES: tuple[InferenceDtype, ...] = ("bf16", "fp32")
-InferenceDevice = Literal["auto", "cpu", "cuda"]
+InferenceDevice = Literal["auto", "cpu", "cuda", "mps"]
 INFERENCE_DEVICE_CHOICES: tuple[InferenceDevice, ...] = (
     "auto",
     "cpu",
     "cuda",
+    "mps",
 )
 TriangleKernel = Literal["auto", "cuequivariance", "torch"]
 

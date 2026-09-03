@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Aureka AI Research
 import io
 import tarfile
 
@@ -15,10 +17,7 @@ from opendde.data.msa.msa_service_client import (
 def test_gather_a3m_lines_splits_by_numeric_header(tmp_path):
     """ColabFold packs results keyed by numeric header, separated by \\x00."""
     a3m = tmp_path / "uniref.a3m"
-    a3m.write_text(
-        ">101\nACDE\n>hitA\tmeta\nA-DE\n"
-        "\x00>102\nFGHI\n>hitB\tmeta\nF-HI\n"
-    )
+    a3m.write_text(">101\nACDE\n>hitA\tmeta\nA-DE\n\x00>102\nFGHI\n>hitB\tmeta\nF-HI\n")
 
     merged = gather_a3m_lines([str(a3m)], [101, 102])
 

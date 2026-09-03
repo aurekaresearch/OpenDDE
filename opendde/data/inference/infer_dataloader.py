@@ -1,16 +1,20 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Aureka AI Research
 import json
 import logging
 import os
 import time
 import traceback
 import warnings
+from collections.abc import Iterable, Iterator, Sized
 from typing import Any, cast
 
 import torch
 from biotite.structure import AtomArray
-from torch.utils.data import DataLoader, Dataset, DistributedSampler
+from torch.utils.data import DataLoader, Dataset, Sampler
 
 from opendde.data.core import ccd
+from opendde.data.inference.input_validation import validate_inference_jobs
 from opendde.data.inference.json_to_feature import SampleDictToFeatures
 from opendde.data.msa.msa_featurizer import InferenceMSAFeaturizer
 from opendde.data.template.template_featurizer import InferenceTemplateFeaturizer
@@ -24,7 +28,99 @@ logger = logging.getLogger(__name__)
 warnings.filterwarnings("ignore", module="biotite")
 
 
-def get_inference_dataloader(configs: Any) -> DataLoader:
+class InferenceJobSampler(Sampler[int]):
+    """Shard whole inference jobs across DP groups and replicate within CP.
+
+    All ranks in one Fold-CP group use the same ``rank`` here, so they receive
+    the same job sequence. DP groups are padded to the same number of forwards
+    because Fold-CP creates process groups collectively during model execution;
+    ``owns`` identifies real assignments so padded work never writes outputs.
+    """
+
+    def __init__(
+        self,
+        data_source: Sized,
+        *,
+        num_replicas: int,
+        rank: int,
+        sample_indices: Iterable[int] | None = None,
+    ) -> None:
+        if num_replicas < 1:
+            raise ValueError("num_replicas must be >= 1")
+        if not 0 <= rank < num_replicas:
+            raise ValueError("rank must be in [0, num_replicas)")
+        self.data_source = data_source
+        self.num_replicas = int(num_replicas)
+        self.rank = int(rank)
+        self.set_sample_indices(sample_indices)
+
+    def set_sample_indices(self, sample_indices: Iterable[int] | None) -> None:
+        indices = (
+            list(range(len(self.data_source)))
+            if sample_indices is None
+            else [int(index) for index in sample_indices]
+        )
+        if any(index < 0 or index >= len(self.data_source) for index in indices):
+            raise IndexError("inference sample index is out of range")
+        self._sample_indices = indices
+        if not indices:
+            self._local_indices = []
+            self._owned_indices: set[int] = set()
+            return
+
+        num_samples = (len(indices) + self.num_replicas - 1) // self.num_replicas
+        total_size = num_samples * self.num_replicas
+        padding_size = total_size - len(indices)
+        padded = indices + (indices * (padding_size // len(indices) + 1))[:padding_size]
+        positions = range(self.rank, total_size, self.num_replicas)
+        self._local_indices = [padded[position] for position in positions]
+        self._owned_indices = {
+            padded[position]
+            for position in range(self.rank, len(indices), self.num_replicas)
+        }
+
+    def __iter__(self) -> Iterator[int]:
+        return iter(self._local_indices)
+
+    def __len__(self) -> int:
+        return len(self._local_indices)
+
+    def owns(self, sample_index: int) -> bool:
+        """Return whether this DP rank owns, rather than pads, this job."""
+        return int(sample_index) in self._owned_indices
+
+
+def _data_parallel_coordinates(configs: Any) -> tuple[int, int]:
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        world_size = torch.distributed.get_world_size()
+        world_rank = torch.distributed.get_rank()
+    else:
+        world_size = DIST_WRAPPER.world_size
+        world_rank = DIST_WRAPPER.rank
+    if getattr(configs, "foldcp_mode", "single") == "distributed":
+        size_dp = int(getattr(configs, "foldcp_size_dp", 1))
+        size_cp = int(getattr(configs, "foldcp_size_cp", 1))
+        if size_dp != 1:
+            raise ValueError(
+                "Only the maintained 1 x P Fold-CP topology is supported; "
+                "foldcp_size_dp must be 1."
+            )
+        if world_size != size_cp:
+            raise ValueError(
+                "Distributed 1 x P Fold-CP dataloading requires WORLD_SIZE to "
+                f"equal foldcp_size_cp; got {world_size} vs {size_cp}."
+            )
+        # Every rank is one member of the same CP replica. All ranks must see
+        # the same job sequence; there is no data-parallel job sharding.
+        return 1, 0
+    return world_size, world_rank
+
+
+def get_inference_dataloader(
+    configs: Any,
+    *,
+    inputs: list[dict[str, Any]] | None = None,
+) -> DataLoader:
     """
     Creates and returns a DataLoader for inference using the InferenceDataset.
 
@@ -36,12 +132,13 @@ def get_inference_dataloader(configs: Any) -> DataLoader:
     """
     inference_dataset = InferenceDataset(
         configs=configs,
+        inputs=inputs,
     )
-    sampler = DistributedSampler(
-        dataset=inference_dataset,
-        num_replicas=DIST_WRAPPER.world_size,
-        rank=DIST_WRAPPER.rank,
-        shuffle=False,
+    size_dp, dp_rank = _data_parallel_coordinates(configs)
+    sampler = InferenceJobSampler(
+        inference_dataset,
+        num_replicas=size_dp,
+        rank=dp_rank,
     )
     dataloader = DataLoader(
         dataset=inference_dataset,
@@ -57,6 +154,7 @@ class InferenceDataset(Dataset):
     def __init__(
         self,
         configs,
+        inputs: list[dict[str, Any]] | None = None,
     ) -> None:
         self.configs = configs
 
@@ -70,8 +168,10 @@ class InferenceDataset(Dataset):
             components_file=configs.data.ccd_components_file,
             rdkit_mol_pkl=configs.data.ccd_components_rdkit_mol_file,
         )
-        with open(self.input_json_path, "r") as f:
-            self.inputs = cast(list[dict[str, Any]], json.load(f))
+        if inputs is None:
+            with open(self.input_json_path, "r") as f:
+                inputs = validate_inference_jobs(json.load(f))
+        self.inputs = cast(list[dict[str, Any]], inputs)
         if self.use_template:
             template_mmcif_dir = configs.data.template.prot_template_mmcif_dir
             fetch_remote = configs.data.template.get("fetch_remote", True)
@@ -236,6 +336,7 @@ class InferenceDataset(Dataset):
         return len(self.inputs)
 
     def __getitem__(self, index: int) -> tuple[dict[str, Any], AtomArray | None, str]:
+        sample_name = f"job_{index}"
         try:
             single_sample_dict = self.inputs[index]
             sample_name = single_sample_dict["name"]
@@ -248,6 +349,6 @@ class InferenceDataset(Dataset):
         except Exception as e:
             data, atom_array = {}, None
             error_message = f"{e}:\n{traceback.format_exc()}"
-        data["sample_name"] = single_sample_dict["name"]
+        data["sample_name"] = sample_name
         data["sample_index"] = index
         return data, atom_array, error_message

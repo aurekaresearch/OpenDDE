@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Aureka AI Research
 import copy
 import os
 import re
@@ -18,6 +20,18 @@ from opendde.data.constants import (
     STD_RESIDUES,
 )
 from opendde.data.core.ccd import biotite_load_ccd_cif
+from opendde.utils.logger import get_logger
+
+
+logger = get_logger(__name__)
+
+_MIN_TERMINAL_C_OXT_DISTANCE = 1.0
+_MAX_TERMINAL_C_OXT_DISTANCE = 1.7
+_MIN_TERMINAL_C_CA_DISTANCE = 1.3
+_MAX_TERMINAL_C_CA_DISTANCE = 1.7
+_MIN_TERMINAL_C_O_DISTANCE = 1.0
+_MAX_TERMINAL_C_O_DISTANCE = 1.5
+_MIN_TERMINAL_O_OXT_DISTANCE = 1.8
 
 
 def get_atom_mask_by_name(
@@ -340,6 +354,153 @@ def save_atoms_to_cif(
     )
 
 
+def _local_coordinate_frame(
+    carbon: np.ndarray,
+    alpha_carbon: np.ndarray,
+    oxygen: np.ndarray,
+) -> np.ndarray | None:
+    """Build an orthonormal frame for one peptide carbonyl group."""
+
+    ca_axis = alpha_carbon - carbon
+    ca_norm = np.linalg.norm(ca_axis)
+    if not np.isfinite(ca_norm) or ca_norm < 1e-6:
+        return None
+    ca_axis = ca_axis / ca_norm
+
+    oxygen_axis = oxygen - carbon
+    oxygen_axis -= np.dot(oxygen_axis, ca_axis) * ca_axis
+    oxygen_norm = np.linalg.norm(oxygen_axis)
+    if not np.isfinite(oxygen_norm) or oxygen_norm < 1e-6:
+        return None
+    oxygen_axis = oxygen_axis / oxygen_norm
+
+    normal_axis = np.cross(ca_axis, oxygen_axis)
+    return np.column_stack((ca_axis, oxygen_axis, normal_axis))
+
+
+def _repair_terminal_oxt_coordinates(atom_array: AtomArray) -> int:
+    """Rebuild chemically invalid OXT coordinates at free protein C termini."""
+
+    annotations = set(atom_array.get_annotation_categories())
+    if not {"mol_type", "ref_pos"}.issubset(annotations):
+        return 0
+
+    chain_ids = (
+        atom_array.label_asym_id
+        if "label_asym_id" in annotations
+        else atom_array.chain_id
+    )
+    ref_mask = atom_array.ref_mask if "ref_mask" in annotations else None
+    bonds = atom_array.bonds.as_array() if atom_array.bonds is not None else None
+    repaired = 0
+
+    for chain_id in np.unique(chain_ids[atom_array.mol_type == "protein"]):
+        chain_mask = (chain_ids == chain_id) & (atom_array.mol_type == "protein")
+        terminal_res_id = np.max(atom_array.res_id[chain_mask])
+        terminal_mask = chain_mask & (atom_array.res_id == terminal_res_id)
+
+        atom_matches = {
+            atom_name: np.flatnonzero(
+                terminal_mask & (atom_array.atom_name == atom_name)
+            )
+            for atom_name in ("CA", "C", "O", "OXT")
+        }
+        if any(len(indices) != 1 for indices in atom_matches.values()):
+            continue
+        atom_indices = {name: indices[0] for name, indices in atom_matches.items()}
+
+        if bonds is not None:
+            has_external_bond = False
+            for atom_index in (
+                atom_indices["C"],
+                atom_indices["O"],
+                atom_indices["OXT"],
+            ):
+                atom_bonds = bonds[np.any(bonds[:, :2] == atom_index, axis=1), :2]
+                bonded_indices = atom_bonds[atom_bonds != atom_index]
+                if np.any(~terminal_mask[bonded_indices]):
+                    has_external_bond = True
+                    break
+            if has_external_bond:
+                continue
+
+        required_indices = np.array(
+            [
+                atom_indices["C"],
+                atom_indices["CA"],
+                atom_indices["O"],
+                atom_indices["OXT"],
+            ]
+        )
+        if ref_mask is not None and not np.all(ref_mask[required_indices]):
+            continue
+
+        pred_coordinates = atom_array.coord[required_indices]
+        ref_coordinates = atom_array.ref_pos[required_indices]
+        if not np.all(np.isfinite(ref_coordinates)):
+            continue
+        if not np.all(np.isfinite(pred_coordinates[:3])):
+            logger.warning(
+                "Skipped terminal OXT repair for chain %s residue %s because "
+                "the predicted C/CA/O coordinates are not finite",
+                chain_id,
+                terminal_res_id,
+            )
+            continue
+
+        c_oxt_distance = np.linalg.norm(pred_coordinates[3] - pred_coordinates[0])
+        o_oxt_distance = np.linalg.norm(pred_coordinates[3] - pred_coordinates[2])
+        if (
+            np.isfinite(c_oxt_distance)
+            and _MIN_TERMINAL_C_OXT_DISTANCE
+            <= c_oxt_distance
+            <= _MAX_TERMINAL_C_OXT_DISTANCE
+            and np.isfinite(o_oxt_distance)
+            and o_oxt_distance >= _MIN_TERMINAL_O_OXT_DISTANCE
+        ):
+            continue
+
+        c_ca_distance = np.linalg.norm(pred_coordinates[1] - pred_coordinates[0])
+        c_o_distance = np.linalg.norm(pred_coordinates[2] - pred_coordinates[0])
+        if not (
+            _MIN_TERMINAL_C_CA_DISTANCE <= c_ca_distance <= _MAX_TERMINAL_C_CA_DISTANCE
+            and _MIN_TERMINAL_C_O_DISTANCE <= c_o_distance <= _MAX_TERMINAL_C_O_DISTANCE
+        ):
+            logger.warning(
+                "Skipped terminal OXT repair for chain %s residue %s because "
+                "the predicted C-CA/C-O distances are invalid (%.3f/%.3f A)",
+                chain_id,
+                terminal_res_id,
+                c_ca_distance,
+                c_o_distance,
+            )
+            continue
+
+        pred_frame = _local_coordinate_frame(*pred_coordinates[:3])
+        ref_frame = _local_coordinate_frame(*ref_coordinates[:3])
+        if pred_frame is None or ref_frame is None:
+            continue
+
+        ref_c_oxt = ref_coordinates[3] - ref_coordinates[0]
+        ref_c_oxt_distance = np.linalg.norm(ref_c_oxt)
+        ref_o_oxt_distance = np.linalg.norm(ref_coordinates[3] - ref_coordinates[2])
+        if not (
+            _MIN_TERMINAL_C_OXT_DISTANCE
+            <= ref_c_oxt_distance
+            <= _MAX_TERMINAL_C_OXT_DISTANCE
+            and ref_o_oxt_distance >= _MIN_TERMINAL_O_OXT_DISTANCE
+        ):
+            continue
+
+        rotation = pred_frame @ ref_frame.T
+        atom_array.coord[atom_indices["OXT"]] = (
+            pred_coordinates[0] + rotation @ ref_c_oxt
+        )
+        repaired += 1
+
+    return repaired
+
+
 def save_structure_cif(
     atom_array: AtomArray,
     pred_coordinate: torch.Tensor,
@@ -351,6 +512,10 @@ def save_structure_cif(
     """
     Save the predicted structure to a CIF file.
 
+    Before serialization, chemically invalid OXT coordinates at free protein
+    C termini are rebuilt from the CCD reference geometry when the predicted
+    C/CA/O anchor geometry is valid. Caller-owned coordinates are not modified.
+
     Args:
         atom_array (AtomArray): The original AtomArray containing the structure.
         pred_coordinate (torch.Tensor): The predicted coordinates for the structure.
@@ -360,8 +525,15 @@ def save_structure_cif(
         save_wo_unresolved (bool): Whether to save a version without unresolved atoms. Defaults to False.
     """
     pred_atom_array = copy.deepcopy(atom_array)
-    pred_pose = pred_coordinate.cpu().numpy()
+    pred_pose = pred_coordinate.detach().cpu().numpy().copy()
     pred_atom_array.coord = pred_pose
+    repaired_oxt_count = _repair_terminal_oxt_coordinates(pred_atom_array)
+    if repaired_oxt_count:
+        logger.warning(
+            "Rebuilt %d invalid terminal OXT coordinate(s) before saving %s",
+            repaired_oxt_count,
+            output_fpath,
+        )
     save_atoms_to_cif(
         output_fpath,
         pred_atom_array,

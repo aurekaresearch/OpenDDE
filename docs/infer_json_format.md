@@ -1,5 +1,6 @@
 # Inference JSON Format
 
+
 OpenDDE input is a JSON file whose top-level value is a non-empty list of jobs.
 It uses AlphaFold Server-style entity keys (`proteinChain`, `dnaSequence`,
 `rnaSequence`, `ligand`, `ion`), not the single-job `alphafold3` dialect.

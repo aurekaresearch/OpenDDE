@@ -146,5 +146,4 @@ python3 runner/inference.py \
     --triangle_attention "cuequivariance" \
     --triangle_multiplicative "cuequivariance" \
     --use_template true
-
 echo "All inference tests completed."

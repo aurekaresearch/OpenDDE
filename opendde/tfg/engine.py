@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Aureka AI Research
 # Copyright 2024 ByteDance and/or its affiliates.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -64,7 +66,9 @@ def _sample_eps(
     """
     if std == 0.0:
         return torch.zeros((1, *shape), device=device, dtype=dtype)
-    return std * torch.randn((k, *shape), device=device, dtype=dtype, generator=generator)
+    return std * torch.randn(
+        (k, *shape), device=device, dtype=dtype, generator=generator
+    )
 
 
 def _logmeanexp(x: torch.Tensor, dim: int) -> torch.Tensor:
@@ -345,10 +349,15 @@ class TFGEngine:
         p_lm: torch.Tensor,
         c_l: torch.Tensor,
         pair_z_spec: Any = None,
+        atom_window_spec: Any = None,
+        foldcp_attention_bias: Any = None,
         chunk_size: int | None,
         inplace_safe: bool,
         enable_efficient_fusion: bool,
         torch_generator: Optional[torch.Generator] = None,
+        rank_action_synchronizer: Optional[
+            Callable[[Callable[[], Any], str], Any]
+        ] = None,
     ) -> torch.Tensor:
         """Run one TFG-aware diffusion update: `x_t -> x_{t-1}`.
 
@@ -376,76 +385,106 @@ class TFGEngine:
             inplace_safe: Whether `denoise_net` may do in-place ops.
             enable_efficient_fusion: Whether to enable fused kernels.
             torch_generator: Optional RNG used for reproducible stochastic guidance.
+            rank_action_synchronizer: Optional 1xP Fold-CP boundary used to
+                propagate rank-local guidance failures before another denoiser
+                call can enter distributed collectives.
 
         Returns:
             Updated noisy coordinates `x_{t-1}` with shape `[*batch, N_atom, 3]`.
         """
-        if step_i == 0:
-            # Fail fast: terms may require specific features (e.g. bonds,
-            # chirality annotations, distance restraints).
-            validate_features(input_feature_dict, self.cfg.terms)
 
-        # A normalized time used by energy terms. This does not have to match
-        # the sampler's `t_hat` schedule exactly; it is a convenient [0, 1]
-        # parameter (1 = early/noisy, 0 = late/clean).
-        t = 1.0 - float(step_i) / float(max(1, num_diffusion_steps))
-        eps = _sample_eps(
-            self.cfg.eps_std,
-            x.shape,
-            k=self.cfg.eps_batch,
-            device=self.device,
-            dtype=self.dtype,
-            generator=torch_generator,
+        def _run_local(action: Callable[[], Any], description: str) -> Any:
+            if rank_action_synchronizer is None:
+                return action()
+            return rank_action_synchronizer(action, description)
+
+        def _prepare_guidance_step():
+            if step_i == 0:
+                # Fail fast: terms may require specific features (e.g. bonds,
+                # chirality annotations, distance restraints).
+                validate_features(input_feature_dict, self.cfg.terms)
+
+            # A normalized time used by energy terms. This does not have to match
+            # the sampler's `t_hat` schedule exactly; it is a convenient [0, 1]
+            # parameter (1 = early/noisy, 0 = late/clean).
+            prepared_t = 1.0 - float(step_i) / float(max(1, num_diffusion_steps))
+            prepared_eps = _sample_eps(
+                self.cfg.eps_std,
+                x.shape,
+                k=self.cfg.eps_batch,
+                device=self.device,
+                dtype=self.dtype,
+                generator=torch_generator,
+            )
+            return prepared_t, prepared_eps
+
+        t, eps = _run_local(
+            _prepare_guidance_step,
+            f"Fold-CP TFG step {step_i} preparation",
         )
 
         x_work = x
         for outer in range(self.cfg.outer_steps):
-            # 1) guidance on x_t through the denoiser path
-            if self.cfg.rho != 0.0:
-                with torch.enable_grad():
-                    x_var = x_work.detach().requires_grad_(True)
-                    x0_pred = denoise_net(
-                        x_noisy=x_var,
-                        t_hat_noise_level=t_hat,
-                        input_feature_dict=input_feature_dict,
-                        s_inputs=s_inputs,
-                        s_trunk=s_trunk,
-                        z_trunk=z_trunk,
-                        pair_z=pair_z,
-                        pair_z_spec=pair_z_spec,
-                        p_lm=p_lm,
-                        c_l=c_l,
-                        chunk_size=chunk_size,
-                        inplace_safe=inplace_safe,
-                        enable_efficient_fusion=enable_efficient_fusion,
-                    )
-                    # Estimate log p(x0_pred) (energy-only) and backprop through
-                    # the denoiser to get guidance gradient on x_t.
-                    avg_logp = self._logp_x0(
-                        x0_pred,
-                        eps,
-                        input_feature_dict,
-                        t=t,
-                        step_i=step_i,
-                    )
-                    grad_xt = torch.autograd.grad(
-                        avg_logp.sum(),
-                        x_var,
-                        retain_graph=False,
-                        create_graph=False,
-                        allow_unused=True,
-                    )[0]
-                    if grad_xt is None:
-                        grad_xt = torch.zeros_like(x_var)
-                xt_shift = grad_xt.detach() * float(self.cfg.rho)
-            else:
-                xt_shift = torch.zeros_like(x_work)
+
+            def _prepare_guidance_shift():
+                # 1) guidance on x_t through the denoiser path. Grad-enabled
+                # denoising is replicated rather than Fold-CP sharded, so this
+                # complete local branch is safe to put behind one rank boundary.
+                if self.cfg.rho != 0.0:
+                    with torch.enable_grad():
+                        x_var = x_work.detach().requires_grad_(True)
+                        x0_pred = denoise_net(
+                            x_noisy=x_var,
+                            t_hat_noise_level=t_hat,
+                            input_feature_dict=input_feature_dict,
+                            s_inputs=s_inputs,
+                            s_trunk=s_trunk,
+                            z_trunk=z_trunk,
+                            pair_z=pair_z,
+                            pair_z_spec=pair_z_spec,
+                            p_lm=p_lm,
+                            c_l=c_l,
+                            atom_window_spec=atom_window_spec,
+                            foldcp_attention_bias=foldcp_attention_bias,
+                            chunk_size=chunk_size,
+                            inplace_safe=inplace_safe,
+                            enable_efficient_fusion=enable_efficient_fusion,
+                        )
+                        # Estimate log p(x0_pred) (energy-only) and backprop through
+                        # the denoiser to get guidance gradient on x_t.
+                        avg_logp = self._logp_x0(
+                            x0_pred,
+                            eps,
+                            input_feature_dict,
+                            t=t,
+                            step_i=step_i,
+                        )
+                        grad_xt = torch.autograd.grad(
+                            avg_logp.sum(),
+                            x_var,
+                            retain_graph=False,
+                            create_graph=False,
+                            allow_unused=True,
+                        )[0]
+                        if grad_xt is None:
+                            grad_xt = torch.zeros_like(x_var)
+                    return grad_xt.detach() * float(self.cfg.rho)
+                return torch.zeros_like(x_work)
+
+            xt_shift = _run_local(
+                _prepare_guidance_shift,
+                f"Fold-CP TFG step {step_i} outer {outer} guidance preparation",
+            )
 
             # 2) denoise with the x_t shift applied
+            shifted_x_work = _run_local(
+                lambda: x_work + xt_shift,
+                f"Fold-CP TFG step {step_i} outer {outer} denoiser-input preparation",
+            )
             with torch.no_grad():
                 # The denoiser is treated as a black box in this branch.
                 x0 = denoise_net(
-                    x_noisy=x_work + xt_shift,
+                    x_noisy=shifted_x_work,
                     t_hat_noise_level=t_hat,
                     input_feature_dict=input_feature_dict,
                     s_inputs=s_inputs,
@@ -455,60 +494,69 @@ class TFGEngine:
                     pair_z_spec=pair_z_spec,
                     p_lm=p_lm,
                     c_l=c_l,
+                    atom_window_spec=atom_window_spec,
+                    foldcp_attention_bias=foldcp_attention_bias,
                     chunk_size=chunk_size,
                     inplace_safe=inplace_safe,
                     enable_efficient_fusion=enable_efficient_fusion,
                 )
 
-            # 3) projection
-            x0_ref = x0.detach()
-            x0_ref = x0_ref + self._project(
-                x0_ref, input_feature_dict, t=t, step_i=step_i
-            )
-
-            # 4) refinement directly on x0
-            for inner in range(self.cfg.inner_steps):
-                if self.cfg.mu == 0.0:
-                    break
-                # Optional logging at the very last refinement step.
-                log_components = (
-                    self.cfg.log_last_step_energy
-                    and (step_i == num_diffusion_steps - 1)
-                    and (outer == self.cfg.outer_steps - 1)
-                    and (inner == self.cfg.inner_steps - 1)
+            def _complete_guidance_outer():
+                # 3) projection
+                x0_ref = x0.detach()
+                x0_ref = x0_ref + self._project(
+                    x0_ref, input_feature_dict, t=t, step_i=step_i
                 )
-                _, grad_x0 = self._logp_and_grad_x0(
-                    x0_ref,
-                    eps,
-                    input_feature_dict,
-                    t=t,
-                    step_i=step_i,
-                    log_components=log_components,
+
+                # 4) refinement directly on x0
+                for inner in range(self.cfg.inner_steps):
+                    if self.cfg.mu == 0.0:
+                        break
+                    # Optional logging at the very last refinement step.
+                    log_components = (
+                        self.cfg.log_last_step_energy
+                        and (step_i == num_diffusion_steps - 1)
+                        and (outer == self.cfg.outer_steps - 1)
+                        and (inner == self.cfg.inner_steps - 1)
+                    )
+                    _, grad_x0 = self._logp_and_grad_x0(
+                        x0_ref,
+                        eps,
+                        input_feature_dict,
+                        t=t,
+                        step_i=step_i,
+                        log_components=log_components,
+                    )
+                    # Gradient ascent on log p(x0) (equivalently, gradient descent
+                    # on energy E). The step size is `cfg.mu`.
+                    x0_ref = x0_ref + grad_x0 * float(self.cfg.mu)
+
+                # 5) predictor-corrector update
+                # keep sign convention consistent with AF3 sampler
+                # `direction` is the normalized update direction implied by x0.
+                direction = (x_work + xt_shift - x0_ref) / t_hat[..., None, None]
+                dt = c_tau - t_hat
+                x_next_local = (
+                    x_work
+                    + xt_shift
+                    + float(step_scale_eta) * dt[..., None, None] * direction
                 )
-                # Gradient ascent on log p(x0) (equivalently, gradient descent
-                # on energy E). The step size is `cfg.mu`.
-                x0_ref = x0_ref + grad_x0 * float(self.cfg.mu)
 
-            # 5) predictor-corrector update
-            # keep sign convention consistent with AF3 sampler
-            # `direction` is the normalized update direction implied by x0.
-            direction = (x_work + xt_shift - x0_ref) / t_hat[..., None, None]
-            dt = c_tau - t_hat
-            x_next = (
-                x_work
-                + xt_shift
-                + float(step_scale_eta) * dt[..., None, None] * direction
-            )
+                # stochasticity
+                # Inject noise so the marginal at the next noise level matches the
+                # chosen diffusion schedule.
+                sigma = torch.sqrt(t_hat**2 - c_tau**2)
+                next_x_work = x_next_local + sigma[..., None, None] * torch.randn(
+                    size=x_next_local.shape,
+                    device=x_next_local.device,
+                    dtype=x_next_local.dtype,
+                    generator=torch_generator,
+                )
+                return x_next_local, next_x_work
 
-            # stochasticity
-            # Inject noise so the marginal at the next noise level matches the
-            # chosen diffusion schedule.
-            sigma = torch.sqrt(t_hat**2 - c_tau**2)
-            x_work = x_next + sigma[..., None, None] * torch.randn(
-                size=x_next.shape,
-                device=x_next.device,
-                dtype=x_next.dtype,
-                generator=torch_generator,
+            x_next, x_work = _run_local(
+                _complete_guidance_outer,
+                f"Fold-CP TFG step {step_i} outer {outer} completion",
             )
 
         return x_next

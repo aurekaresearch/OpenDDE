@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Aureka AI Research
 """Credential-free client for the public ColabFold MMseqs2 MSA service.
 
 OpenDDE does not host its own MSA server. Protein MSA search is delegated to the

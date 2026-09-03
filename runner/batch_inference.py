@@ -1,34 +1,48 @@
-import difflib
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Aureka AI Research
+import hashlib
 import json
 import logging
 import os
-import subprocess
 import tempfile
 import time
 import uuid
 from pathlib import Path
-from typing import List, Literal, Optional, Union
+from typing import Callable, List, Literal, Optional, TypeVar, Union, cast
 
 import click
+import torch.distributed as dist
 import tqdm
 from Bio import SeqIO
 from rdkit import Chem
 
 from opendde.config.inference import (
     build_inference_config,
-    update_gpu_compatible_configs,
+    validate_inference_schedule,
+    validate_triangle_kernels,
 )
 from opendde.config.model_registry import DEFAULT_MODEL_NAME, model_configs
+from opendde.config.schema import (
+    INFERENCE_DEVICE_CHOICES,
+    INFERENCE_DTYPE_CHOICES,
+    InferenceDevice,
+    InferenceDtype,
+    OpenDDEConfig,
+)
 from opendde.data.inference.json_maker import cif_to_input_json
 from opendde.data.inference.json_parser import lig_file_to_atom_info
+from opendde.data.inference.input_validation import (
+    validate_inference_jobs,
+    validate_inference_seed,
+)
+from opendde.data.tools import kalign
 from opendde.data.utils import pdb_to_cif
-from opendde.distributed.foldcp.config import FoldCPConfig, apply_foldcp_config
-from opendde.utils.download import download_inference_cache
-from opendde.utils.environment import format_doctor_report
+from opendde.distributed.foldcp.config import FoldCPConfig
 from opendde.utils.logger import get_logger
 from opendde.utils.logging_config import init_logging
-from opendde.version import __version__
+from runner.cli import CONTEXT_SETTINGS, opendde_cli
 from runner.inference import (
+    FoldCPJobCoordinationError,
     InferenceRunner,
     infer_predict,
 )
@@ -38,6 +52,82 @@ from runner.template_search import update_template_info
 
 logger = get_logger(__name__)
 SUPPORTED_MODELS = tuple(model_configs.keys())
+_T = TypeVar("_T")
+_GENERATED_INPUT_SUFFIXES = ("-update-msa.json", "-final-updated.json")
+
+
+def _run_on_rank0_and_broadcast(
+    operation: Callable[[], _T],
+    *,
+    description: str,
+    world_control_group: dist.ProcessGroup | None = None,
+) -> _T:
+    """Run filesystem preprocessing once and give every distributed rank its result."""
+
+    if not dist.is_available() or not dist.is_initialized():
+        return operation()
+
+    payload: list[tuple[bool, object] | None] = [None]
+    if dist.get_rank() == 0:
+        try:
+            payload[0] = (True, operation())
+        except Exception as exc:
+            payload[0] = (False, f"{type(exc).__name__}: {exc}")
+    if world_control_group is None:
+        dist.broadcast_object_list(payload, src=0)
+    else:
+        dist.broadcast_object_list(payload, src=0, group=world_control_group)
+    result = payload[0]
+    if result is None:
+        raise RuntimeError(f"Rank 0 returned no status while {description}.")
+    succeeded, value = result
+    if not succeeded:
+        raise RuntimeError(f"Rank-0 failure while {description}: {value}")
+    return cast(_T, value)
+
+
+def _discover_inference_jsons(json_file: str, out_dir: str) -> list[str]:
+    """Return stable source JSON paths while excluding generated output JSONs."""
+
+    input_path = Path(json_file)
+    if input_path.is_file():
+        if input_path.suffix != ".json":
+            raise RuntimeError(f"Inference input file must end with .json: {json_file}")
+        return [str(input_path)]
+    if not input_path.is_dir():
+        raise RuntimeError(f"Can not read input file or directory: {json_file}")
+
+    output_root = Path(out_dir).resolve()
+    infer_jsons = []
+    for path in input_path.rglob("*.json"):
+        if not path.is_file() or path.name.endswith(_GENERATED_INPUT_SUFFIXES):
+            continue
+        resolved = path.resolve()
+        if resolved == output_root or output_root in resolved.parents:
+            continue
+        infer_jsons.append(str(path))
+    infer_jsons.sort()
+    if not infer_jsons:
+        raise RuntimeError(f"Can not read a valid source JSON file in {json_file}")
+    return infer_jsons
+
+
+def _validate_input_collection(paths: list[str]) -> None:
+    """Reject names that would collide across files in one directory run."""
+
+    owners: dict[str, str] = {}
+    for path in paths:
+        with open(path, "r", encoding="utf-8") as handle:
+            jobs = validate_inference_jobs(json.load(handle))
+        for job in jobs:
+            name = job["name"]
+            previous = owners.get(name)
+            if previous is not None:
+                raise ValueError(
+                    f"Inference job name {name!r} occurs in both {previous} and {path}; "
+                    "the outputs would collide."
+                )
+            owners[name] = path
 
 
 def preprocess_input(
@@ -82,10 +172,26 @@ def preprocess_input(
     Returns:
         str: Path to the updated JSON file.
     """
-    # 1. Protein MSA search
-    msa_updated_json, _ = update_infer_json(
-        input_json, out_dir, use_msa=use_msa, mode=msa_server_mode
+    generated_json_dir = os.path.join(
+        os.path.abspath(out_dir),
+        ".opendde_preprocessed",
+        hashlib.blake2b(
+            os.path.abspath(input_json).encode("utf-8"), digest_size=8
+        ).hexdigest(),
     )
+
+    # 1. Protein MSA search. When MSA is disabled, do not convert legacy MSA
+    # metadata or write a derived JSON next to a potentially read-only input.
+    if use_msa:
+        msa_updated_json, _ = update_infer_json(
+            input_json,
+            out_dir,
+            use_msa=True,
+            mode=msa_server_mode,
+            json_output_dir=generated_json_dir,
+        )
+    else:
+        msa_updated_json = input_json
 
     # Read the data (either original or updated)
     with open(msa_updated_json, "r") as f:
@@ -125,9 +231,8 @@ def preprocess_input(
         else:
             output_json_name = f"{base}-final-updated{ext}"
 
-        output_json = os.path.join(
-            os.path.dirname(os.path.abspath(msa_updated_json)), output_json_name
-        )
+        os.makedirs(generated_json_dir, exist_ok=True)
+        output_json = os.path.join(generated_json_dir, output_json_name)
 
         with open(output_json, "w") as f:
             json.dump(json_data, f, indent=4)
@@ -263,7 +368,7 @@ def get_default_runner(
     n_cycle: int = 10,
     n_step: int = 200,
     n_sample: int = 5,
-    dtype: Literal["bf16", "fp32"] = "fp32",
+    dtype: InferenceDtype = "fp32",
     model_name: str = DEFAULT_MODEL_NAME,
     load_checkpoint_path: str = "",
     use_msa: bool = True,
@@ -275,7 +380,7 @@ def get_default_runner(
     deterministic: bool = False,
     use_template: bool = False,
     use_rna_msa: bool = False,
-    need_atom_confidence: bool = False,
+    need_atom_confidence: bool = True,
     kalign_binary_path: Optional[str] = None,
     use_tfg_guidance: bool = False,
     foldcp_mode: Literal["single", "distributed"] = "single",
@@ -283,6 +388,8 @@ def get_default_runner(
     foldcp_size_cp: int = 1,
     foldcp_devices: str = "",
     foldcp_metrics_jsonl: str = "",
+    *,
+    device: InferenceDevice = "auto",
 ) -> InferenceRunner:
     """
     Get a default InferenceRunner with the specified configurations.
@@ -294,6 +401,7 @@ def get_default_runner(
         n_step (int): Number of diffusion steps.
         n_sample (int): Number of samples.
         dtype (str): Inference data type. Defaults to 'fp32'.
+        device (str): Device selection: auto, cpu, cuda, or mps.
         model_name (str): Name of the model checkpoint.
         load_checkpoint_path (str): Explicit checkpoint path. If unset, uses the released checkpoint filename for model_name.
         use_msa (bool): Whether to use MSA.
@@ -316,6 +424,27 @@ def get_default_runner(
     Returns:
         InferenceRunner: An instance of InferenceRunner.
     """
+    if dtype not in INFERENCE_DTYPE_CHOICES:
+        raise ValueError(
+            f"dtype must be one of {INFERENCE_DTYPE_CHOICES}; got {dtype!r}."
+        )
+    if device not in INFERENCE_DEVICE_CHOICES:
+        raise ValueError(
+            f"device must be one of {INFERENCE_DEVICE_CHOICES}; got {device!r}."
+        )
+    validate_triangle_kernels(trimul_kernel, triatt_kernel)
+    if use_rna_msa and not use_msa:
+        raise ValueError(
+            "--use_rna_msa true requires --use_msa true; the global MSA switch "
+            "otherwise disables RNA MSA feature construction."
+        )
+    for option, value in (
+        ("--cycle", n_cycle),
+        ("--step", n_step),
+        ("--sample", n_sample),
+    ):
+        if value < 1:
+            raise ValueError(f"{option} must be at least 1, got {value}.")
     foldcp_config = FoldCPConfig.from_runtime_args(
         mode=foldcp_mode,
         size_dp=foldcp_size_dp,
@@ -333,7 +462,9 @@ def get_default_runner(
         fill_required_with_null=True,
     )
     if seeds is not None:
-        configs.seeds = seeds
+        configs.seeds = [
+            validate_inference_seed(seed, location="seeds") for seed in seeds
+        ]
     model_name = configs.model_name
     # the user input configs has the highest priority
     configs.dump_dir = dump_dir
@@ -342,6 +473,7 @@ def get_default_runner(
     configs.sample_diffusion.N_sample = n_sample
     configs.sample_diffusion.N_step = n_step
     configs.dtype = dtype
+    configs.device = device
     configs.use_msa = use_msa
     configs.triangle_multiplicative = trimul_kernel
     configs.triangle_attention = triatt_kernel
@@ -353,44 +485,19 @@ def get_default_runner(
     configs.use_rna_msa = use_rna_msa
     configs.need_atom_confidence = need_atom_confidence
     configs.sample_diffusion.guidance["enable"] = use_tfg_guidance
-    configs = apply_foldcp_config(configs, foldcp_config)
+    # Runtime assignment intentionally stays mutable for legacy callers, so
+    # rebuild the typed view once before any filesystem, process-group, or model
+    # initialization. This gives the Python API the same boundary as Click.
+    configs = OpenDDEConfig.model_validate(configs.model_dump())
+    validate_inference_schedule(configs)
 
-    if kalign_binary_path is not None:
-        # The path provided by the user is expected to exist by default
-        configs.data.template.kalign_binary_path = kalign_binary_path
-        assert os.path.exists(kalign_binary_path), (
-            f"kalign_binary_path {kalign_binary_path} does not exist"
+    if kalign_binary_path is not None or use_template:
+        configs.data.template.kalign_binary_path = kalign.resolve_kalign_binary(
+            kalign_binary_path
         )
-    else:
-        # If no path is provided and templates are used, try to find kalign in the system PATH
-        if use_template:
-            found_path = None
-            try:
-                result = subprocess.run(
-                    ["which", "kalign"], capture_output=True, text=True
-                )
-                if result.returncode == 0 and result.stdout.strip():
-                    kalign_in_path = result.stdout.strip()
-                    if os.path.exists(kalign_in_path) and os.access(
-                        kalign_in_path, os.X_OK
-                    ):
-                        found_path = kalign_in_path
-            except (subprocess.CalledProcessError, FileNotFoundError):
-                pass
 
-            if found_path is not None:
-                configs.data.template.kalign_binary_path = found_path
-            else:
-                raise RuntimeError(
-                    "Kalign binary not found in system PATH. "
-                    "To install kalign, you can use one of the following methods:\n"
-                    "1. Using conda: conda install -c bioconda kalign\n"
-                    "2. Using apt (Ubuntu/Debian): apt-get install kalign\n"
-                    "3. Download from: https://github.com/TimoLassmann/kalign\n"
-                    "After installation, make sure the binary is accessible in PATH or provide kalign_binary_path."
-                )
-
-    configs = update_gpu_compatible_configs(configs)
+    runner = InferenceRunner(configs, foldcp_config=foldcp_config)
+    configs = runner.configs
     logger.info(
         f"Inference by OpenDDE: model_name: {model_name}, dtype: {configs.dtype}"
     )
@@ -411,8 +518,7 @@ def get_default_runner(
         foldcp_config.cp_mesh_shape,
         foldcp_config.metrics_jsonl or "<disabled>",
     )
-    download_inference_cache(configs)
-    return InferenceRunner(configs)
+    return runner
 
 
 def inference_jsons(
@@ -423,7 +529,7 @@ def inference_jsons(
     n_cycle: int = 10,
     n_step: int = 200,
     n_sample: int = 5,
-    dtype: Literal["bf16", "fp32"] = "fp32",
+    dtype: InferenceDtype = "fp32",
     model_name: str = DEFAULT_MODEL_NAME,
     load_checkpoint_path: str = "",
     trimul_kernel: str = "auto",
@@ -435,7 +541,7 @@ def inference_jsons(
     use_template: bool = False,
     use_rna_msa: bool = False,
     msa_server_mode: Optional[str] = None,
-    need_atom_confidence: bool = False,
+    need_atom_confidence: bool = True,
     kalign_binary_path: Optional[str] = None,
     use_tfg_guidance: bool = False,
     hmmsearch_binary_path: Optional[str] = None,
@@ -453,6 +559,8 @@ def inference_jsons(
     foldcp_size_cp: int = 1,
     foldcp_devices: str = "",
     foldcp_metrics_jsonl: str = "",
+    *,
+    device: InferenceDevice = "auto",
 ) -> None:
     """
     Run inference on a single JSON file or a directory of JSON files.
@@ -466,6 +574,7 @@ def inference_jsons(
         n_step (int): Number of diffusion steps.
         n_sample (int): Number of samples.
         dtype (str): Data type.
+        device (str): Device selection: auto, cpu, cuda, or mps.
         model_name (str): Model name.
         load_checkpoint_path (str): Explicit checkpoint path.
         trimul_kernel (str): Kernel for triangle multiplicative.
@@ -495,23 +604,13 @@ def inference_jsons(
         foldcp_devices (str): Optional visible device list recorded in metrics.
         foldcp_metrics_jsonl (str): Optional JSONL path for benchmark records.
     """
-    infer_jsons = []
-    if os.path.isdir(json_file):
-        infer_jsons = [
-            str(file) for file in Path(json_file).rglob("*") if file.is_file()
-        ]
-        if len(infer_jsons) == 0:
-            raise RuntimeError(f"Can not read a valid json file in {json_file}")
-    elif os.path.isfile(json_file):
-        infer_jsons = [json_file]
-    else:
-        raise RuntimeError(f"Can not read a special file: {json_file}")
-    infer_jsons = [file for file in infer_jsons if file.endswith(".json")]
-    logger.info(f"Will infer with {len(infer_jsons)} jsons")
-    if len(infer_jsons) == 0:
-        return
-
     infer_errors = {}
+    # Reject missing/malformed inputs and cross-file output collisions before
+    # CUDA initialization and multi-GiB checkpoint loading. Every torchrun rank
+    # performs this cheap shared-filesystem preflight; after the Runner creates
+    # its control group, rank 0 still broadcasts the canonical collection.
+    preflight_jsons = _discover_inference_jsons(json_file, out_dir)
+    _validate_input_collection(preflight_jsons)
     runner = get_default_runner(
         seeds=seeds,
         dump_dir=out_dir,
@@ -519,6 +618,7 @@ def inference_jsons(
         n_step=n_step,
         n_sample=n_sample,
         dtype=dtype,
+        device=device,
         model_name=model_name,
         load_checkpoint_path=load_checkpoint_path,
         use_msa=use_msa,
@@ -538,74 +638,55 @@ def inference_jsons(
         foldcp_size_cp=foldcp_size_cp,
         foldcp_devices=foldcp_devices,
         foldcp_metrics_jsonl=foldcp_metrics_jsonl,
-
     )
-    configs = runner.configs
-    for _, infer_json in enumerate(tqdm.tqdm(infer_jsons)):
-        try:
-            configs["input_json_path"] = preprocess_input(
-                infer_json,
-                out_dir=out_dir,
-                use_msa=use_msa,
-                use_template=use_template,
-                use_rna_msa=use_rna_msa,
-                msa_server_mode=msa_server_mode,
-                hmmsearch_binary_path=hmmsearch_binary_path,
-                hmmbuild_binary_path=hmmbuild_binary_path,
-                seqres_database_path=seqres_database_path,
-                nhmmer_binary_path=nhmmer_binary_path,
-                hmmalign_binary_path=hmmalign_binary_path,
-                hmmbuild_rna_binary_path=hmmbuild_rna_binary_path,
-                ntrna_database_path=ntrna_database_path,
-                rfam_database_path=rfam_database_path,
-                rna_central_database_path=rna_central_database_path,
-                nhmmer_n_cpu=nhmmer_n_cpu,
-            )
-            infer_predict(runner, configs)
-        except Exception as exc:
-            infer_errors[infer_json] = str(exc)
-    if len(infer_errors) > 0:
-        logger.warning(f"Run inference failed: {infer_errors}")
-
-
-CONTEXT_SETTINGS = dict(help_option_names=["-h", "--help"], show_default=True)
-
-
-class SuggestGroup(click.Group):
-    """A Click group that suggests similar commands on error."""
-
-    def resolve_command(self, ctx, args):
-        """Try to resolve the command, and suggest matches if it fails."""
-        try:
-            return super().resolve_command(ctx, args)
-        except click.UsageError as e:
-            if len(args) > 0:
-                cmd_name = args[0]
-                all_commands = self.list_commands(ctx)
-                matches = difflib.get_close_matches(cmd_name, all_commands)
-                if matches:
-                    e.message += (
-                        f"\n\nDid you mean one of these?\n    {', '.join(matches)}"
-                    )
-            raise e
-
-
-@click.group(name="opendde", cls=SuggestGroup, context_settings=CONTEXT_SETTINGS)
-@click.version_option(version=__version__)
-def opendde_cli() -> None:
-    """
-    OpenDDE: an AlphaFold 3-style structure prediction toolkit.
-
-    This CLI provides tools for structure prediction, data conversion,
-    and MSA/template searching.
-    """
-    pass
-
-
-@click.command(context_settings=CONTEXT_SETTINGS)
-def doctor() -> None:
-    """Print environment diagnostics and install recommendations."""
-    click.echo(format_doctor_report())
+    try:
+        world_control_group = getattr(runner, "foldcp_world_control_group", None)
+        infer_jsons = _run_on_rank0_and_broadcast(
+            lambda: _discover_inference_jsons(json_file, out_dir),
+            description=f"discovering inference inputs under {json_file}",
+            world_control_group=world_control_group,
+        )
+        _run_on_rank0_and_broadcast(
+            lambda: _validate_input_collection(infer_jsons),
+            description="validating inference job names",
+            world_control_group=world_control_group,
+        )
+        logger.info(f"Will infer with {len(infer_jsons)} jsons")
+        configs = runner.configs
+        for _, infer_json in enumerate(tqdm.tqdm(infer_jsons)):
+            try:
+                configs["input_json_path"] = _run_on_rank0_and_broadcast(
+                    lambda: preprocess_input(
+                        infer_json,
+                        out_dir=out_dir,
+                        use_msa=use_msa,
+                        use_template=use_template,
+                        use_rna_msa=use_rna_msa,
+                        msa_server_mode=msa_server_mode,
+                        hmmsearch_binary_path=hmmsearch_binary_path,
+                        hmmbuild_binary_path=hmmbuild_binary_path,
+                        seqres_database_path=seqres_database_path,
+                        nhmmer_binary_path=nhmmer_binary_path,
+                        hmmalign_binary_path=hmmalign_binary_path,
+                        hmmbuild_rna_binary_path=hmmbuild_rna_binary_path,
+                        ntrna_database_path=ntrna_database_path,
+                        rfam_database_path=rfam_database_path,
+                        rna_central_database_path=rna_central_database_path,
+                        nhmmer_n_cpu=nhmmer_n_cpu,
+                    ),
+                    description=f"preprocessing {infer_json}",
+                    world_control_group=world_control_group,
+                )
+                infer_predict(runner, configs)
+            except FoldCPJobCoordinationError as exc:
+                infer_errors[infer_json] = str(exc)
+                raise
+            except Exception as exc:
+                infer_errors[infer_json] = str(exc)
+        if len(infer_errors) > 0:
+            raise RuntimeError(f"One or more inference inputs failed: {infer_errors}")
+    finally:
+        runner.close()
 
 
 @click.command(context_settings=CONTEXT_SETTINGS)
@@ -627,14 +708,22 @@ def doctor() -> None:
 @click.option(
     "-d",
     "--dtype",
-    type=str,
+    type=click.Choice(INFERENCE_DTYPE_CHOICES, case_sensitive=False),
     default="fp32",
     help="Inference dtype. Defaults to fp32; pass bf16 to opt in.",
 )
 @click.option(
+    "--device",
+    type=click.Choice(INFERENCE_DEVICE_CHOICES, case_sensitive=False),
+    default="auto",
+    show_default=True,
+    help="Inference device. Auto uses CUDA when available, then Apple MPS, "
+    "otherwise CPU.",
+)
+@click.option(
     "-n",
     "--model_name",
-    type=str,
+    type=click.Choice(SUPPORTED_MODELS),
     default=DEFAULT_MODEL_NAME,
     help="Model checkpoint name.",
 )
@@ -658,13 +747,13 @@ def doctor() -> None:
 )
 @click.option(
     "--trimul_kernel",
-    type=str,
+    type=click.Choice(("auto", "cuequivariance", "torch"), case_sensitive=False),
     default="auto",
     help="Triangle multiplicative update kernel ('auto', 'cuequivariance', or 'torch').",
 )
 @click.option(
     "--triatt_kernel",
-    type=str,
+    type=click.Choice(("auto", "cuequivariance", "torch"), case_sensitive=False),
     default="auto",
     help="Triangle attention kernel ('auto', 'cuequivariance', or 'torch').",
 )
@@ -714,7 +803,7 @@ def doctor() -> None:
 @click.option(
     "--need_atom_confidence",
     type=bool,
-    default=False,
+    default=True,
     help="Whether to compute atom-level confidence scores.",
 )
 @click.option(
@@ -727,13 +816,16 @@ def doctor() -> None:
     "--foldcp_size_dp",
     type=int,
     default=1,
-    help="Number of data-parallel ranks for Fold-CP.",
+    help="Fold-CP mesh rows; only 1 is supported (maintained 1 x P topology).",
 )
 @click.option(
     "--foldcp_size_cp",
     type=int,
     default=1,
-    help="Number of context-parallel ranks; distributed mode requires a square value such as 4.",
+    help=(
+        "Number of context-parallel ranks; distributed mode uses a 1 x P mesh "
+        "and requires a value greater than 1."
+    ),
 )
 @click.option(
     "--foldcp_devices",
@@ -826,7 +918,8 @@ def predict(
     cycle: int,
     step: int,
     sample: int,
-    dtype: Literal["bf16", "fp32"],
+    dtype: InferenceDtype,
+    device: InferenceDevice,
     model_name: str,
     load_checkpoint_path: str,
     use_msa: bool,
@@ -871,6 +964,7 @@ def predict(
         step (int): Number of diffusion steps.
         sample (int): Number of samples.
         dtype (str): Data type.
+        device (str): Device selection: auto, cpu, cuda, or mps.
         model_name (str): Model name.
         load_checkpoint_path (str): Explicit checkpoint path.
         use_msa (bool): Use MSA.
@@ -917,19 +1011,17 @@ def predict(
         f"Using inference params for model {model_name}: "
         f"cycle={cycle}, step={step}, use_msa={use_msa}"
     )
-    assert trimul_kernel in [
-        "auto",
-        "cuequivariance",
-        "torch",
-    ], "Invalid trimul_kernel. Options: 'auto', 'cuequivariance', 'torch'."
-    assert triatt_kernel in [
-        "auto",
-        "cuequivariance",
-        "torch",
-    ], "Invalid triatt_kernel. Options: 'auto', 'cuequivariance', 'torch'."
+    validate_triangle_kernels(trimul_kernel, triatt_kernel)
     # None => not provided on the command line; let inference fall back to JSON
     # modelSeeds (or a random seed) instead.
-    seed_list = [int(s) for s in seeds.split(",")] if seeds else None
+    seed_list = (
+        [
+            validate_inference_seed(s.strip(), location="--seeds")
+            for s in seeds.split(",")
+        ]
+        if seeds
+        else None
+    )
 
     if use_template:
         assert model_name in SUPPORTED_MODELS, (
@@ -971,6 +1063,7 @@ def predict(
         n_step=step,
         n_sample=sample,
         dtype=dtype,
+        device=device,
         model_name=model_name,
         load_checkpoint_path=load_checkpoint_path,
         trimul_kernel=trimul_kernel,
@@ -1402,12 +1495,8 @@ def inputprep(
     )
 
 
-opendde_cli.add_command(predict, name="pred")
-opendde_cli.add_command(doctor, name="doctor")
-opendde_cli.add_command(tojson, name="json")
-opendde_cli.add_command(msa, name="msa")
-opendde_cli.add_command(msatemplate, name="mt")
-opendde_cli.add_command(inputprep, name="prep")
-
 if __name__ == "__main__":
+    from runner.cli import register_runtime_commands
+
+    register_runtime_commands(globals())
     opendde_cli()

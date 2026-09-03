@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Aureka AI Research
 import os
 from typing import Optional, Union, cast
 
@@ -10,6 +12,7 @@ from opendde.distributed.foldcp.confidence import (
     distributed_confidence_pair_logits,
 )
 from opendde.distributed.foldcp.config import FoldCPConfig
+from opendde.distributed.foldcp.comm import run_group_rank_action_synchronized
 from opendde.distributed.foldcp.mesh import FoldCPProcessMesh
 from opendde.distributed.foldcp.pair_sharding import (
     FoldCPPairShardSpec,
@@ -22,6 +25,7 @@ from opendde.model.modules.pairformer import PairformerStack
 from opendde.model.modules.primitives import LinearNoBias
 from opendde.model.triangular.layers import LayerNorm
 from opendde.model.utils import broadcast_token_to_atom, one_hot
+from opendde.utils.torch_utils import cdist, cleanup_device_memory, disabled_autocast
 
 
 class ConfidenceHead(nn.Module):
@@ -152,24 +156,20 @@ class ConfidenceHead(nn.Module):
             return None
         if self._foldcp_mesh is not None:
             return self._foldcp_mesh
-        foldcp = FoldCPConfig.from_runtime_args(
-            mode="distributed",
-            size_dp=int(os.environ.get("OPENDDE_FOLDCP_SIZE_DP", "1")),
-            size_cp=int(os.environ.get("OPENDDE_FOLDCP_SIZE_CP", "4")),
-            devices=os.environ.get("OPENDDE_FOLDCP_DEVICES", ""),
-            metrics_jsonl=os.environ.get("OPENDDE_FOLDCP_METRICS_JSONL", ""),
-        )
+        foldcp = FoldCPConfig.from_environment()
         self._foldcp_mesh = FoldCPProcessMesh.create(foldcp)
         return self._foldcp_mesh
 
     @staticmethod
     def _foldcp_is_non_output_rank() -> bool:
-        return (
-            os.environ.get("OPENDDE_FOLDCP_MODE", "single") == "distributed"
-            and dist.is_available()
-            and dist.is_initialized()
-            and dist.get_rank() != 0
-        )
+        if (
+            os.environ.get("OPENDDE_FOLDCP_MODE", "single") != "distributed"
+            or not dist.is_available()
+            or not dist.is_initialized()
+        ):
+            return False
+        size_cp = FoldCPConfig.from_environment().size_cp
+        return dist.get_rank() % size_cp != 0
 
     def _build_confidence_z_init_local(
         self,
@@ -194,8 +194,7 @@ class ConfidenceHead(nn.Module):
         valid_rows = valid_row_end - row_start
         valid_cols = valid_col_end - col_start
         z_init_local[:valid_rows, :valid_cols, :] = (
-            s2[row_start:valid_row_end, None, :]
-            + s1[None, col_start:valid_col_end, :]
+            s2[row_start:valid_row_end, None, :] + s1[None, col_start:valid_col_end, :]
         )
         return z_init_local.contiguous()
 
@@ -252,81 +251,139 @@ class ConfidenceHead(nn.Module):
                 - resolved_preds: Predicted resolved scores [..., N_sample, N_atom, 2].
         """
 
-        s_inputs = s_inputs.detach()
-        s_trunk = s_trunk.detach()
-        z_trunk = z_trunk.detach()
-
-        s_trunk = self.input_strunk_ln(torch.clamp(s_trunk, min=-512, max=512))
-
-        x_rep_atom_mask = self._select_distogram_rep_atom_mask(
-            input_feature_dict=input_feature_dict,
-            n_token=s_trunk.shape[-2],
-        )
-        x_pred_rep_coords = x_pred_coords[..., x_rep_atom_mask, :]
-        N_sample = x_pred_rep_coords.size(-3)
-
         foldcp_mesh = self._maybe_create_foldcp_mesh()
         use_foldcp_confidence = (
             foldcp_mesh is not None
             and self.pairformer_stack.blocks
             and getattr(self.pairformer_stack.blocks[0], "c_s", 0) > 0
         )
-        z_pair_spec = None
-        if use_foldcp_confidence:
-            if z_trunk_spec is None:
-                z_trunk_local, z_pair_spec = shard_pair_tensor(
-                    z_trunk,
-                    foldcp_mesh,
-                    pair_dims=(-3, -2),
-                )
-            else:
-                z_trunk_local = z_trunk
-                z_pair_spec = z_trunk_spec
-            z_init_local = self._build_confidence_z_init_local(
-                s_inputs=s_inputs,
-                z_pair_spec=z_pair_spec,
-                reference=z_trunk_local,
-            )
-            z_trunk = z_trunk_local + z_init_local
-            del z_trunk_local, z_init_local
-            torch.cuda.empty_cache()
-        else:
-            z_init = (
-                self.linear_no_bias_s1(s_inputs)[..., None, :, :]
-                + self.linear_no_bias_s2(s_inputs)[..., None, :]
-            )
-            z_trunk = z_init + z_trunk
-            del z_init
-            torch.cuda.empty_cache()
 
-        plddt_preds = [] if compute_plddt else None
-        pae_preds = [] if compute_pae else None
-        pde_preds = [] if compute_pde else None
-        resolved_preds = [] if compute_resolved else None
+        def _prepare_confidence_inputs():
+            prepared_s_inputs = s_inputs.detach()
+            prepared_s_trunk = self.input_strunk_ln(
+                torch.clamp(s_trunk.detach(), min=-512, max=512)
+            )
+            prepared_z_trunk = z_trunk.detach()
+            x_rep_atom_mask = self._select_distogram_rep_atom_mask(
+                input_feature_dict=input_feature_dict,
+                n_token=prepared_s_trunk.shape[-2],
+            )
+            prepared_coords = x_pred_coords[..., x_rep_atom_mask, :]
+            prepared_z_spec = None
+            if use_foldcp_confidence:
+                assert foldcp_mesh is not None
+                if z_trunk_spec is None:
+                    z_trunk_local, prepared_z_spec = shard_pair_tensor(
+                        prepared_z_trunk,
+                        foldcp_mesh,
+                        pair_dims=(-3, -2),
+                    )
+                else:
+                    z_trunk_local = prepared_z_trunk
+                    prepared_z_spec = z_trunk_spec
+                z_init_local = self._build_confidence_z_init_local(
+                    s_inputs=prepared_s_inputs,
+                    z_pair_spec=prepared_z_spec,
+                    reference=z_trunk_local,
+                )
+                prepared_z_trunk = z_trunk_local + z_init_local
+                del z_trunk_local, z_init_local
+            else:
+                z_init = (
+                    self.linear_no_bias_s1(prepared_s_inputs)[..., None, :, :]
+                    + self.linear_no_bias_s2(prepared_s_inputs)[..., None, :]
+                )
+                prepared_z_trunk = z_init + prepared_z_trunk
+                del z_init
+            cleanup_device_memory(
+                prepared_z_trunk.device,
+                collect_garbage=False,
+            )
+            return (
+                prepared_s_inputs,
+                prepared_s_trunk,
+                prepared_z_trunk,
+                prepared_coords,
+                prepared_z_spec,
+            )
+
+        if use_foldcp_confidence:
+            assert foldcp_mesh is not None
+            prepared_inputs = run_group_rank_action_synchronized(
+                _prepare_confidence_inputs,
+                group=foldcp_mesh.group_2d,
+                description="Fold-CP confidence input preparation",
+            )
+            if prepared_inputs is None:  # pragma: no cover
+                raise RuntimeError("Fold-CP confidence inputs were not prepared.")
+        else:
+            prepared_inputs = _prepare_confidence_inputs()
+        del _prepare_confidence_inputs
+        s_inputs, s_trunk, z_trunk, x_pred_rep_coords, z_pair_spec = prepared_inputs
+        N_sample = x_pred_rep_coords.size(-3)
+
+        plddt_preds = None
+        pae_preds = None
+        pde_preds = None
+        resolved_preds = None
         single_sample = N_sample == 1
+        offload_pair_outputs = not single_sample and not torch.is_grad_enabled()
+        foldcp_non_output_rank = self._foldcp_is_non_output_rank()
+
+        def _allocate_sample_output(
+            prediction: Optional[torch.Tensor],
+            sample_dim: int,
+        ) -> Optional[torch.Tensor]:
+            if prediction is None:
+                return None
+            output_ndim = prediction.ndim + 1
+            sample_axis = sample_dim if sample_dim >= 0 else output_ndim + sample_dim
+            output_shape = list(prediction.shape)
+            output_shape.insert(sample_axis, N_sample)
+            return prediction.new_empty(output_shape)
+
         for i in range(N_sample):
             if use_foldcp_confidence:
                 assert foldcp_mesh is not None
                 assert z_pair_spec is not None
-                plddt_pred, pae_pred, pde_pred, resolved_pred = (
-                    self.memory_efficient_forward_foldcp_local(
-                        input_feature_dict=input_feature_dict,
-                        s_trunk=(
+                sample_inputs = run_group_rank_action_synchronized(
+                    lambda: (
+                        (
                             s_trunk
                             if single_sample
                             else (s_trunk.clone() if inplace_safe else s_trunk)
                         ),
-                        z_pair_local=z_trunk if single_sample else z_trunk.clone(),
+                        z_trunk if single_sample else z_trunk.clone(),
+                        x_pred_rep_coords[..., i, :, :],
+                    ),
+                    group=foldcp_mesh.group_2d,
+                    description=f"Fold-CP confidence sample {i} input preparation",
+                )
+                if sample_inputs is None:  # pragma: no cover
+                    raise RuntimeError(
+                        f"Fold-CP confidence sample {i} inputs were not prepared."
+                    )
+                sample_s_trunk, sample_z_trunk, sample_coords = sample_inputs
+                plddt_pred, pae_pred, pde_pred, resolved_pred = (
+                    self.memory_efficient_forward_foldcp_local(
+                        input_feature_dict=input_feature_dict,
+                        s_trunk=sample_s_trunk,
+                        z_pair_local=sample_z_trunk,
                         z_pair_spec=z_pair_spec,
                         foldcp_mesh=foldcp_mesh,
                         pair_mask=pair_mask,
-                        x_pred_rep_coords=x_pred_rep_coords[..., i, :, :],
+                        x_pred_rep_coords=sample_coords,
+                        chunk_size=chunk_size,
                         compute_plddt=compute_plddt,
                         compute_pae=compute_pae,
                         compute_pde=compute_pde,
                         compute_resolved=compute_resolved,
+                        pair_output_device=(
+                            torch.device("cpu") if not single_sample else None
+                        ),
                     )
                 )
+                del sample_inputs, sample_s_trunk, sample_z_trunk, sample_coords
             else:
                 plddt_pred, pae_pred, pde_pred, resolved_pred = (
                     self.memory_efficient_forward(
@@ -345,32 +402,82 @@ class ConfidenceHead(nn.Module):
                         compute_resolved=compute_resolved,
                     )
                 )
-            if self._foldcp_is_non_output_rank() and all(
-                pred is None
-                for pred in (plddt_pred, pae_pred, pde_pred, resolved_pred)
+
+                # PAE/PDE are O(N_sample * N_token^2).  Keeping every completed
+                # sample on CUDA recreates the same confidence-head capacity
+                # inversion that the distributed streaming path avoids: a
+                # multi-sample aggregate just below the single-output cutoff can
+                # remain resident until post-processing.  In inference, retain
+                # completed pair logits on CPU and stage one sample back to the
+                # compute device during summary generation.  Gradient-enabled
+                # execution keeps the original device and autograd path.
+                if offload_pair_outputs:
+                    if pae_pred is not None:
+                        pae_pred = pae_pred.to(device="cpu")
+                    if pde_pred is not None:
+                        pde_pred = pde_pred.to(device="cpu")
+
+            def _retain_sample_outputs(
+                plddt_pred: Optional[torch.Tensor] = plddt_pred,
+                pae_pred: Optional[torch.Tensor] = pae_pred,
+                pde_pred: Optional[torch.Tensor] = pde_pred,
+                resolved_pred: Optional[torch.Tensor] = resolved_pred,
+                plddt_preds: Optional[torch.Tensor] = plddt_preds,
+                pae_preds: Optional[torch.Tensor] = pae_preds,
+                pde_preds: Optional[torch.Tensor] = pde_preds,
+                resolved_preds: Optional[torch.Tensor] = resolved_preds,
+                sample_index: int = i,
             ):
-                return None, None, None, None
-            if plddt_preds is not None:
-                plddt_preds.append(plddt_pred)
-            if pae_preds is not None:
-                pae_preds.append(pae_pred)
-            if pde_preds is not None:
-                pde_preds.append(pde_pred)
-            if resolved_preds is not None:
-                resolved_preds.append(resolved_pred)
-        plddt_preds = (
-            torch.stack(plddt_preds, dim=-3) if plddt_preds is not None else None
-        )  # [..., N_sample, N_atom, plddt_bins]
-        # Pae_preds/pde_preds single tensor will occupy 11.6G[BF16]/23.2G[FP32]
-        pae_preds = (
-            torch.stack(pae_preds, dim=-4) if pae_preds is not None else None
-        )  # [..., N_sample, N_token, N_token, pae_bins]
-        pde_preds = (
-            torch.stack(pde_preds, dim=-4) if pde_preds is not None else None
-        )  # [..., N_sample, N_token, N_token, pde_bins]
-        resolved_preds = (
-            torch.stack(resolved_preds, dim=-3) if resolved_preds is not None else None
-        )  # [..., N_sample, N_atom, 2]
+                outputs = (
+                    plddt_preds,
+                    pae_preds,
+                    pde_preds,
+                    resolved_preds,
+                )
+                if sample_index == 0:
+                    outputs = (
+                        _allocate_sample_output(plddt_pred, -3),
+                        _allocate_sample_output(pae_pred, -4),
+                        _allocate_sample_output(pde_pred, -4),
+                        _allocate_sample_output(resolved_pred, -3),
+                    )
+                if foldcp_non_output_rank and all(
+                    pred is None
+                    for pred in (plddt_pred, pae_pred, pde_pred, resolved_pred)
+                ):
+                    return outputs
+                for output, prediction, sample_dim in (
+                    (outputs[0], plddt_pred, -3),
+                    (outputs[1], pae_pred, -4),
+                    (outputs[2], pde_pred, -4),
+                    (outputs[3], resolved_pred, -3),
+                ):
+                    if output is None or prediction is None:
+                        continue
+                    sample_axis = (
+                        sample_dim if sample_dim >= 0 else output.ndim + sample_dim
+                    )
+                    output.select(sample_axis, sample_index).copy_(prediction)
+                return outputs
+
+            if use_foldcp_confidence:
+                assert foldcp_mesh is not None
+                retained_outputs = run_group_rank_action_synchronized(
+                    _retain_sample_outputs,
+                    group=foldcp_mesh.group_2d,
+                    description=f"Fold-CP confidence sample {i} output retention",
+                )
+                if retained_outputs is None:  # pragma: no cover
+                    raise RuntimeError(
+                        f"Fold-CP confidence sample {i} outputs were not retained."
+                    )
+            else:
+                retained_outputs = _retain_sample_outputs()
+            del _retain_sample_outputs
+            plddt_preds, pae_preds, pde_preds, resolved_preds = retained_outputs
+            del plddt_pred, pae_pred, pde_pred, resolved_pred
+        if foldcp_non_output_rank:
+            return None, None, None, None
         return (
             plddt_preds,
             pae_preds,
@@ -387,26 +494,34 @@ class ConfidenceHead(nn.Module):
         foldcp_mesh: FoldCPProcessMesh,
         pair_mask: Optional[torch.Tensor],
         x_pred_rep_coords: torch.Tensor,
+        chunk_size: Optional[int] = None,
         compute_plddt: bool = True,
         compute_pae: bool = True,
         compute_pde: bool = True,
         compute_resolved: bool = True,
+        pair_output_device: Optional[torch.device] = None,
     ) -> tuple[
         Optional[torch.Tensor],
         Optional[torch.Tensor],
         Optional[torch.Tensor],
         Optional[torch.Tensor],
     ]:
-        x_pred_rep_coords = x_pred_rep_coords.to(torch.float32)
-        z_pair_local = add_confidence_distance_embedding_local(
-            z_pair_local=z_pair_local,
-            z_pair_spec=z_pair_spec,
-            x_pred_rep_coords=x_pred_rep_coords,
-            lower_bins=self.lower_bins,
-            upper_bins=self.upper_bins,
-            linear_onehot=self.linear_no_bias_d,
-            linear_distance=self.linear_no_bias_d_wo_onehot,
+        prepared_pair = run_group_rank_action_synchronized(
+            lambda z_pair_local=z_pair_local: add_confidence_distance_embedding_local(
+                z_pair_local=z_pair_local,
+                z_pair_spec=z_pair_spec,
+                x_pred_rep_coords=x_pred_rep_coords.to(torch.float32),
+                lower_bins=self.lower_bins,
+                upper_bins=self.upper_bins,
+                linear_onehot=self.linear_no_bias_d,
+                linear_distance=self.linear_no_bias_d_wo_onehot,
+            ),
+            group=foldcp_mesh.group_2d,
+            description="Fold-CP confidence distance-embedding preparation",
         )
+        if prepared_pair is None:  # pragma: no cover
+            raise RuntimeError("Fold-CP confidence pair input was not prepared.")
+        z_pair_local = prepared_pair
         s_single, z_pair_local, z_pair_spec = (
             distributed_pairformer_stack_single_bridge_update(
                 self.pairformer_stack,
@@ -422,65 +537,114 @@ class ConfidenceHead(nn.Module):
                 ),
                 return_local_pair=True,
                 z_spec=z_pair_spec,
+                chunk_size=chunk_size,
             )
         )
-        if compute_pae or compute_pde:
-            z_pair_local = z_pair_local.to(torch.float32)
-            torch.cuda.empty_cache()
-        if compute_plddt or compute_resolved:
-            s_single = s_single.to(torch.float32)
+        del prepared_pair
 
-        atom_to_token_idx = cast(
-            torch.Tensor, input_feature_dict["atom_to_token_idx"]
-        )
-        atom_to_tokatom_idx = cast(
-            torch.Tensor, input_feature_dict["atom_to_tokatom_idx"]
-        )
-
-        with torch.amp.autocast("cuda", enabled=False):
-            pae_pred, pde_pred = distributed_confidence_pair_logits(
-                z_pair_local=z_pair_local,
-                z_pair_spec=z_pair_spec,
-                mesh=foldcp_mesh,
-                pae_ln=self.pae_ln,
-                pae_linear=self.linear_no_bias_pae,
-                pde_ln=self.pde_ln,
-                pde_linear=self.linear_no_bias_pde,
-                compute_pae=compute_pae,
-                compute_pde=compute_pde,
-                gather_to_rank0_only=True,
-            )
-            is_output_rank = dist.get_rank(foldcp_mesh.group_2d) == 0
-            if not is_output_rank:
-                return None, None, None, None
+        def _prepare_confidence_logits(
+            z_pair_local: torch.Tensor = z_pair_local,
+            s_single: torch.Tensor = s_single,
+        ):
+            prepared_z_pair = z_pair_local
+            prepared_s_single = s_single
+            if compute_pae or compute_pde:
+                prepared_z_pair = prepared_z_pair.to(torch.float32)
+                cleanup_device_memory(
+                    prepared_z_pair.device,
+                    collect_garbage=False,
+                )
             if compute_plddt or compute_resolved:
-                a = broadcast_token_to_atom(
-                    x_token=s_single, atom_to_token_idx=atom_to_token_idx
-                )
-                plddt_pred = (
-                    torch.einsum(
-                        "...nc,ncb->...nb",
-                        self.plddt_ln(a),
-                        self.plddt_weight[atom_to_tokatom_idx],
-                    )
-                    if compute_plddt
-                    else None
-                )
-                resolved_pred = (
-                    torch.einsum(
-                        "...nc,ncb->...nb",
-                        self.resolved_ln(a),
-                        self.resolved_weight[atom_to_tokatom_idx],
-                    )
-                    if compute_resolved
-                    else None
-                )
-            else:
-                plddt_pred = None
-                resolved_pred = None
+                prepared_s_single = prepared_s_single.to(torch.float32)
+            return (
+                prepared_z_pair,
+                prepared_s_single,
+                cast(torch.Tensor, input_feature_dict["atom_to_token_idx"]),
+                cast(torch.Tensor, input_feature_dict["atom_to_tokatom_idx"]),
+            )
+
+        prepared_logits = run_group_rank_action_synchronized(
+            _prepare_confidence_logits,
+            group=foldcp_mesh.group_2d,
+            description="Fold-CP confidence logit preparation",
+        )
+        if prepared_logits is None:  # pragma: no cover
+            raise RuntimeError("Fold-CP confidence logits were not prepared.")
+        z_pair_local, s_single, atom_to_token_idx, atom_to_tokatom_idx = prepared_logits
+        del prepared_logits
+        del _prepare_confidence_logits
+
+        device = z_pair_local.device
+        pair_source_owner: list[Optional[torch.Tensor]] = [z_pair_local]
         del z_pair_local
-        torch.cuda.empty_cache()
-        return plddt_pred, pae_pred, pde_pred, resolved_pred
+
+        def _release_pair_source(
+            owner: list[Optional[torch.Tensor]] = pair_source_owner,
+        ) -> None:
+            owner[0] = None
+
+        try:
+            with disabled_autocast():
+                pae_pred, pde_pred = distributed_confidence_pair_logits(
+                    z_pair_local=cast(torch.Tensor, pair_source_owner[0]),
+                    z_pair_spec=z_pair_spec,
+                    mesh=foldcp_mesh,
+                    pae_ln=self.pae_ln,
+                    pae_linear=self.linear_no_bias_pae,
+                    pde_ln=self.pde_ln,
+                    pde_linear=self.linear_no_bias_pde,
+                    compute_pae=compute_pae,
+                    compute_pde=compute_pde,
+                    gather_to_rank0_only=True,
+                    output_device=pair_output_device,
+                    release_pair_source=_release_pair_source,
+                )
+        finally:
+            pair_source_owner[0] = None
+        del _release_pair_source, pair_source_owner
+        is_output_rank = dist.get_rank(foldcp_mesh.group_2d) == 0
+
+        def _finalize_confidence_outputs():
+            if not is_output_rank:
+                cleanup_device_memory(device, collect_garbage=False)
+                return None, None, None, None
+            with disabled_autocast():
+                if compute_plddt or compute_resolved:
+                    a = broadcast_token_to_atom(
+                        x_token=s_single, atom_to_token_idx=atom_to_token_idx
+                    )
+                    plddt_pred = (
+                        torch.einsum(
+                            "...nc,ncb->...nb",
+                            self.plddt_ln(a),
+                            self.plddt_weight[atom_to_tokatom_idx],
+                        )
+                        if compute_plddt
+                        else None
+                    )
+                    resolved_pred = (
+                        torch.einsum(
+                            "...nc,ncb->...nb",
+                            self.resolved_ln(a),
+                            self.resolved_weight[atom_to_tokatom_idx],
+                        )
+                        if compute_resolved
+                        else None
+                    )
+                else:
+                    plddt_pred = None
+                    resolved_pred = None
+            cleanup_device_memory(device, collect_garbage=False)
+            return plddt_pred, pae_pred, pde_pred, resolved_pred
+
+        outputs = run_group_rank_action_synchronized(
+            _finalize_confidence_outputs,
+            group=foldcp_mesh.group_2d,
+            description="Fold-CP confidence rank-owned output finalization",
+        )
+        if outputs is None:  # pragma: no cover
+            raise RuntimeError("Fold-CP confidence outputs were not finalized.")
+        return outputs
 
     def memory_efficient_forward(
         self,
@@ -516,13 +680,28 @@ class ConfidenceHead(nn.Module):
             and getattr(self.pairformer_stack.blocks[0], "c_s", 0) > 0
         )
         if use_foldcp_confidence:
-            z_pair_local, z_pair_spec = shard_pair_tensor(
-                z_pair,
-                foldcp_mesh,
-                pair_dims=(-3, -2),
+            assert foldcp_mesh is not None
+            prepared_pair = run_group_rank_action_synchronized(
+                lambda: shard_pair_tensor(
+                    z_pair,
+                    foldcp_mesh,
+                    pair_dims=(-3, -2),
+                ),
+                group=foldcp_mesh.group_2d,
+                description="Fold-CP confidence direct pair sharding",
             )
+            if prepared_pair is None:  # pragma: no cover
+                raise RuntimeError("Fold-CP confidence pair was not sharded.")
+            z_pair_local, z_pair_spec = prepared_pair
             del z_pair
-            torch.cuda.empty_cache()
+            run_group_rank_action_synchronized(
+                lambda: cleanup_device_memory(
+                    z_pair_local.device,
+                    collect_garbage=False,
+                ),
+                group=foldcp_mesh.group_2d,
+                description="Fold-CP confidence direct pair cleanup",
+            )
             return self.memory_efficient_forward_foldcp_local(
                 input_feature_dict=input_feature_dict,
                 s_trunk=s_trunk,
@@ -531,6 +710,7 @@ class ConfidenceHead(nn.Module):
                 foldcp_mesh=foldcp_mesh,
                 pair_mask=pair_mask,
                 x_pred_rep_coords=x_pred_rep_coords,
+                chunk_size=chunk_size,
                 compute_plddt=compute_plddt,
                 compute_pae=compute_pae,
                 compute_pde=compute_pde,
@@ -538,9 +718,9 @@ class ConfidenceHead(nn.Module):
             )
 
         # Embed pair distances of representative atoms:
-        with torch.amp.autocast("cuda", enabled=False):
+        with disabled_autocast():
             x_pred_rep_coords = x_pred_rep_coords.to(torch.float32)
-            distance_pred = torch.cdist(
+            distance_pred = cdist(
                 x_pred_rep_coords, x_pred_rep_coords
             )  # [..., N_tokens, N_tokens]
         if inplace_safe:
@@ -594,7 +774,7 @@ class ConfidenceHead(nn.Module):
             torch.Tensor, input_feature_dict["atom_to_tokatom_idx"]
         )  # in range [0, max_atoms_per_token-1] shape: [N_atom] # influenced by crop
 
-        with torch.amp.autocast("cuda", enabled=False):
+        with disabled_autocast():
             pae_pred = (
                 self.linear_no_bias_pae(self.pae_ln(z_pair)) if compute_pae else None
             )
@@ -630,5 +810,5 @@ class ConfidenceHead(nn.Module):
                 plddt_pred = None
                 resolved_pred = None
         if z_pair.shape[-2] > 2000:
-            torch.cuda.empty_cache()
+            cleanup_device_memory(z_pair.device, collect_garbage=False)
         return plddt_pred, pae_pred, pde_pred, resolved_pred

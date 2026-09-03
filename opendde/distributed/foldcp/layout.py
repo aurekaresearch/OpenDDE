@@ -1,4 +1,6 @@
-"""2D rank layout helpers for Fold-CP."""
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Aureka AI Research
+"""Rank layout helpers for Fold-CP."""
 
 from __future__ import annotations
 
@@ -7,17 +9,23 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class FoldCP2DLayout:
-    """Map between a square 2D CP coordinate and rank inside a CP group."""
+    """Map between a CP coordinate and rank inside a CP group.
+
+    The maintained Fold-CP topology is strictly 1 x P.  Keeping the two-axis
+    coordinate type avoids a broad representation change in pair-sharding
+    metadata, but the row coordinate is always zero at runtime.
+    """
 
     shape: tuple[int, int]
 
     def __post_init__(self) -> None:
         if len(self.shape) != 2:
             raise ValueError("FoldCP2DLayout expects a 2D shape.")
-        if self.shape[0] != self.shape[1]:
-            raise ValueError("Fold-CP currently requires a square 2D CP mesh.")
-        if self.shape[0] < 1:
-            raise ValueError("Fold-CP mesh side length must be positive.")
+        rows, cols = self.shape
+        if rows < 1 or cols < 1:
+            raise ValueError("Fold-CP mesh dimensions must be positive.")
+        if rows != 1:
+            raise ValueError("Only the maintained 1 x P Fold-CP layout is supported.")
 
     @property
     def numel(self) -> int:
@@ -48,4 +56,6 @@ class FoldCP2DLayout:
         return self.to_linear((row, col))
 
     def transpose_rank(self, coord: tuple[int, int]) -> int:
+        if self.shape[0] == 1:
+            return self.to_linear(coord)
         return self.to_linear((coord[1], coord[0]))

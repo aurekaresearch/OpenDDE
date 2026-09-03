@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Aureka AI Research
 from typing import Optional
 
 import torch
@@ -5,6 +7,7 @@ import torch.nn as nn
 
 from opendde.data.constants import rdkit_vdws
 from opendde.utils.logger import get_logger
+
 
 logger = get_logger(__name__)
 

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Aureka AI Research
 """Benchmark and validation metrics for Fold-CP tasks."""
 
 from __future__ import annotations
@@ -11,6 +13,7 @@ from typing import Any, Iterator, Optional
 
 import torch
 
+from opendde.distributed.foldcp.comm import detach_rank_local_error_traceback
 from opendde.distributed.foldcp.config import FoldCPConfig
 
 _MIB = 1024 * 1024
@@ -22,19 +25,23 @@ def bytes_to_mib(value: int | float | None) -> Optional[float]:
     return float(value) / _MIB
 
 
-def _cuda_available() -> bool:
+def _cuda_available(device: Optional[torch.device] = None) -> bool:
+    if device is not None and device.type != "cuda":
+        return False
     return torch.cuda.is_available() and torch.cuda.device_count() > 0
 
 
-def _sync_cuda() -> None:
-    if _cuda_available():
-        torch.cuda.synchronize()
+def _sync_device(device: Optional[torch.device] = None) -> None:
+    if _cuda_available(device):
+        torch.cuda.synchronize(device=device)
 
 
-def _cuda_mem_info_mib() -> tuple[Optional[float], Optional[float]]:
-    if not _cuda_available():
+def _cuda_mem_info_mib(
+    device: Optional[torch.device] = None,
+) -> tuple[Optional[float], Optional[float]]:
+    if not _cuda_available(device):
         return None, None
-    free_bytes, total_bytes = torch.cuda.mem_get_info()
+    free_bytes, total_bytes = torch.cuda.mem_get_info(device=device)
     return bytes_to_mib(free_bytes), bytes_to_mib(total_bytes)
 
 
@@ -54,7 +61,11 @@ def infer_n_token(data: Any) -> Optional[int]:
     if "N_token" in data:
         return _scalar_int(data["N_token"])
     input_feature_dict = data.get("input_feature_dict", {})
-    token_index = input_feature_dict.get("token_index") if isinstance(input_feature_dict, dict) else None
+    token_index = (
+        input_feature_dict.get("token_index")
+        if isinstance(input_feature_dict, dict)
+        else None
+    )
     if token_index is not None and hasattr(token_index, "shape"):
         return int(token_index.shape[-1])
     return None
@@ -74,6 +85,8 @@ class FoldCPStageMetric:
     stage_peak_mib: Optional[float]
     total_peak_mib: Optional[float]
     allocated_after_mib: Optional[float]
+    reserved_peak_mib: Optional[float]
+    reserved_after_mib: Optional[float]
     rank: int = 0
     device_index: Optional[int] = None
     cuda_free_mib: Optional[float] = None
@@ -134,22 +147,33 @@ def measure_foldcp_stage(
     n_token: Optional[int] = None,
     reset_peak: bool = True,
     record_start: bool = False,
+    device: Optional[torch.device] = None,
 ) -> Iterator[None]:
     """Measure wall time and CUDA peak memory for one Fold-CP task stage."""
 
-    if reset_peak and _cuda_available():
-        torch.cuda.reset_peak_memory_stats()
-    _sync_cuda()
+    if reset_peak and _cuda_available(device):
+        torch.cuda.reset_peak_memory_stats(device=device)
+    _sync_device(device)
     rank = recorder.rank
-    device_index = torch.cuda.current_device() if _cuda_available() else None
+    device_index = (
+        device.index if device is not None and device.type == "cuda" else None
+    )
+    if device_index is None and _cuda_available(device):
+        device_index = torch.cuda.current_device()
     if record_start:
-        if _cuda_available():
-            start_peak = bytes_to_mib(torch.cuda.max_memory_allocated())
-            start_allocated = bytes_to_mib(torch.cuda.memory_allocated())
+        if _cuda_available(device):
+            start_peak = bytes_to_mib(torch.cuda.max_memory_allocated(device=device))
+            start_allocated = bytes_to_mib(torch.cuda.memory_allocated(device=device))
+            start_reserved_peak = bytes_to_mib(
+                torch.cuda.max_memory_reserved(device=device)
+            )
+            start_reserved = bytes_to_mib(torch.cuda.memory_reserved(device=device))
         else:
             start_peak = None
             start_allocated = None
-        start_free, start_total = _cuda_mem_info_mib()
+            start_reserved_peak = None
+            start_reserved = None
+        start_free, start_total = _cuda_mem_info_mib(device)
         recorder.record(
             FoldCPStageMetric(
                 task_id=task_id,
@@ -166,6 +190,8 @@ def measure_foldcp_stage(
                 stage_peak_mib=start_peak,
                 total_peak_mib=start_peak,
                 allocated_after_mib=start_allocated,
+                reserved_peak_mib=start_reserved_peak,
+                reserved_after_mib=start_reserved,
                 cuda_free_mib=start_free,
                 cuda_total_mib=start_total,
                 status="started",
@@ -179,21 +205,32 @@ def measure_foldcp_stage(
     except RuntimeError as exc:
         status = "oom" if "out of memory" in str(exc).lower() else "error"
         error = str(exc).splitlines()[0]
+        # The stage traceback can own multi-gigabyte CUDA temporaries.  Release
+        # those frames before synchronize/memory sampling in ``finally``;
+        # otherwise metric finalization itself runs while the failed payload is
+        # still live and can turn a recoverable rank-local OOM into a second OOM
+        # or a distributed error-reporting hang.
+        detach_rank_local_error_traceback(exc)
         raise
     except Exception as exc:
         status = "error"
         error = str(exc).splitlines()[0]
+        detach_rank_local_error_traceback(exc)
         raise
     finally:
-        _sync_cuda()
+        _sync_device(device)
         elapsed_ms = (time.perf_counter() - start) * 1000.0
-        if _cuda_available():
-            peak = bytes_to_mib(torch.cuda.max_memory_allocated())
-            allocated_after = bytes_to_mib(torch.cuda.memory_allocated())
+        if _cuda_available(device):
+            peak = bytes_to_mib(torch.cuda.max_memory_allocated(device=device))
+            allocated_after = bytes_to_mib(torch.cuda.memory_allocated(device=device))
+            reserved_peak = bytes_to_mib(torch.cuda.max_memory_reserved(device=device))
+            reserved_after = bytes_to_mib(torch.cuda.memory_reserved(device=device))
         else:
             peak = None
             allocated_after = None
-        cuda_free, cuda_total = _cuda_mem_info_mib()
+            reserved_peak = None
+            reserved_after = None
+        cuda_free, cuda_total = _cuda_mem_info_mib(device)
         recorder.record(
             FoldCPStageMetric(
                 task_id=task_id,
@@ -210,6 +247,8 @@ def measure_foldcp_stage(
                 stage_peak_mib=peak,
                 total_peak_mib=peak,
                 allocated_after_mib=allocated_after,
+                reserved_peak_mib=reserved_peak,
+                reserved_after_mib=reserved_after,
                 cuda_free_mib=cuda_free,
                 cuda_total_mib=cuda_total,
                 status=status,

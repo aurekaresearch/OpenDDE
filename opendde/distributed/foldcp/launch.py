@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Aureka AI Research
 """Fold-CP CUDA launch-shape helpers.
 
 These helpers keep distributed local-shard projections on the same deterministic
@@ -6,10 +8,45 @@ CUDA launch family as the serial source path without gathering full pair tensors
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 
 _SMALL_LINEAR_SOURCE_ROWS = 262_144
+
+
+def foldcp_module_with_canonical_launch_chunks(
+    module: torch.nn.Module,
+    x: torch.Tensor,
+    *,
+    launch_rows: int = _SMALL_LINEAR_SOURCE_ROWS,
+) -> torch.Tensor:
+    """Apply a row-wise module with a shard-count-independent launch size.
+
+    Full and CP-local tensors use the same fixed flat-row launch geometry.  The
+    last launch is zero padded, so no full pair tensor or remote shard is ever
+    materialized.
+    """
+
+    if x.shape[-1] == 0:
+        return module(x)
+    local_rows = int(x.numel() // x.shape[-1])
+    flat = x.contiguous().reshape(local_rows, x.shape[-1])
+    output = None
+    for start in range(0, local_rows, launch_rows):
+        valid_rows = min(launch_rows, local_rows - start)
+        launch = flat.new_zeros((launch_rows, flat.shape[-1]))
+        launch[:valid_rows].copy_(flat[start : start + valid_rows])
+        projected = module(launch)
+        if output is None:
+            output = projected.new_empty((local_rows, projected.shape[-1]))
+        output[start : start + valid_rows].copy_(projected[:valid_rows])
+        del launch, projected
+    if output is None:
+        projected = module(flat)
+        return projected.reshape(*x.shape[:-1], projected.shape[-1])
+    return output.reshape(*x.shape[:-1], output.shape[-1])
 
 
 def foldcp_linear_launch_rows(*, local_rows: int, source_rows: int) -> int:
@@ -105,9 +142,7 @@ def foldcp_pair_row_slab_linear_with_source_grid_launch(
     flat = x.contiguous().reshape(-1, x.shape[-1])
     source_rows = original_n * original_n
     launch = flat.new_zeros(source_rows, flat.shape[-1])
-    row_offsets = (
-        (torch.arange(valid_rows, device=x.device) + row_start) * original_n
-    )
+    row_offsets = (torch.arange(valid_rows, device=x.device) + row_start) * original_n
     source_index = (
         row_offsets[:, None]
         + col_start
@@ -164,12 +199,37 @@ def foldcp_pair_tile_linear_with_source_chunk_launch(
     if valid_rows <= 0 or valid_cols <= 0:
         return x.new_zeros((tile_rows, tile_cols, out_features))
 
-    flat = x.contiguous().reshape(-1, x.shape[-1])
     launch_rows = source_rows * source_cols
-    launch = flat.new_zeros(launch_rows, flat.shape[-1])
-    row_offsets = (
-        (torch.arange(valid_rows, device=x.device) + row_start) * source_cols
+    compact_bf16_384 = (
+        os.environ.get(
+            "OPENDDE_FOLDCP_COMPACT_BF16_384_SOURCE_CHUNK",
+            "1",
+        )
+        != "0"
+        and x.is_cuda
+        and x.dtype == torch.bfloat16
+        and not torch.is_grad_enabled()
+        and tuple(linear.weight.shape) == (384, 384)
+        and launch_rows >= 90_000
     )
+    if compact_bf16_384:
+        compact = (
+            x[:valid_rows, :valid_cols, :]
+            .contiguous()
+            .reshape(valid_rows * valid_cols, x.shape[-1])
+        )
+        projected = linear(compact).reshape(
+            valid_rows,
+            valid_cols,
+            out_features,
+        )
+        out = projected.new_zeros((tile_rows, tile_cols, out_features))
+        out[:valid_rows, :valid_cols, :].copy_(projected)
+        return out
+
+    flat = x.contiguous().reshape(-1, x.shape[-1])
+    launch = flat.new_zeros(launch_rows, flat.shape[-1])
+    row_offsets = (torch.arange(valid_rows, device=x.device) + row_start) * source_cols
     source_index = (
         row_offsets[:, None]
         + col_start
@@ -187,6 +247,17 @@ def foldcp_pair_tile_linear_with_source_chunk_launch(
 
 
 _PAIR_ROW_SLAB_SOURCE_GRID_MIN_LOCAL_ROWS = 1_048_576
+_PAIR_ROW_SLAB_SOURCE_GRID_BOUNDARY_MIN_ROWS = 1_048_576
+_PAIR_ROW_SLAB_SOURCE_GRID_BOUNDARY_MAX_ROWS = 1_054_729
+
+
+def _pair_row_slab_source_grid_boundary(source_rows: int) -> bool:
+    source_rows = int(source_rows)
+    return (
+        _PAIR_ROW_SLAB_SOURCE_GRID_BOUNDARY_MIN_ROWS
+        <= source_rows
+        <= _PAIR_ROW_SLAB_SOURCE_GRID_BOUNDARY_MAX_ROWS
+    )
 
 
 def foldcp_pair_row_slab_linear_with_source_launch_policy(
@@ -208,7 +279,9 @@ def foldcp_pair_row_slab_linear_with_source_launch_policy(
     computing only this rank's local output tile.
     """
     if x.ndim != 3:
-        raise ValueError("source row-slab launch policy expects [rows, cols, channels].")
+        raise ValueError(
+            "source row-slab launch policy expects [rows, cols, channels]."
+        )
     original_n = int(original_n)
     row_start = int(row_start)
     col_start = int(col_start)
@@ -223,8 +296,12 @@ def foldcp_pair_row_slab_linear_with_source_launch_policy(
     else:
         valid_cols = max(0, min(int(valid_cols), tile_cols, original_n))
 
+    source_rows = original_n * original_n
     local_valid_rows = valid_rows * valid_cols
-    if local_valid_rows >= _PAIR_ROW_SLAB_SOURCE_GRID_MIN_LOCAL_ROWS:
+    if (
+        local_valid_rows >= _PAIR_ROW_SLAB_SOURCE_GRID_MIN_LOCAL_ROWS
+        or _pair_row_slab_source_grid_boundary(source_rows)
+    ):
         return foldcp_pair_row_slab_linear_with_source_grid_launch(
             linear,
             x,
@@ -237,7 +314,7 @@ def foldcp_pair_row_slab_linear_with_source_launch_policy(
     return foldcp_linear_with_source_launch_shape(
         linear,
         x,
-        source_rows=original_n * original_n,
+        source_rows=source_rows,
     )
 
 

@@ -1,8 +1,8 @@
 interface_cluster_id,n_targets,n_interfaces,pdb_ids,interface_ids
 21aq_3__9k6j_3,3,3,9lof;9log;9ve0,9lof_A_C;9log_A_C;9ve0_B_C
 21aq_3__9l9y_2,4,4,9loe;9lof;9log;9ve0,9loe_A_B;9lof_A_B;9log_A_B;9ve0_A_C
-21aq_3__9n7s_4,1,2,21av,21av_A_C;21av_C_D
 21aq_3__9ua5_3,1,2,21av,21av_B_C;21av_C_E
+21aq_3__9n7s_4,1,2,21av,21av_A_C;21av_C_D
 21tw_1__21tw_2,1,3,21tw,21tw_A_B;21tw_A_C;21tw_A_D
 22ps_3__9k6j_3,1,2,22ps,22ps_B_C;22ps_E_F
 22ps_3__9l9y_2,1,2,22ps,22ps_A_C;22ps_D_F

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Aureka AI Research
 # Copyright 2021 AlQuraishi Laboratory
 
 
@@ -10,6 +12,7 @@ import torch.nn as nn
 
 from opendde.model.triangular.layers import Attention, LayerNorm, OpenfoldLinear
 from opendde.model.utils import chunk_layer, is_fp16_enabled, permute_final_dims
+from opendde.utils.torch_utils import disabled_autocast
 
 
 def kernel_triangular_mult(
@@ -471,13 +474,22 @@ class TriangleMultiplicativeUpdate(BaseTriangleMultiplicativeUpdate):
         Returns:
             [*, N_res, N_res, C_z] output tensor
         """
+        if triangle_multiplicative not in {"torch", "cuequivariance"}:
+            raise ValueError(
+                "triangle_multiplicative must be 'cuequivariance' or 'torch', "
+                f"but got {triangle_multiplicative}"
+            )
+
+        use_cuequivariance = (
+            triangle_multiplicative == "cuequivariance"
+            and z.is_cuda
+            and self.c_z == self.c_hidden
+        )
         _input_inplace_safe = inplace_safe is True
 
-        # Note: cuequivariance requires that the hidden dimension c must equal c_z.
-        # If this condition is not met, an AssertionError will be raised.
-        # Therefore, we include a check here: if c != c_z, we fall back to using plain PyTorch.
-        # This situation may occur in our template module.
-        if triangle_multiplicative == "cuequivariance" and (self.c_z == self.c_hidden):
+        # cuEquivariance requires the hidden dimension to equal c_z. Unsupported
+        # shapes and non-CUDA devices use the PyTorch implementation instead.
+        if use_cuequivariance:
             if _input_inplace_safe and _add_with_inplace:
                 z_in = z.clone()
             norm_in_weight = cast(torch.Tensor, self.layer_norm_in.weight)
@@ -506,7 +518,7 @@ class TriangleMultiplicativeUpdate(BaseTriangleMultiplicativeUpdate):
                 return z + z_in
             else:
                 return z
-        elif (triangle_multiplicative == "torch") or (self.c_z != self.c_hidden):
+        else:
             if inplace_safe:
                 x = self._inference_forward(
                     z,
@@ -541,7 +553,7 @@ class TriangleMultiplicativeUpdate(BaseTriangleMultiplicativeUpdate):
                 b = b / b.std()
 
             if is_fp16_enabled():
-                with torch.amp.autocast("cuda", enabled=False):
+                with disabled_autocast():
                     x = self._combine_projections(a.float(), b.float())
             else:
                 x = self._combine_projections(a, b)
@@ -554,10 +566,6 @@ class TriangleMultiplicativeUpdate(BaseTriangleMultiplicativeUpdate):
             if _input_inplace_safe and _add_with_inplace:
                 x = x + z_in
             return x
-        else:
-            raise ValueError(
-                f"triangle_multiplicative must be 'cuequivariance' or 'torch', but got {triangle_multiplicative}"
-            )
 
 
 class TriangleMultiplicationOutgoing(TriangleMultiplicativeUpdate):

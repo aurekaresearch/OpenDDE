@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Aureka AI Research
+from unittest import mock
+
 import torch
 
 from opendde.data.tokenizer import STRUCTURAL_TOKEN_ROLES
@@ -115,3 +119,50 @@ def test_chunked_forward_matches_unchunked_forward():
         chunked[3]["structural_pair_attn_bias"],
         unchunked[3]["structural_pair_attn_bias"],
     )
+
+
+def test_chunked_inference_writes_final_outputs_without_cat():
+    expander = StructuralTokenExpander(
+        c_s=4,
+        c_z=3,
+        c_s_inputs=5,
+        init_mode="scratch",
+        pair_projection_mode="factorized",
+        pair_chunk_size=2,
+    )
+    role = torch.tensor(
+        [
+            STRUCTURAL_TOKEN_ROLES["protein_bb"],
+            STRUCTURAL_TOKEN_ROLES["protein_sc"],
+            STRUCTURAL_TOKEN_ROLES["protein_bb"],
+        ]
+    )
+    parent = torch.tensor([0, 0, 1])
+    input_feature_dict = {
+        "subtoken_role_id": role,
+        "parent_residue_idx": parent,
+        "asym_id": torch.tensor([0, 0]),
+        "residue_index": torch.tensor([10, 11]),
+        "prev_parent_residue_idx": torch.tensor([-1, -1, 0]),
+        "next_parent_residue_idx": torch.tensor([1, 1, -1]),
+        "structural_polymer_type": torch.tensor([1, 1, 1]),
+    }
+
+    with (
+        torch.no_grad(),
+        mock.patch(
+            "opendde.model.modules.structural_tokens.torch.cat",
+            side_effect=AssertionError(
+                "inference must not retain and concatenate chunks"
+            ),
+        ),
+    ):
+        _, _, z_struct, pair_features = expander(
+            input_feature_dict=input_feature_dict,
+            s_inputs_res=torch.randn(2, 5),
+            s_res=torch.randn(2, 4),
+            z_res=torch.randn(2, 2, 3),
+        )
+
+    assert z_struct.shape == (3, 3, 3)
+    assert pair_features["structural_pair_attn_bias"].shape == (3, 3)

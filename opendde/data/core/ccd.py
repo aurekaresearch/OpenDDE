@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Aureka AI Research
 import copy
 import functools
 from collections import defaultdict
@@ -34,10 +36,26 @@ def set_ccd_cache_paths(
     """Set CCD cache paths and clear path-dependent caches."""
     global _ccd_rdkit_mols
 
-    if components_file is not None:
-        data_configs["ccd_components_file"] = str(components_file)
-    if rdkit_mol_pkl is not None:
-        data_configs["ccd_components_rdkit_mol_file"] = str(rdkit_mol_pkl)
+    next_components_file = (
+        str(components_file)
+        if components_file is not None
+        else str(data_configs["ccd_components_file"])
+    )
+    next_rdkit_mol_pkl = (
+        str(rdkit_mol_pkl)
+        if rdkit_mol_pkl is not None
+        else str(data_configs["ccd_components_rdkit_mol_file"])
+    )
+    if next_components_file == str(
+        data_configs["ccd_components_file"]
+    ) and next_rdkit_mol_pkl == str(data_configs["ccd_components_rdkit_mol_file"]):
+        # Directory inference constructs one dataset per source JSON. Keeping
+        # the same asset paths must not evict and reload the large CCD caches
+        # for every otherwise independent input file.
+        return
+
+    data_configs["ccd_components_file"] = next_components_file
+    data_configs["ccd_components_rdkit_mol_file"] = next_rdkit_mol_pkl
 
     biotite_load_ccd_cif.cache_clear()
     get_component_atom_array.cache_clear()
@@ -45,6 +63,15 @@ def set_ccd_cache_paths(
     get_mol_type.cache_clear()
     get_ccd_ref_info.cache_clear()
     _ccd_rdkit_mols = {}
+
+
+def get_ccd_cache_paths() -> tuple[str, str]:
+    """Return the currently published process-wide CCD asset paths."""
+
+    return (
+        str(data_configs["ccd_components_file"]),
+        str(data_configs["ccd_components_rdkit_mol_file"]),
+    )
 
 
 @functools.lru_cache

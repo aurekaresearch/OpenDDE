@@ -1,6 +1,6 @@
 pdb_id,id,type,entry_id,entity_id_1,entity_id_2,entity_type_1,entity_type_2,chain_id_1,chain_id_2,auth_chain_id_1,auth_chain_id_2,seq_length_1,seq_length_2,resolved_seq_length_1,resolved_seq_length_2,subset,entity_cluster_id_1,entity_cluster_id_2,interface_cluster_id
-9lz0,9lz0_A_B,interface,9lz0,1,2,polypeptide(L),polypeptide(L),A,B,A,H,393,229,349,118,[antibody-protein];[antibody_HL-protein],9lxp_1,9l9y_2,9l9y_2__9lxp_1
 9lz0,9lz0_A_C,interface,9lz0,1,3,polypeptide(L),polypeptide(L),A,C,A,L,393,215,349,108,[antibody-protein];[antibody_HL-protein],9lxp_1,9k6j_3,9k6j_3__9lxp_1
+9lz0,9lz0_A_B,interface,9lz0,1,2,polypeptide(L),polypeptide(L),A,B,A,H,393,229,349,118,[antibody-protein];[antibody_HL-protein],9lxp_1,9l9y_2,9l9y_2__9lxp_1
 9wpm,9wpm_B_C,interface,9wpm,2,3,polypeptide(L),polypeptide(L),B,C,C,N,362,128,220,126,[antibody-protein];[antibody_H-protein],9lr2_1,9n7s_4,9lr2_1__9n7s_4
 9wpm,9wpm_B_F,interface,9wpm,2,6,polypeptide(L),polypeptide(L),B,F,C,S,362,285,220,226,[antibody-protein];[antibody_scFv-protein],9lr2_1,9vmn_5,9lr2_1__9vmn_5
 9wpm,9wpm_C_D,interface,9wpm,3,4,polypeptide(L),polypeptide(L),C,D,N,B,128,345,126,328,[antibody-protein];[antibody_H-protein],9n7s_4,9vmn_2,9n7s_4__9vmn_2

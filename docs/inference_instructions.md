@@ -1,44 +1,76 @@
 # Inference Instructions
 
 Concise reference for installing OpenDDE, preparing runtime data, and running
-`opendde` commands. For Docker, see
-[docker_installation.md](./docker_installation.md).
+`opendde` commands.
 
 ## Install
 
-OpenDDE requires Python `>=3.11`. Install `uv` if needed:
+OpenDDE supports CPython `3.11`, `3.12`, and `3.13`. We recommend
+[`uv`](https://docs.astral.sh/uv/getting-started/installation/) for Python
+installations. Choose one of the following methods.
 
-```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-source "$HOME/.local/bin/env"
-```
-
-GPU install:
+### Install from PyPI
 
 ```bash
 uv venv --python 3.11
-source .venv/bin/activate
-uv pip install --torch-backend cu126 'opendde[gpu]'
-opendde doctor
 ```
 
-CPU install:
+CPU:
 
 ```bash
-uv venv --python 3.11
-source .venv/bin/activate
-uv pip install --torch-backend cpu 'opendde[cpu]'
-opendde doctor
+uv pip install --python .venv --torch-backend cpu opendde
 ```
 
-Source install from a checkout:
+NVIDIA GPU (Linux x86_64, CUDA 12.6):
 
 ```bash
-uv venv --python 3.11
-source .venv/bin/activate
-uv pip install --torch-backend cu126 -e '.[gpu]'
-opendde doctor
+uv pip install --python .venv --torch-backend cu126 "opendde[gpu]"
 ```
+
+### Install from source
+
+```bash
+git clone https://github.com/aurekaresearch/OpenDDE.git
+cd OpenDDE
+uv venv --python 3.11
+```
+
+CPU:
+
+```bash
+uv pip install --python .venv --torch-backend cpu -e .
+```
+
+NVIDIA GPU (Linux x86_64, CUDA 12.6):
+
+```bash
+uv pip install --python .venv --torch-backend cu126 -e ".[gpu]"
+```
+
+After a PyPI or source installation, verify the environment with:
+
+```bash
+uv run --no-project --python .venv opendde doctor
+```
+
+### Use Docker
+
+The prebuilt image targets NVIDIA GPU inference:
+
+```bash
+docker pull aurekaresearch/opendde:v1
+```
+
+See the [Docker guide](./docker_installation.md) for GPU setup, runtime-data
+mounts, and a complete `docker run` example.
+
+> [!NOTE]
+> `--torch-backend` selects the PyTorch build, while `[gpu]` adds the optional
+> cuEquivariance kernels. Linux wheels require glibc 2.28 or newer. Apple
+> Silicon runs on CPU or on the Metal (MPS) backend with `--device mps`; Intel
+> macOS is unsupported, and Windows has not been validated. At runtime,
+> `--device auto` uses CUDA when available, then MPS, and otherwise falls back
+> to CPU.
 
 ## Runtime data
 
@@ -50,6 +82,10 @@ $OPENDDE_ROOT_DIR/
 ├── common/
 └── search_database/        # needed for local template/RNA-MSA search
 ```
+
+The default checkpoint and managed common files come from a release-pinned
+asset revision and are verified against their published size and SHA-256.
+Checkpoints passed explicitly with `--load_checkpoint_path` are left untouched.
 
 Prepare data from a source checkout:
 
@@ -65,43 +101,37 @@ search databases are not needed:
 bash scripts/download_opendde_data.sh --skip-search-database
 ```
 
-If you already have a checkpoint:
+If you already have a custom checkpoint, keep a descriptive filename and pass
+it directly. Use `--skip-model` when preparing only the remaining runtime data:
 
 ```bash
 mkdir -p "$OPENDDE_ROOT_DIR/checkpoint"
-cp /path/to/opendde.pt "$OPENDDE_ROOT_DIR/checkpoint/opendde.pt"
+cp /path/to/my_checkpoint.pt \
+  "$OPENDDE_ROOT_DIR/checkpoint/my_checkpoint.pt"
+bash scripts/download_opendde_data.sh --skip-model
+opendde pred \
+  --load_checkpoint_path "$OPENDDE_ROOT_DIR/checkpoint/my_checkpoint.pt" \
+  -i examples/input.json \
+  -o ./output
 ```
 
-Alternatively, keep the checkpoint anywhere readable and pass it directly with
-`opendde pred --load_checkpoint_path /path/to/opendde_abag.pt`.
-
-Released checkpoints:
-
-| Checkpoint | Use case | Download |
-| --- | --- | --- |
-| `opendde.pt` | General-purpose OpenDDE checkpoint. | [opendde.pt](https://huggingface.co/aurekaresearch/OpenDDE/resolve/main/opendde.pt) |
-| `opendde_abag.pt` | ABAG-optimized checkpoint for antibody-antigen complexes. | [opendde_abag.pt](https://huggingface.co/aurekaresearch/OpenDDE/resolve/main/opendde_abag.pt) |
+The names `opendde.pt` and `opendde_abag.pt` are reserved for released assets.
+Their authoritative links, sizes, and digests are in
+[supported_models.md](./supported_models.md).
 
 Use `opendde.pt` with `-n opendde_v1` as the default general-purpose
 checkpoint. To use the ABAG-optimized checkpoint, keep it as
 `opendde_abag.pt` and pass it with `--load_checkpoint_path`, for example
 `opendde pred --load_checkpoint_path "$OPENDDE_ROOT_DIR/checkpoint/opendde_abag.pt"`.
 
-Concrete setup:
+Install and verify the ABAG checkpoint from the same manifest-backed helper:
 
 ```bash
 export OPENDDE_ROOT_DIR=/path/to/opendde_data
-mkdir -p "$OPENDDE_ROOT_DIR/checkpoint"
-
-# General-purpose checkpoint used by default with -n opendde_v1.
-curl -L \
-  -o "$OPENDDE_ROOT_DIR/checkpoint/opendde.pt" \
-  https://huggingface.co/aurekaresearch/OpenDDE/resolve/main/opendde.pt
-
-# ABAG-optimized checkpoint, selected with --load_checkpoint_path.
-curl -L \
-  -o "$OPENDDE_ROOT_DIR/checkpoint/opendde_abag.pt" \
-  https://huggingface.co/aurekaresearch/OpenDDE/resolve/main/opendde_abag.pt
+bash scripts/download_opendde_data.sh \
+  --checkpoint opendde_abag.pt \
+  --skip-common \
+  --skip-search-database
 ```
 
 Then run general-purpose inference without an explicit checkpoint path. For ABAG
@@ -180,7 +210,9 @@ Notes:
   present in the JSON.
 - Template and RNA-MSA search use local databases under
   `$OPENDDE_ROOT_DIR/search_database/`.
-- Updated JSON files are written next to the input JSON.
+- Generated JSON files are written under
+  `<out_dir>/.opendde_preprocessed/<input-hash>/` rather than next to the
+  input JSON, so read-only input directories work.
 
 Details: [msa_template_pipeline.md](./msa_template_pipeline.md).
 
@@ -207,27 +239,39 @@ opendde pred \
   --cycle 10
 ```
 
-Inference defaults to `fp32` and `auto` triangle kernels (PyTorch on CPU,
-cuEquivariance on a CUDA GPU), so neither needs to be set explicitly.
+Inference defaults to `--device auto`, `fp32`, and `auto` triangle kernels.
+Device auto-selection uses NVIDIA CUDA when available, then the Apple Metal
+(MPS) backend on Apple Silicon, and otherwise CPU.
+cuEquivariance is selected only when its Linux CUDA packages import successfully;
+otherwise the model uses PyTorch triangle kernels. MPS always uses PyTorch
+triangle kernels and defaults to FP32. `--dtype bf16` also works there and
+follows the same dynamic policy as CUDA: the trunk uses BF16; by default,
+diffusion and the confidence head stay FP32 through 2560 tokens, confidence
+uses BF16 above 2560, and diffusion uses BF16 above 3840 to reduce memory.
+BF16 performance varies by Apple GPU and workload, so compare it with FP32 for
+your inputs. BF16 autocast needs macOS 14 or newer and is downgraded to FP32
+below that.
 
+## Multi-GPU Fold-CP inference
 
-## 4-GPU Fold-CP inference
+> [!IMPORTANT]
+> Fold-CP inference does not currently support cuEquivariance (`cueq`) triangle
+> kernels. Select the distributed PyTorch implementations with
+> `--triatt_kernel torch --trimul_kernel torch`. In distributed mode, `auto`
+> resolves to these PyTorch kernels and an explicit `cueq` request fails before
+> model loading. On CUDA BF16, Fold-CP triangle
+> attention also uses Triton 3.3.1 from the GPU install extra to fuse
+> attention-bias addition; this Triton helper is separate from cuEquivariance.
 
-> Note: the current Fold-CP path is provided as a distributed-inference demo.
-> It verifies that OpenDDE can execute the four-GPU context-parallel path,
-> including MSA-enabled inputs, but memory capacity and runtime performance are
-> still being actively optimized. We plan to continue improving this path in
-> collaboration with NVIDIA, including integration and tuning for acceleration
-> libraries such as cuEquivariance where applicable.
-
-Fold-CP distributes token-pair-heavy inference work over four GPUs. Launch it
-with `torchrun` and expose exactly the GPUs you want to use:
+Fold-CP distributes token-pair-heavy inference work over a `1 x P` mesh, where
+`P` can be any available GPU count greater than one. Launch it with `torchrun`
+and expose exactly the GPUs you want to use. For example, four GPUs use:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node 4 \
   -m runner.batch_inference pred \
   -i examples/protein_200.json \
-  -o ./output_cp4 \
+  -o ./output_foldcp \
   -n opendde_v1 \
   --use_msa false \
   --use_template false \
@@ -235,6 +279,8 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node 4 \
   --sample 1 \
   --step 200 \
   --cycle 10 \
+  --trimul_kernel torch \
+  --triatt_kernel torch \
   --foldcp_mode distributed \
   --foldcp_size_dp 1 \
   --foldcp_size_cp 4
@@ -242,11 +288,14 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node 4 \
 
 Runtime notes:
 
-- `--nproc_per_node 4` must match `--foldcp_size_dp 1` times
-  `--foldcp_size_cp 4`.
-- `--foldcp_size_cp 4` creates a 2 x 2 context-parallel mesh.
-- The same input, model, dtype, cycle, step, sample, MSA, template, and kernel
-  settings should be used when comparing single-GPU and Fold-CP outputs.
+- `--nproc_per_node P` must match `--foldcp_size_dp 1` times
+  `--foldcp_size_cp P`.
+- `--foldcp_size_cp P` creates a `1 x P` context-parallel mesh. The example
+  uses `P=4`; other GPU counts require changing both `4` values.
+- Keep the input, model, dtype, cycle, step, sample, MSA, and template settings
+  identical when comparing single-GPU and Fold-CP outputs. Select
+  `--triatt_kernel torch --trimul_kernel torch` for both runs; the distributed
+  CUDA BF16 path additionally uses Triton for attention-bias fusion.
 - Outputs are written under the requested `-o/--out_dir` just like normal
   inference.
 - Optional `--foldcp_metrics_jsonl path/to/metrics.jsonl` records Fold-CP timing
@@ -293,12 +342,15 @@ Outputs are written to:
 | `--seeds` | Comma-separated seeds, e.g. `101,102`. Overrides the job's `modelSeeds`; if unset, `modelSeeds` are used, or a random seed when both are absent. |
 | `--use_msa` | Use/generate protein MSA features. |
 | `--use_template` | Use/generate template features. |
-| `--use_rna_msa` | Use/generate RNA MSA features. |
+| `--use_rna_msa` | Use/generate RNA MSA features; requires `--use_msa true`. |
 | `--use_tfg_guidance` | Enable Training-Free Guidance. |
-| `--foldcp_mode` | `single` or `distributed`; use `distributed` with `torchrun` for four-GPU Fold-CP inference. |
-| `--foldcp_size_cp` | Number of context-parallel ranks. Four-GPU Fold-CP uses `4`. |
+| `--foldcp_mode` | `single` or `distributed`; use `distributed` with `torchrun` for multi-GPU Fold-CP inference. |
+| `--foldcp_size_dp` | Compatibility option; only `1` is supported. Runtime `2 x 2` topology is not maintained. |
+| `--foldcp_size_cp` | Context-parallel degree `P` in the maintained `1 x P` mesh; must match the launched process count. |
+| `--foldcp_devices` | Optional visible-device list recorded in Fold-CP metrics; actual GPU visibility is controlled by `CUDA_VISIBLE_DEVICES`. |
 | `--foldcp_metrics_jsonl` | Optional JSONL path for Fold-CP timing and memory metrics. |
-| `--dtype` | `bf16`, `fp16`, or `fp32`. |
+| `--dtype` | `bf16` or `fp32`. |
+| `--device` | `auto`, `cpu`, `cuda`, or `mps`; auto uses CUDA when available, then Apple MPS, and otherwise CPU. |
 | `--trimul_kernel`, `--triatt_kernel` | `auto`, `cuequivariance`, or `torch`. |
 
 Run `opendde <command> --help` for the full option list.

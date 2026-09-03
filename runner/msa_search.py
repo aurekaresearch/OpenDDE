@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Aureka AI Research
 import json
 import os
 from typing import Any, Optional, Sequence, Tuple
@@ -181,6 +183,7 @@ def update_infer_json(
     out_dir: str,
     use_msa: bool = True,
     mode: Optional[str] = None,
+    json_output_dir: Optional[str] = None,
 ) -> Tuple[str, bool]:
     """
     Update the inference JSON file with MSA information.
@@ -191,6 +194,8 @@ def update_infer_json(
         out_dir (str): Directory to save MSA results.
         use_msa (bool): Whether to perform MSA search if missing.
         mode (Optional[str]): Deprecated compatibility argument; ignored.
+        json_output_dir (Optional[str]): Directory for the generated JSON.
+            Defaults to the source JSON directory for API compatibility.
 
     Returns:
         Tuple[str, bool]:
@@ -219,8 +224,14 @@ def update_infer_json(
                 mode=mode,
             )
     if actual_updated or json_need_converted:
+        generated_dir = (
+            os.path.dirname(os.path.abspath(json_file))
+            if json_output_dir is None
+            else os.path.abspath(json_output_dir)
+        )
+        os.makedirs(generated_dir, exist_ok=True)
         updated_json = os.path.join(
-            os.path.dirname(os.path.abspath(json_file)),
+            generated_dir,
             f"{os.path.splitext(os.path.basename(json_file))[0]}-update-msa.json",
         )
         with open(updated_json, "w") as f:

@@ -1,9 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Aureka AI Research
 import dataclasses
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Self, Sequence, TypeAlias
 
 import numpy as np
 from biotite.structure import AtomArray
-from typing_extensions import Self, TypeAlias
 
 from opendde.data.constants import (
     DNA_CHAIN,
@@ -285,6 +286,8 @@ class InferenceTemplateFeaturizer:
             elif "ligand" in info:
                 count, ctype = info["ligand"]["count"], LIGAND_CHAIN_TYPES
                 seq = "X" * (atom_array.asym_id_int == curr_asym_id).sum()
+            elif "ion" in info:
+                count, ctype = info["ion"]["count"], LIGAND_CHAIN_TYPES
 
             templates = []
             if t_path and use_template and online_template_featurizer:
@@ -312,10 +315,16 @@ class InferenceTemplateFeaturizer:
 
             for i in range(count):
                 aid = curr_asym_id + i
+                chain_seq = seq
+                if "ion" in info:
+                    chain_seq = "X" * np.count_nonzero(
+                        (atom_array.asym_id_int == aid)
+                        & atom_array.centre_atom_mask.astype(bool)
+                    )
                 template_meta_infos[aid] = {
                     "entity_id": eid,
                     "chain_id": atom_array.chain_id[atom_array.asym_id_int == aid][0],
-                    "sequence": seq,
+                    "sequence": chain_seq,
                     "chain_entity_type": ctype,
                     "templates": templates,
                 }

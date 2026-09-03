@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Aureka AI Research
 """2D pair-tensor sharding helpers for Fold-CP."""
 
 from __future__ import annotations
@@ -9,6 +11,12 @@ from typing import Optional
 import torch
 import torch.distributed as dist
 
+from opendde.distributed.foldcp.comm import (
+    Ring2DComm,
+    foldcp_control_barrier,
+    gather_tensor_by_ring,
+    run_group_rank_action_synchronized,
+)
 from opendde.distributed.foldcp.layout import FoldCP2DLayout
 from opendde.distributed.foldcp.mesh import FoldCPProcessMesh
 
@@ -60,8 +68,8 @@ def infer_pair_dims(tensor: torch.Tensor, n_token: int) -> Optional[tuple[int, i
     return None
 
 
-def _padded_pair_size(n_pair: int, mesh_side: int) -> int:
-    return int(math.ceil(n_pair / mesh_side) * mesh_side)
+def _padded_pair_size(n_pair: int, partitions: int) -> int:
+    return int(math.ceil(n_pair / partitions) * partitions)
 
 
 def _slice_for_pair(
@@ -97,6 +105,72 @@ def _pair_output_shape_like(
     shape[row_dim] = spec.original_shape[row_dim]
     shape[col_dim] = spec.original_shape[col_dim]
     return tuple(shape)
+
+
+def _gather_pair_tensor_1xp_ring(
+    local_tensor: torch.Tensor,
+    spec: FoldCPPairShardSpec,
+    group: dist.ProcessGroup,
+    *,
+    description: str,
+) -> torch.Tensor:
+    """Stream equal-width column shards into one output on every 1xP rank.
+
+    ``all_gather(list[P])`` keeps a complete tensor's worth of receive shards
+    alive beside the assembled full output. The maintained topology has one
+    unsharded row and P column slabs, so a neighbour Ring can copy each slab
+    directly into its final location while reusing at most two receive buffers.
+    """
+
+    def _prepare_ring() -> tuple[FoldCP2DLayout, int, int, Ring2DComm]:
+        layout = FoldCP2DLayout(spec.mesh_shape)
+        group_size = dist.get_world_size(group)
+        if group_size != layout.numel:
+            raise ValueError("pair gather group size must match the shard mesh.")
+        if local_tensor.ndim != len(spec.original_shape):
+            raise ValueError(
+                "local pair-like tensor must keep the same rank as the source pair "
+                "tensor."
+            )
+        row_dim, col_dim = _normalize_pair_dims(local_tensor.ndim, spec.pair_dims)
+        group_rank = dist.get_rank(group)
+        expected_coord = layout.to_coord(group_rank)
+        if spec.mesh_coord != expected_coord:
+            raise ValueError(
+                "pair shard coordinate must match its group rank; "
+                f"got {spec.mesh_coord} vs {expected_coord}."
+            )
+        if spec.row_range != (0, spec.original_shape[row_dim]):
+            raise ValueError(
+                "maintained 1xP pair gathers require the row dimension to remain "
+                "unsharded."
+            )
+        expected_col_width = spec.col_range[1] - spec.col_range[0]
+        if int(local_tensor.shape[col_dim]) != expected_col_width:
+            raise ValueError(
+                "local pair-like column width does not match its shard metadata; "
+                f"got {int(local_tensor.shape[col_dim])} vs {expected_col_width}."
+            )
+        return layout, group_rank, col_dim, Ring2DComm(group, layout)
+
+    prepared = run_group_rank_action_synchronized(
+        _prepare_ring,
+        group=group,
+        description=f"{description} metadata preparation",
+    )
+    if prepared is None:  # pragma: no cover - every rank runs the action
+        raise RuntimeError(f"{description} metadata was not prepared.")
+    layout, group_rank, col_dim, ring = prepared
+    return gather_tensor_by_ring(
+        local_tensor,
+        comm=ring.comm_row,
+        group=group,
+        local_index=group_rank,
+        side=layout.numel,
+        dim=col_dim,
+        length=spec.original_shape[col_dim],
+        description=description,
+    )
 
 
 def _copy_pair_shard_into_output(
@@ -145,20 +219,22 @@ def shard_pair_tensor(
     n_col = tensor.shape[col_dim]
     if n_row != n_col:
         raise ValueError(f"pair tensor must be square, got {n_row} x {n_col}.")
-    mesh_side = mesh.layout.shape[0]
-    padded_n = _padded_pair_size(n_row, mesh_side)
+    mesh_rows, mesh_cols = mesh.layout.shape
+    padded_rows = _padded_pair_size(n_row, mesh_rows)
+    padded_cols = _padded_pair_size(n_col, mesh_cols)
     padded_shape = list(tensor.shape)
-    padded_shape[row_dim] = padded_n
-    padded_shape[col_dim] = padded_n
+    padded_shape[row_dim] = padded_rows
+    padded_shape[col_dim] = padded_cols
 
-    tile = padded_n // mesh_side
-    row_start = mesh.coord[0] * tile
-    col_start = mesh.coord[1] * tile
-    row_range = (row_start, row_start + tile)
-    col_range = (col_start, col_start + tile)
+    row_tile = padded_rows // mesh_rows
+    col_tile = padded_cols // mesh_cols
+    row_start = mesh.coord[0] * row_tile
+    col_start = mesh.coord[1] * col_tile
+    row_range = (row_start, row_start + row_tile)
+    col_range = (col_start, col_start + col_tile)
     local_shape = list(tensor.shape)
-    local_shape[row_dim] = tile
-    local_shape[col_dim] = tile
+    local_shape[row_dim] = row_tile
+    local_shape[col_dim] = col_tile
     local = tensor.new_full(tuple(local_shape), pad_value)
 
     valid_row_end = min(row_range[1], n_row)
@@ -204,21 +280,23 @@ def make_pair_shard_spec(
     n_col = original_shape[col_dim]
     if n_row != n_col:
         raise ValueError(f"pair tensor must be square, got {n_row} x {n_col}.")
-    mesh_side = mesh.layout.shape[0]
-    padded_n = _padded_pair_size(n_row, mesh_side)
+    mesh_rows, mesh_cols = mesh.layout.shape
+    padded_rows = _padded_pair_size(n_row, mesh_rows)
+    padded_cols = _padded_pair_size(n_col, mesh_cols)
     padded_shape = list(original_shape)
-    padded_shape[row_dim] = padded_n
-    padded_shape[col_dim] = padded_n
+    padded_shape[row_dim] = padded_rows
+    padded_shape[col_dim] = padded_cols
 
-    tile = padded_n // mesh_side
-    row_start = mesh.coord[0] * tile
-    col_start = mesh.coord[1] * tile
+    row_tile = padded_rows // mesh_rows
+    col_tile = padded_cols // mesh_cols
+    row_start = mesh.coord[0] * row_tile
+    col_start = mesh.coord[1] * col_tile
     return FoldCPPairShardSpec(
         original_shape=tuple(original_shape),
         padded_shape=tuple(padded_shape),
         pair_dims=pair_dims,
-        row_range=(row_start, row_start + tile),
-        col_range=(col_start, col_start + tile),
+        row_range=(row_start, row_start + row_tile),
+        col_range=(col_start, col_start + col_tile),
         mesh_shape=mesh.layout.shape,
         mesh_coord=mesh.coord,
     )
@@ -229,23 +307,16 @@ def gather_pair_tensor(
     spec: FoldCPPairShardSpec,
     group: dist.ProcessGroup,
 ) -> torch.Tensor:
-    """Gather local pair shards from all CP ranks and crop padding."""
+    """Gather local pair shards with the maintained 1xP streaming Ring."""
 
     if not dist.is_initialized():
         raise RuntimeError("torch.distributed must be initialized before gather.")
-    layout = FoldCP2DLayout(spec.mesh_shape)
-    gathered = [torch.empty_like(local_tensor) for _ in range(layout.numel)]
-    dist.all_gather(gathered, local_tensor.contiguous(), group=group)
-
-    full = local_tensor.new_empty(spec.original_shape)
-    tile_row = spec.local_shape[spec.pair_dims[0]]
-    tile_col = spec.local_shape[spec.pair_dims[1]]
-    for cp_rank, shard in enumerate(gathered):
-        row, col = layout.to_coord(cp_rank)
-        row_range = (row * tile_row, (row + 1) * tile_row)
-        col_range = (col * tile_col, (col + 1) * tile_col)
-        _copy_pair_shard_into_output(full, shard, spec.pair_dims, row_range, col_range)
-    return full
+    return _gather_pair_tensor_1xp_ring(
+        local_tensor,
+        spec,
+        group,
+        description="pair Ring gather",
+    )
 
 
 def gather_pair_tensor_like(
@@ -262,25 +333,12 @@ def gather_pair_tensor_like(
 
     if not dist.is_initialized():
         raise RuntimeError("torch.distributed must be initialized before gather.")
-    row_dim, col_dim = spec.pair_dims
-    if local_tensor.ndim != len(spec.original_shape):
-        raise ValueError(
-            "local pair-like tensor must keep the same rank as the source pair tensor."
-        )
-
-    layout = FoldCP2DLayout(spec.mesh_shape)
-    gathered = [torch.empty_like(local_tensor) for _ in range(layout.numel)]
-    dist.all_gather(gathered, local_tensor.contiguous(), group=group)
-
-    full = local_tensor.new_empty(_pair_output_shape_like(local_tensor, spec))
-    tile_row = local_tensor.shape[row_dim]
-    tile_col = local_tensor.shape[col_dim]
-    for cp_rank, shard in enumerate(gathered):
-        row, col = layout.to_coord(cp_rank)
-        row_range = (row * tile_row, (row + 1) * tile_row)
-        col_range = (col * tile_col, (col + 1) * tile_col)
-        _copy_pair_shard_into_output(full, shard, spec.pair_dims, row_range, col_range)
-    return full
+    return _gather_pair_tensor_1xp_ring(
+        local_tensor,
+        spec,
+        group,
+        description="pair-like Ring gather",
+    )
 
 
 def gather_pair_tensor_like_to_rank(
@@ -298,38 +356,136 @@ def gather_pair_tensor_like_to_rank(
 
     if not dist.is_initialized():
         raise RuntimeError("torch.distributed must be initialized before gather.")
-    row_dim, col_dim = spec.pair_dims
-    if local_tensor.ndim != len(spec.original_shape):
-        raise ValueError(
-            "local pair-like tensor must keep the same rank as the source pair tensor."
+
+    def _allocate_stream_buffers() -> tuple[
+        FoldCP2DLayout,
+        int,
+        int,
+        int,
+        int,
+        int,
+        int,
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
+        layout = FoldCP2DLayout(spec.mesh_shape)
+        group_size = dist.get_world_size(group)
+        if group_size != layout.numel:
+            raise ValueError("pair-to-rank group size must match the shard mesh.")
+        normalized_dst = int(dst_group_rank)
+        if normalized_dst < 0 or normalized_dst >= group_size:
+            raise ValueError(
+                f"destination group rank must be in [0, {group_size}), "
+                f"got {normalized_dst}."
+            )
+        group_rank = dist.get_rank(group)
+        dst_global_rank = dist.get_global_rank(group, normalized_dst)
+        row_dim, col_dim = _normalize_pair_dims(local_tensor.ndim, spec.pair_dims)
+        if local_tensor.ndim != len(spec.original_shape):
+            raise ValueError(
+                "local pair-like tensor must keep the same rank as the source pair "
+                "tensor."
+            )
+        tile_row = int(local_tensor.shape[row_dim])
+        tile_col = int(local_tensor.shape[col_dim])
+        send_tensor = local_tensor.contiguous()
+        if group_rank != normalized_dst:
+            return (
+                layout,
+                group_rank,
+                normalized_dst,
+                dst_global_rank,
+                row_dim,
+                tile_row,
+                tile_col,
+                send_tensor,
+                None,
+                None,
+            )
+        return (
+            layout,
+            group_rank,
+            normalized_dst,
+            dst_global_rank,
+            row_dim,
+            tile_row,
+            tile_col,
+            send_tensor,
+            local_tensor.new_empty(_pair_output_shape_like(local_tensor, spec)),
+            torch.empty_like(send_tensor),
         )
 
-    layout = FoldCP2DLayout(spec.mesh_shape)
-    group_rank = dist.get_rank(group)
-    dst_global_rank = dist.get_global_rank(group, dst_group_rank)
-    local_tensor = local_tensor.contiguous()
+    stream_buffers = run_group_rank_action_synchronized(
+        _allocate_stream_buffers,
+        group=group,
+        description="pair-to-rank stream-buffer allocation",
+    )
+    if stream_buffers is None:
+        raise RuntimeError("pair-to-rank stream buffers were not allocated.")
+    (
+        layout,
+        group_rank,
+        dst_group_rank,
+        dst_global_rank,
+        _row_dim,
+        tile_row,
+        tile_col,
+        send_tensor,
+        full,
+        recv_buffer,
+    ) = stream_buffers
 
-    if group_rank != dst_group_rank:
-        dist.send(local_tensor, dst=dst_global_rank, group=group)
-        return None
-
-    full = local_tensor.new_empty(_pair_output_shape_like(local_tensor, spec))
-    tile_row = local_tensor.shape[row_dim]
-    tile_col = local_tensor.shape[col_dim]
-
+    assembly_error = ""
     for cp_rank in range(layout.numel):
         row, col = layout.to_coord(cp_rank)
         row_range = (row * tile_row, (row + 1) * tile_row)
         col_range = (col * tile_col, (col + 1) * tile_col)
-        if cp_rank == dst_group_rank:
-            _copy_pair_shard_into_output(
-                full, local_tensor, spec.pair_dims, row_range, col_range
-            )
-        else:
-            shard = torch.empty_like(local_tensor)
+        shard = None
+        if cp_rank == dst_group_rank and group_rank == dst_group_rank:
+            shard = send_tensor
+        elif cp_rank != dst_group_rank:
             src_global_rank = dist.get_global_rank(group, cp_rank)
-            dist.recv(shard, src=src_global_rank, group=group)
-            _copy_pair_shard_into_output(full, shard, spec.pair_dims, row_range, col_range)
+            if group_rank == cp_rank:
+                dist.send(send_tensor, dst=dst_global_rank, group=group)
+            elif group_rank == dst_group_rank:
+                if recv_buffer is None:
+                    assembly_error = "destination rank has no receive buffer"
+                else:
+                    dist.recv(recv_buffer, src=src_global_rank, group=group)
+                    shard = recv_buffer
+        if group_rank == dst_group_rank and shard is not None and not assembly_error:
+            try:
+                if full is None:
+                    raise ValueError("destination rank has no full output buffer")
+                _copy_pair_shard_into_output(
+                    full, shard, spec.pair_dims, row_range, col_range
+                )
+            except Exception as exc:
+                assembly_error = (
+                    f"pair-to-rank output assembly failed: {type(exc).__name__}: {exc}"
+                )
+        if cp_rank != dst_group_rank:
+            # Keep ranks that were not part of this P2P transfer from entering
+            # the next P2P/final status collective ahead of its sender/receiver.
+            # This is control-only synchronization. Runner-backed 1xP uses its
+            # already-created Gloo world so a near-capacity rank does not need
+            # a late NCCL barrier allocation after confidence logits exist.
+            foldcp_control_barrier(group)
+
+    def _raise_assembly_error() -> None:
+        if assembly_error:
+            raise RuntimeError(assembly_error)
+
+    run_group_rank_action_synchronized(
+        _raise_assembly_error if group_rank == dst_group_rank else None,
+        group=group,
+        description="pair-to-rank output assembly",
+    )
+    if group_rank != dst_group_rank:
+        return None
+    if full is None:
+        raise RuntimeError("destination rank returned no pair-like output.")
     return full
 
 

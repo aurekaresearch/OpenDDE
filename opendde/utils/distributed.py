@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Aureka AI Research
 import os
 
 import torch
@@ -16,17 +18,37 @@ class DistWrapper:
         self.num_nodes = int(self.world_size // self.local_world_size)
         self.node_rank = int(self.rank // self.local_world_size)
 
+    def refresh(self) -> None:
+        """Refresh global coordinates after a process group is initialized.
+
+        ``DIST_WRAPPER`` is constructed at import time.  That is correct for a
+        normal ``torchrun`` launch, but libraries can initialize the default
+        process group programmatically after this module has already been
+        imported.  Keep the environment-derived local coordinates and refresh
+        the values that PyTorch can authoritatively report.
+        """
+
+        if not distributed_available():
+            return
+        self.rank = torch.distributed.get_rank()
+        self.world_size = torch.distributed.get_world_size()
+        self.num_nodes = max(1, self.world_size // self.local_world_size)
+        self.node_rank = self.rank // self.local_world_size
+
     def all_gather_object(self, obj, group=None):
         """Function to gather objects from several distributed processes.
         It is now only used by sync metrics in logger due to security reason.
         """
-        if self.world_size > 1 and distributed_available():
+        if distributed_available():
+            group_world_size = torch.distributed.get_world_size(group=group)
+        else:
+            group_world_size = 1
+        if group_world_size > 1:
             with torch.no_grad():
-                obj_list = [None for _ in range(self.world_size)]
+                obj_list = [None for _ in range(group_world_size)]
                 torch.distributed.all_gather_object(obj_list, obj, group=group)
                 return obj_list
-        else:
-            return [obj]
+        return [obj]
 
 
 DIST_WRAPPER = DistWrapper()

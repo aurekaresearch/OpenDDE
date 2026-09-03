@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Aureka AI Research
 class DefaultNoneWithType(object):
     def __init__(self, dtype):
         self.dtype = dtype

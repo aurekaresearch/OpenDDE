@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Aureka AI Research
 # Copyright 2025 Shad Nygren, Virtual Hipster Corporation
 # Contributed to the OpenDDE project under the Apache License 2.0
 
@@ -40,7 +42,7 @@ class TestTritonCompatibility(unittest.TestCase):
 
         attention = Attention(c_q=8, c_k=8, c_v=8, c_hidden=4, no_heads=2)
         q_x = torch.randn(2, 4, 8)
-        with self.assertRaises(AssertionError):
+        with self.assertRaises(ValueError):
             attention(q_x=q_x, kv_x=q_x, triangle_attention="unsupported")
 
 

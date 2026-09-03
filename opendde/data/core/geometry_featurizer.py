@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Aureka AI Research
 # Copyright 2024 ByteDance and/or its affiliates.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

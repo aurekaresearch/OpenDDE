@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Aureka AI Research
 import copy
 import unittest
 
@@ -109,9 +111,7 @@ def _structural_feat_dict():
     return {
         "token_index": torch.arange(4, dtype=torch.long),
         "atom_to_token_idx": torch.tensor([0, 0, 1, 2, 2, 3], dtype=torch.long),
-        "distogram_rep_atom_mask": torch.tensor(
-            [1, 1, 0, 1, 1, 0], dtype=torch.long
-        ),
+        "distogram_rep_atom_mask": torch.tensor([1, 1, 0, 1, 1, 0], dtype=torch.long),
         "structural_distogram_rep_atom_mask": torch.tensor(
             [1, 0, 1, 1, 0, 1], dtype=torch.long
         ),
@@ -391,7 +391,9 @@ class TestShapeComplementarity(unittest.TestCase):
 
         feat = _base_feat_dict()
         feat["token_index"] = torch.arange(3, dtype=torch.long)
-        feat["atom_to_token_idx"] = torch.tensor([0, 0, 0, 1, 2, 2, 2], dtype=torch.long)
+        feat["atom_to_token_idx"] = torch.tensor(
+            [0, 0, 0, 1, 2, 2, 2], dtype=torch.long
+        )
         feat["distogram_rep_atom_mask"] = torch.tensor(
             [1, 0, 0, 1, 1, 0, 0], dtype=torch.long
         )
@@ -428,7 +430,9 @@ class TestShapeComplementarity(unittest.TestCase):
         )
         self.assertEqual(shape_comp["shape_comp_token"].shape, (4,))
         self.assertEqual(shape_comp["shape_comp_pair"].shape, (4, 4))
-        outputs = build_shape_comp_pred_outputs(shape_comp=shape_comp, keep_pair_map=False)
+        outputs = build_shape_comp_pred_outputs(
+            shape_comp=shape_comp, keep_pair_map=False
+        )
         self.assertNotIn("shape_comp_pair_pred", outputs)
         self.assertNotIn("shape_comp_pair_mask", outputs)
         self.assertIn("shape_comp_token_pred", outputs)

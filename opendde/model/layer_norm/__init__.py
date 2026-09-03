@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Aureka AI Research
 # Copyright 2024 ByteDance and/or its affiliates.
 #
 # Copyright 2021- HPC-AI Technology Inc.

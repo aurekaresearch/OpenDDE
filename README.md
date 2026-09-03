@@ -1,9 +1,10 @@
 # OpenDDE-Preview
 
-![OpenDDE banner](assets/OpenDDE.png)
+
+![OpenDDE banner](https://raw.githubusercontent.com/aurekaresearch/OpenDDE/main/assets/OpenDDE.png)
 
 ![Status](https://img.shields.io/badge/status-preview-orange)
-![Python](https://img.shields.io/badge/python-%3E%3D3.11-blue)
+![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-blue)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 
 OpenDDE is an open-source, all-atom biomolecular foundation model that turns co-folding into a scalable engine for structure prediction, design, and optimization in drug discovery.
@@ -14,57 +15,87 @@ OpenDDE is an open-source, all-atom biomolecular foundation model that turns co-
 > be reproducible across releases. It is not yet intended for production
 > pipelines. Please open an issue for bugs, regressions, or feature requests.
 
-![OpenDDE banner](assets/scaling_law.png)
-![results](assets/results.png)
+![OpenDDE banner](https://raw.githubusercontent.com/aurekaresearch/OpenDDE/main/assets/scaling_law.png)
+![results](https://raw.githubusercontent.com/aurekaresearch/OpenDDE/main/assets/results.png)
 
 ## News
 
-- **2026-07-03: OpenDDE-Preview has been released! Read the [technical report](assets/OpenDDE_Technical_Reports.pdf) and visit the [project website](https://aurekaresearch.github.io/OpenDDE-Website).**
-    - Model weights can be downloaded from Hugging Face: [opendde.pt](https://huggingface.co/aurekaresearch/OpenDDE/resolve/main/opendde.pt) | [opendde_abag.pt](https://huggingface.co/aurekaresearch/OpenDDE/resolve/main/opendde_abag.pt)
+- **2026-07-03: We release OpenDDE-preview (co-folding)! Read the [technical report](https://arxiv.org/abs/2607.03787) and visit the [website](https://aurekaresearch.github.io/OpenDDE-Website).**
+    - Model weights can be downloaded from Hugging Face: [opendde.pt](https://huggingface.co/aurekaresearch/OpenDDE/resolve/eddd563ce96571f784012edd8f045181c8f8627d/opendde.pt) | [opendde_abag.pt](https://huggingface.co/aurekaresearch/OpenDDE/resolve/eddd563ce96571f784012edd8f045181c8f8627d/opendde_abag.pt)
     - The Docker image can be pulled with `docker pull aurekaresearch/opendde:v1`
     - The 2026ARK-AB Benchmark is now available
 
 ## Installation
 
-OpenDDE requires Python `>=3.11`. The package pins PyTorch, so install with `uv`
-and choose the matching PyTorch backend explicitly.
+OpenDDE supports CPython `3.11`, `3.12`, and `3.13`. We recommend
+[`uv`](https://docs.astral.sh/uv/getting-started/installation/) for Python
+installations. Choose one of the following methods.
 
-GPU/CUDA install, for Linux CUDA environments:
-
-```bash
-uv venv --python 3.11
-source .venv/bin/activate
-uv pip install --torch-backend cu126 'opendde[gpu]'
-opendde doctor
-```
-
-CPU-only install:
+### Install from PyPI
 
 ```bash
 uv venv --python 3.11
-source .venv/bin/activate
-uv pip install --torch-backend cpu 'opendde[cpu]'
-opendde doctor
 ```
 
-From a source checkout, install editable mode instead:
+CPU:
 
 ```bash
-uv venv --python 3.11
-source .venv/bin/activate
-uv pip install --torch-backend cpu -e '.[cpu]'
-uv pip install --group dev
-opendde doctor
+uv pip install --python .venv --torch-backend cpu opendde
 ```
 
-For full source and Docker setup notes, see
-[docs/inference_instructions.md](docs/inference_instructions.md) and
-[docs/docker_installation.md](docs/docker_installation.md). Pull the prebuilt
-Docker image with:
+NVIDIA GPU (Linux x86_64, CUDA 12.6):
+
+```bash
+uv pip install --python .venv --torch-backend cu126 "opendde[gpu]"
+```
+
+### Install from source
+
+```bash
+git clone https://github.com/aurekaresearch/OpenDDE.git
+cd OpenDDE
+uv venv --python 3.11
+```
+
+CPU:
+
+```bash
+uv pip install --python .venv --torch-backend cpu -e .
+```
+
+NVIDIA GPU (Linux x86_64, CUDA 12.6):
+
+```bash
+uv pip install --python .venv --torch-backend cu126 -e ".[gpu]"
+```
+
+After a PyPI or source installation, verify the environment with:
+
+```bash
+uv run --no-project --python .venv opendde doctor
+```
+
+### Use Docker
+
+The prebuilt image targets NVIDIA GPU inference:
 
 ```bash
 docker pull aurekaresearch/opendde:v1
 ```
+
+See the [Docker guide](https://github.com/aurekaresearch/OpenDDE/blob/main/docs/docker_installation.md)
+for GPU setup, runtime-data mounts, and a complete `docker run` example.
+
+> [!NOTE]
+> `--torch-backend` selects the PyTorch build, while `[gpu]` adds the optional
+> cuEquivariance kernels. Linux wheels require glibc 2.28 or newer. Apple
+> Silicon runs on CPU or on the Metal (MPS) backend with `--device mps`; Intel
+> macOS is unsupported, and Windows has not been validated. At runtime,
+> `--device auto` uses CUDA when available, then MPS, and otherwise falls back
+> to CPU.
+
+For runtime-data setup and additional installation details, see the
+[inference instructions](https://github.com/aurekaresearch/OpenDDE/blob/main/docs/inference_instructions.md).
 
 ## Model and Runtime Data
 
@@ -93,6 +124,12 @@ download the default checkpoint and common runtime files when they are missing.
 You can also place checkpoint files manually under
 `$OPENDDE_ROOT_DIR/checkpoint/`.
 
+Python-managed checkpoint and common-asset downloads use a release-pinned
+revision, published size, and SHA-256 before atomic replacement. The source
+helper independently verifies released checkpoints; external search databases
+are prepared separately. A checkpoint supplied with `--load_checkpoint_path`
+is never replaced automatically.
+
 For a prediction that disables protein MSA, template search, and RNA MSA, the
 large `search_database/` files are not needed. From a source checkout, use:
 
@@ -104,8 +141,8 @@ Released checkpoints:
 
 | Checkpoint        | Use case                              | Download                                                                                      |
 | ----------------- | ------------------------------------- | --------------------------------------------------------------------------------------------- |
-| `opendde.pt`      | General-purpose checkpoint.           | [opendde.pt](https://huggingface.co/aurekaresearch/OpenDDE/resolve/main/opendde.pt)           |
-| `opendde_abag.pt` | Checkpoint tuned on antibody-antigen. | [opendde_abag.pt](https://huggingface.co/aurekaresearch/OpenDDE/resolve/main/opendde_abag.pt) |
+| `opendde.pt`      | General-purpose checkpoint.           | [opendde.pt](https://huggingface.co/aurekaresearch/OpenDDE/resolve/eddd563ce96571f784012edd8f045181c8f8627d/opendde.pt)           |
+| `opendde_abag.pt` | Checkpoint tuned on antibody-antigen. | [opendde_abag.pt](https://huggingface.co/aurekaresearch/OpenDDE/resolve/eddd563ce96571f784012edd8f045181c8f8627d/opendde_abag.pt) |
 
 Use `opendde.pt` with `-n opendde_v1` for the default model. For ABAG runs,
 keep the filename as `opendde_abag.pt` and pass it explicitly:
@@ -118,7 +155,7 @@ opendde pred \
 ```
 
 Detailed asset setup, mirrors, and Docker data mounts are documented in
-[docs/inference_instructions.md](docs/inference_instructions.md).
+[inference instructions](https://github.com/aurekaresearch/OpenDDE/blob/main/docs/inference_instructions.md).
 
 ## Running Your First Prediction
 
@@ -173,16 +210,27 @@ For production runs, enable the preprocessing features you need, for example
 require network access, HMMER/Kalign binaries, and large local search databases;
 see the inference guide for details.
 
-## 4-GPU Fold-CP Inference
+## Multi-GPU Fold-CP Inference
 
-OpenDDE supports a four-GPU Fold-CP inference mode for larger inputs. Launch it
-with `torchrun` so that one process runs on each GPU:
+> [!IMPORTANT]
+> Multi-GPU Fold-CP does not support cuEquivariance triangle kernels, so use
+> `--trimul_kernel torch --triatt_kernel torch`. Distributed `auto` requests
+> resolve to these PyTorch kernels, while an explicit cuEquivariance request is
+> rejected before model loading. On CUDA BF16, the distributed
+> PyTorch triangle-attention path uses the Triton dependency from the GPU install
+> extra to fuse attention-bias addition. See the
+> [Fold-CP reproduction guide](https://github.com/aurekaresearch/OpenDDE/blob/main/docs/foldcp_e2e_baseline.md)
+> for controlled launch commands and validation guidance.
+
+OpenDDE supports a `1 x P` Fold-CP inference mode for larger inputs, where `P`
+can be any available GPU count greater than one. Launch it with `torchrun` so
+that one process runs on each GPU. For example, four GPUs use:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node 4 \
   -m runner.batch_inference pred \
   -i examples/protein_200.json \
-  -o ./output_cp4 \
+  -o ./output_foldcp \
   -n opendde_v1 \
   --use_msa false \
   --use_template false \
@@ -190,13 +238,18 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node 4 \
   --sample 1 \
   --step 200 \
   --cycle 10 \
+  --trimul_kernel torch \
+  --triatt_kernel torch \
   --foldcp_mode distributed \
   --foldcp_size_dp 1 \
   --foldcp_size_cp 4
 ```
 
-`--foldcp_size_cp 4` uses a `2 x 2` context-parallel mesh. For normal single-GPU
-or CPU inference, omit the Fold-CP flags or use `--foldcp_mode single`.
+Only the `1 x P` topology is supported. `--nproc_per_node` must equal
+`--foldcp_size_cp P`; `--foldcp_size_dp` is retained only for command-line
+compatibility and must remain `1`. The example uses `P=4`; replace both
+occurrences of `4` with the desired `P`. For normal single-GPU or CPU inference,
+omit the Fold-CP flags or use `--foldcp_mode single --foldcp_size_cp 1`.
 
 ## Input JSON
 
@@ -205,7 +258,7 @@ such as `proteinChain`, `dnaSequence`, `rnaSequence`, `ligand`, or `ion`.
 `covalent_bonds` is optional and should be added only when explicit covalent
 links are needed.
 
-See [docs/infer_json_format.md](docs/infer_json_format.md) for the full schema,
+See the [input JSON format](https://github.com/aurekaresearch/OpenDDE/blob/main/docs/infer_json_format.md) for the full schema,
 including covalent bonds, ligands, modifications, MSA paths, and template paths.
 
 ## CLI Overview
@@ -225,13 +278,16 @@ checkpoint files such as `opendde_abag.pt`.
 
 ## Documentation
 
-- [Inference instructions](docs/inference_instructions.md)
-- [Docker installation](docs/docker_installation.md)
-- [Input JSON format](docs/infer_json_format.md)
-- [MSA/template/RNA-MSA pipeline](docs/msa_template_pipeline.md)
-- [Kernel options](docs/kernels.md)
-- [Supported models](docs/supported_models.md)
-- [Tutorial](docs/tutorial.md)
+- [Changelog](https://github.com/aurekaresearch/OpenDDE/blob/main/CHANGELOG.md)
+- [Model/checkpoint manifest](https://github.com/aurekaresearch/OpenDDE/blob/main/opendde/config/model_manifest.json)
+- [Inference instructions](https://github.com/aurekaresearch/OpenDDE/blob/main/docs/inference_instructions.md)
+- [Docker installation](https://github.com/aurekaresearch/OpenDDE/blob/main/docs/docker_installation.md)
+- [Input JSON format](https://github.com/aurekaresearch/OpenDDE/blob/main/docs/infer_json_format.md)
+- [MSA/template/RNA-MSA pipeline](https://github.com/aurekaresearch/OpenDDE/blob/main/docs/msa_template_pipeline.md)
+- [Kernel options](https://github.com/aurekaresearch/OpenDDE/blob/main/docs/kernels.md)
+- [Fold-CP reproduction guide](https://github.com/aurekaresearch/OpenDDE/blob/main/docs/foldcp_e2e_baseline.md)
+- [Supported models](https://github.com/aurekaresearch/OpenDDE/blob/main/docs/supported_models.md)
+- [Tutorial](https://github.com/aurekaresearch/OpenDDE/blob/main/docs/tutorial.md)
 
 ## Citation and Acknowledgements
 
@@ -241,8 +297,8 @@ AlphaFold 3, Protenix, OpenFold, and ColabFold.
 
 ## License
 
-OpenDDE is released under the Apache-2.0 license. See [LICENSE](LICENSE).
+OpenDDE is released under the Apache-2.0 license. See [LICENSE](https://github.com/aurekaresearch/OpenDDE/blob/main/LICENSE).
 
-## Hiring
+## Partnership and Collaboration
 
-![Hiring](assets/hiring.png)
+![Hiring](https://raw.githubusercontent.com/aurekaresearch/OpenDDE/main/assets/hiring.png)

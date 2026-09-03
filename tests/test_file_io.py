@@ -1,7 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Aureka AI Research
 import gzip
+import json
 import pickle
 
-from opendde.utils.file_io import LMDBDict, load_gzip_pickle
+import torch
+
+from opendde.utils.file_io import LMDBDict, load_gzip_pickle, save_json
 
 
 def test_load_gzip_pickle_roundtrips_lmdbdict(tmp_path):
@@ -18,3 +23,17 @@ def test_load_gzip_pickle_roundtrips_lmdbdict(tmp_path):
 
     assert isinstance(loaded, LMDBDict)
     assert loaded.path == "some.lmdb"
+
+
+def test_save_json_does_not_mutate_nested_caller_data(tmp_path):
+    tensor = torch.tensor([1.25])
+    data = {"nested": {"score": tensor}, "label": "sample"}
+    output = tmp_path / "result.json"
+
+    save_json(data, output)
+
+    assert data["nested"]["score"] is tensor
+    assert json.loads(output.read_text()) == {
+        "nested": {"score": [1.25]},
+        "label": "sample",
+    }

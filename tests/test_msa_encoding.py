@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Aureka AI Research
 """Tests for MSA encoding vectorized sequence parsing.
 
 Verifies the numpy LUT-based approach produces identical msa_arr and del_arr

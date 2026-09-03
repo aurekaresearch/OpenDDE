@@ -1,18 +1,24 @@
-"""Runtime flags for the Fold-CP migration.
-
-The migration intentionally has one user-facing switch: keep the original
-single-card path, or run the four-card context-parallel path once each stage is
-ported. Other knobs such as dtype, MSA, templates, and chunk size stay orthogonal.
-"""
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Aureka AI Research
+"""Runtime flags for single-process or multi-GPU 1 x P Fold-CP inference."""
 
 from __future__ import annotations
 
-import math
 import os
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
-from typing import Any, Literal
+from typing import Any, Iterator, Literal
+
+import torch.distributed as dist
 
 FoldCPMode = Literal["single", "distributed"]
+FOLDCP_ENVIRONMENT_KEYS = (
+    "OPENDDE_FOLDCP_MODE",
+    "OPENDDE_FOLDCP_SIZE_DP",
+    "OPENDDE_FOLDCP_SIZE_CP",
+    "OPENDDE_FOLDCP_DEVICES",
+    "OPENDDE_FOLDCP_METRICS_JSONL",
+)
 
 
 def _as_int(value: Any, default: int) -> int:
@@ -59,32 +65,54 @@ class FoldCPConfig:
             metrics_jsonl=getattr(configs, "foldcp_metrics_jsonl", "") or "",
         )
 
+    @classmethod
+    def from_environment(cls) -> "FoldCPConfig":
+        """Resolve process-global Fold-CP settings without a fixed-P fallback.
+
+        The Runner publishes every field explicitly. Library users may instead
+        enable distributed execution after initializing the default process
+        group; in that case the maintained topology is 1xWORLD_SIZE, so infer
+        P from the group rather than silently assuming the historical CP=4.
+        """
+
+        mode = os.environ.get("OPENDDE_FOLDCP_MODE", "single")
+        size_dp = _as_int(os.environ.get("OPENDDE_FOLDCP_SIZE_DP"), 1)
+        raw_size_cp = os.environ.get("OPENDDE_FOLDCP_SIZE_CP")
+        if raw_size_cp in {None, ""}:
+            size_cp = (
+                dist.get_world_size()
+                if mode == "distributed"
+                and dist.is_available()
+                and dist.is_initialized()
+                else 1
+            )
+        else:
+            size_cp = int(raw_size_cp)
+        return cls.from_runtime_args(
+            mode=mode,
+            size_dp=size_dp,
+            size_cp=size_cp,
+            devices=os.environ.get("OPENDDE_FOLDCP_DEVICES", ""),
+            metrics_jsonl=os.environ.get("OPENDDE_FOLDCP_METRICS_JSONL", ""),
+        )
+
     def validate(self) -> "FoldCPConfig":
         if self.mode not in {"single", "distributed"}:
             raise ValueError("foldcp_mode must be 'single' or 'distributed'.")
-        if self.size_dp < 1:
-            raise ValueError("foldcp_size_dp must be >= 1.")
+        if self.size_dp != 1:
+            raise ValueError(
+                "Only the maintained 1 x P Fold-CP topology is supported; "
+                "foldcp_size_dp must be 1."
+            )
         if self.size_cp < 1:
             raise ValueError("foldcp_size_cp must be >= 1.")
         if self.mode == "single" and self.size_cp != 1:
             raise ValueError("foldcp_mode='single' requires foldcp_size_cp=1.")
         if self.mode == "distributed":
-            sqrt_cp = math.isqrt(self.size_cp)
-            if sqrt_cp * sqrt_cp != self.size_cp:
-                raise ValueError(
-                    "foldcp_size_cp must be a perfect square for the 2D CP mesh."
-                )
             if self.size_cp == 1:
                 raise ValueError(
                     "foldcp_mode='distributed' requires foldcp_size_cp > 1."
                 )
-        world_size = int(os.environ.get("WORLD_SIZE", "0") or "0")
-        if world_size and self.size_dp * self.size_cp != world_size:
-            raise ValueError(
-                "foldcp_size_dp * foldcp_size_cp must equal WORLD_SIZE "
-                f"when launched with torchrun; got {self.size_dp} * "
-                f"{self.size_cp} != {world_size}."
-            )
         return self
 
     @property
@@ -93,8 +121,9 @@ class FoldCPConfig:
 
     @property
     def cp_mesh_shape(self) -> tuple[int, int]:
-        side = math.isqrt(self.size_cp)
-        return (side, side)
+        if not self.enabled:
+            return (1, 1)
+        return (1, self.size_cp)
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -104,7 +133,7 @@ class FoldCPConfig:
 
     def launch_hint(self) -> str:
         if self.enabled:
-            nproc = self.size_dp * self.size_cp
+            nproc = self.size_cp
             return (
                 f"torchrun --nproc_per_node {nproc} -m runner.batch_inference pred "
                 f"--foldcp_mode distributed --foldcp_size_dp {self.size_dp} "
@@ -119,11 +148,15 @@ class FoldCPConfig:
 def apply_foldcp_config(configs: Any, foldcp: FoldCPConfig) -> Any:
     """Attach validated Fold-CP settings to the mutable OpenDDE config object."""
 
-    os.environ["OPENDDE_FOLDCP_MODE"] = foldcp.mode
-    os.environ["OPENDDE_FOLDCP_SIZE_DP"] = str(foldcp.size_dp)
-    os.environ["OPENDDE_FOLDCP_SIZE_CP"] = str(foldcp.size_cp)
-    os.environ["OPENDDE_FOLDCP_DEVICES"] = foldcp.devices
-    os.environ["OPENDDE_FOLDCP_METRICS_JSONL"] = foldcp.metrics_jsonl
+    values = (
+        foldcp.mode,
+        str(foldcp.size_dp),
+        str(foldcp.size_cp),
+        foldcp.devices,
+        foldcp.metrics_jsonl,
+    )
+    for key, value in zip(FOLDCP_ENVIRONMENT_KEYS, values, strict=True):
+        os.environ[key] = value
 
     configs.foldcp_mode = foldcp.mode
     configs.foldcp_size_dp = foldcp.size_dp
@@ -132,3 +165,39 @@ def apply_foldcp_config(configs: Any, foldcp: FoldCPConfig) -> Any:
     configs.foldcp_metrics_jsonl = foldcp.metrics_jsonl
     configs.foldcp = foldcp.to_dict()
     return configs
+
+
+@contextmanager
+def use_serial_model_when_cp_has_padding_only_ranks(
+    foldcp: FoldCPConfig,
+    n_token: int | None,
+) -> Iterator[bool]:
+    """Run the model's original serial path when a 1 x P launch has P > N.
+
+    Context parallelism cannot reduce an input below one token column per
+    rank. When ``P > N``, the additional ranks contain padding only, so the
+    distributed kernels add communication and can select different tiny GEMM
+    launch families without saving useful compute or memory. All ranks instead
+    execute the unchanged serial model for this input; the existing distributed
+    runner still coordinates errors and retains only its normal output rank.
+    """
+
+    use_serial = bool(
+        foldcp.enabled and n_token is not None and int(n_token) < int(foldcp.size_cp)
+    )
+    if not use_serial:
+        yield False
+        return
+
+    previous = {key: os.environ.get(key) for key in FOLDCP_ENVIRONMENT_KEYS}
+    os.environ["OPENDDE_FOLDCP_MODE"] = "single"
+    os.environ["OPENDDE_FOLDCP_SIZE_DP"] = "1"
+    os.environ["OPENDDE_FOLDCP_SIZE_CP"] = "1"
+    try:
+        yield True
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value

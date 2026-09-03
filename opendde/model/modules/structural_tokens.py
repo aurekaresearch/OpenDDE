@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Aureka AI Research
 from typing import Any, Optional
 
 import torch
@@ -5,8 +7,10 @@ import torch.nn as nn
 
 from opendde.data.tokenizer import STRUCTURAL_TOKEN_ROLES
 from opendde.distributed.foldcp.atom_window import (
+    _gather_pair_rows_one_by_p,
     gather_pair_embedding_in_dense_trunk_from_foldcp_local,
 )
+from opendde.distributed.foldcp.comm import run_group_rank_action_synchronized
 from opendde.distributed.foldcp.mesh import FoldCPProcessMesh
 from opendde.distributed.foldcp.pair_sharding import (
     FoldCPPairShardSpec,
@@ -55,9 +59,7 @@ class StructuralTokenExpander(nn.Module):
                 "StructuralTokenExpander pair_chunk_size must be positive or None; "
                 f"got {pair_chunk_size}"
             )
-        self.pair_chunk_size = (
-            None if pair_chunk_size is None else int(pair_chunk_size)
-        )
+        self.pair_chunk_size = None if pair_chunk_size is None else int(pair_chunk_size)
         if pair_projection_mode not in {"full", "factorized", "none"}:
             raise ValueError(
                 "StructuralTokenExpander pair_projection_mode must be one of "
@@ -232,6 +234,14 @@ class StructuralTokenExpander(nn.Module):
     ) -> torch.Tensor:
         row_parent = parent.index_select(dim=0, index=row_index)
         col_parent = parent.index_select(dim=0, index=col_index)
+        if mesh.layout.shape[0] == 1:
+            return _gather_pair_rows_one_by_p(
+                z_local=z,
+                z_spec=z_spec,
+                idx_q=row_parent.unsqueeze(0),
+                idx_k=col_parent.unsqueeze(0),
+                mesh=mesh,
+            ).squeeze(0)
         return gather_pair_embedding_in_dense_trunk_from_foldcp_local(
             z_local=z,
             z_spec=z_spec,
@@ -273,8 +283,7 @@ class StructuralTokenExpander(nn.Module):
                     # DDP static_graph does not see role-dependent unused params.
                     dummy_use = dummy_use + projection(dummy_input).sum() * 0.0
         return (
-            flat_delta.reshape(*batch_shape, n_struct, n_struct, self.c_z)
-            + dummy_use
+            flat_delta.reshape(*batch_shape, n_struct, n_struct, self.c_z) + dummy_use
         )
 
     def _pair_project_by_role_full_chunk(
@@ -306,8 +315,7 @@ class StructuralTokenExpander(nn.Module):
                 else:
                     dummy_use = dummy_use + projection(dummy_input).sum() * 0.0
         return (
-            flat_delta.reshape(*batch_shape, chunk_len, n_struct, self.c_z)
-            + dummy_use
+            flat_delta.reshape(*batch_shape, chunk_len, n_struct, self.c_z) + dummy_use
         )
 
     def _pair_project_by_role_full_tile(
@@ -572,7 +580,10 @@ class StructuralTokenExpander(nn.Module):
             row_polymer_type[:, None] > 0
         )
         same_residue_twin = same_parent_residue & (
-            (row_is_backbone[:, None] & (col_is_sidechain[None, :] | col_is_base[None, :]))
+            (
+                row_is_backbone[:, None]
+                & (col_is_sidechain[None, :] | col_is_base[None, :])
+            )
             | (
                 col_is_backbone[None, :]
                 & (row_is_sidechain[:, None] | row_is_base[:, None])
@@ -726,8 +737,16 @@ class StructuralTokenExpander(nn.Module):
             role=role,
             parent=parent,
         )
-        z_chunks = []
-        attn_bias_chunks = []
+        if n_struct < 1:
+            raise ValueError(
+                "Structural pair context requires at least one structural token; "
+                f"got {n_struct}."
+            )
+        retain_autograd_chunks = torch.is_grad_enabled()
+        z_chunks = [] if retain_autograd_chunks else None
+        attn_bias_chunks = [] if retain_autograd_chunks else None
+        z_out = None
+        attn_bias_out = None
         for start in range(0, n_struct, chunk_size):
             end = min(start + chunk_size, n_struct)
             row_index = torch.arange(start, end, device=parent.device)
@@ -752,14 +771,29 @@ class StructuralTokenExpander(nn.Module):
                 pair_features,
                 dtype=z_chunk.dtype,
             )
-            z_chunks.append(z_chunk)
-            attn_bias_chunks.append(
-                self._make_attention_bias(pair_features, dtype=z_chunk.dtype)
+            attn_bias_chunk = self._make_attention_bias(
+                pair_features, dtype=z_chunk.dtype
             )
+            if retain_autograd_chunks:
+                z_chunks.append(z_chunk)
+                attn_bias_chunks.append(attn_bias_chunk)
+                continue
 
-        return torch.cat(z_chunks, dim=-3), {
-            "structural_pair_attn_bias": torch.cat(attn_bias_chunks, dim=0)
-        }
+            if z_out is None:
+                z_out = z_chunk.new_empty(
+                    (*z_chunk.shape[:-3], n_struct, *z_chunk.shape[-2:])
+                )
+                attn_bias_out = attn_bias_chunk.new_empty(
+                    (n_struct, *attn_bias_chunk.shape[1:])
+                )
+            z_out[..., start:end, :, :].copy_(z_chunk)
+            attn_bias_out[start:end].copy_(attn_bias_chunk)
+
+        if retain_autograd_chunks:
+            return torch.cat(z_chunks, dim=-3), {
+                "structural_pair_attn_bias": torch.cat(attn_bias_chunks, dim=0)
+            }
+        return z_out, {"structural_pair_attn_bias": attn_bias_out}
 
     def _make_attention_bias(
         self, pair_features: dict[str, torch.Tensor], dtype: torch.dtype
@@ -864,71 +898,150 @@ class StructuralTokenExpander(nn.Module):
         dict[str, FoldCPPairShardSpec],
         FoldCPPairShardSpec,
     ]:
-        parent = input_feature_dict["parent_residue_idx"].long()
-        role = input_feature_dict["subtoken_role_id"].long()
-        s_inputs_struct = self._gather_parent_single(
-            s_inputs_res, parent
-        ) + self.single_input_role_embedding(role).to(dtype=s_inputs_res.dtype)
-        s_parent = self._gather_parent_single(s_res, parent)
-        s_struct = (
-            s_parent
-            + self.single_split_mlp(s_parent)
-            + self.single_role_embedding(role).to(dtype=s_parent.dtype)
-        )
+        def _prepare_structural_state():
+            parent = input_feature_dict["parent_residue_idx"].long()
+            role = input_feature_dict["subtoken_role_id"].long()
+            s_inputs_struct = self._gather_parent_single(
+                s_inputs_res, parent
+            ) + self.single_input_role_embedding(role).to(dtype=s_inputs_res.dtype)
+            s_parent = self._gather_parent_single(s_res, parent)
+            s_struct = (
+                s_parent
+                + self.single_split_mlp(s_parent)
+                + self.single_role_embedding(role).to(dtype=s_parent.dtype)
+            )
 
-        n_struct = role.shape[-1]
-        residue_batch_shape = (
-            z_res.shape[:-3]
-            if z_res_spec is None
-            else z_res_spec.original_shape[:-3]
-        )
-        z_shape = (*residue_batch_shape, n_struct, n_struct, self.c_z)
-        z_spec = make_pair_shard_spec(z_shape, mesh, pair_dims=(-3, -2))
-        bias_spec = make_pair_shard_spec(
-            (*residue_batch_shape, n_struct, n_struct),
-            mesh,
-            pair_dims=(-2, -1),
-        )
+            n_struct = role.shape[-1]
+            residue_batch_shape = (
+                z_res.shape[:-3]
+                if z_res_spec is None
+                else z_res_spec.original_shape[:-3]
+            )
+            z_shape = (*residue_batch_shape, n_struct, n_struct, self.c_z)
+            z_spec = make_pair_shard_spec(z_shape, mesh, pair_dims=(-3, -2))
+            bias_spec = make_pair_shard_spec(
+                (*residue_batch_shape, n_struct, n_struct),
+                mesh,
+                pair_dims=(-2, -1),
+            )
 
-        row_start, row_end = z_spec.row_range
-        col_start, col_end = z_spec.col_range
-        valid_row_end = min(row_end, n_struct)
-        valid_col_end = min(col_end, n_struct)
-        valid_rows = max(0, valid_row_end - row_start)
-        valid_cols = max(0, valid_col_end - col_start)
-        z_local = z_res.new_zeros(z_spec.local_shape)
-        attn_bias_local = z_res.new_zeros(bias_spec.local_shape)
+            row_start, row_end = z_spec.row_range
+            col_start, col_end = z_spec.col_range
+            valid_row_end = min(row_end, n_struct)
+            valid_col_end = min(col_end, n_struct)
+            valid_rows = max(0, valid_row_end - row_start)
+            valid_cols = max(0, valid_col_end - col_start)
+            z_local = z_res.new_zeros(z_spec.local_shape)
+            attn_bias_local = z_res.new_zeros(bias_spec.local_shape)
+            context = None
+            col_index = None
+            if valid_rows > 0 and valid_cols > 0:
+                col_index = torch.arange(
+                    col_start,
+                    valid_col_end,
+                    device=parent.device,
+                )
+                context = self._build_structural_pair_context(
+                    input_feature_dict=input_feature_dict,
+                    role=role,
+                    parent=parent,
+                )
+            return (
+                parent,
+                role,
+                s_inputs_struct,
+                s_struct,
+                n_struct,
+                z_spec,
+                bias_spec,
+                row_start,
+                col_start,
+                valid_row_end,
+                valid_col_end,
+                valid_rows,
+                valid_cols,
+                z_local,
+                attn_bias_local,
+                context,
+                col_index,
+            )
+
+        prepared = run_group_rank_action_synchronized(
+            _prepare_structural_state,
+            group=mesh.group_2d,
+            description="Fold-CP structural expander preparation",
+        )
+        if prepared is None:  # pragma: no cover
+            raise RuntimeError("Fold-CP structural expander was not prepared.")
+        (
+            parent,
+            role,
+            s_inputs_struct,
+            s_struct,
+            n_struct,
+            z_spec,
+            bias_spec,
+            row_start,
+            col_start,
+            valid_row_end,
+            valid_col_end,
+            valid_rows,
+            valid_cols,
+            z_local,
+            attn_bias_local,
+            context,
+            col_index,
+        ) = prepared
 
         if valid_rows > 0 and valid_cols > 0:
-            col_index = torch.arange(col_start, valid_col_end, device=parent.device)
-            context = self._build_structural_pair_context(
-                input_feature_dict=input_feature_dict,
-                role=role,
-                parent=parent,
-            )
+            if context is None or col_index is None:  # pragma: no cover
+                raise RuntimeError("Fold-CP structural context was not prepared.")
             if self._use_foldcp_full_projection_source_order(z_res):
                 source_chunk = min(self.pair_chunk_size or n_struct, n_struct)
-                source_col_index = torch.arange(n_struct, device=parent.device)
+                source_col_index = run_group_rank_action_synchronized(
+                    lambda: torch.arange(n_struct, device=parent.device),
+                    group=mesh.group_2d,
+                    description="Fold-CP structural source-column preparation",
+                )
+                if source_col_index is None:  # pragma: no cover
+                    raise RuntimeError(
+                        "Fold-CP structural source columns were not prepared."
+                    )
                 for source_row_start in range(0, n_struct, source_chunk):
                     source_row_end = min(source_row_start + source_chunk, n_struct)
                     local_row_start = max(row_start, source_row_start)
                     local_row_end = min(valid_row_end, source_row_end)
-                    source_row_index = torch.arange(
-                        source_row_start,
-                        source_row_end,
-                        device=parent.device,
-                    )
-                    pair_features = self._build_structural_pair_features_for_rows(
-                        context=context,
-                        row_index=source_row_index,
-                    )
-                    if z_res_spec is None:
-                        z_source = self._gather_parent_pair_rows(
-                            z=z_res,
-                            parent=parent,
+
+                    def _prepare_source_chunk():
+                        source_row_index = torch.arange(
+                            source_row_start,
+                            source_row_end,
+                            device=parent.device,
+                        )
+                        pair_features = self._build_structural_pair_features_for_rows(
+                            context=context,
                             row_index=source_row_index,
                         )
-                    else:
+                        z_source = None
+                        if z_res_spec is None:
+                            z_source = self._gather_parent_pair_rows(
+                                z=z_res,
+                                parent=parent,
+                                row_index=source_row_index,
+                            )
+                        return source_row_index, pair_features, z_source
+
+                    source_prepared = run_group_rank_action_synchronized(
+                        _prepare_source_chunk,
+                        group=mesh.group_2d,
+                        description="Fold-CP structural source-chunk preparation",
+                    )
+                    if source_prepared is None:  # pragma: no cover
+                        raise RuntimeError(
+                            "Fold-CP structural source chunk was not prepared."
+                        )
+                    source_row_index, pair_features, z_source = source_prepared
+                    if z_source is None:
                         z_source = self._gather_parent_pair_tile_from_foldcp_local(
                             z=z_res,
                             z_spec=z_res_spec,
@@ -937,81 +1050,116 @@ class StructuralTokenExpander(nn.Module):
                             col_index=source_col_index,
                             mesh=mesh,
                         )
-                    if local_row_start >= local_row_end:
-                        continue
-                    delta = self._pair_project_by_role(
-                        z=z_source,
-                        role=role,
-                        pair_features=pair_features,
-                        row_index=source_row_index,
-                    )
-                    if delta is not None:
-                        z_source = z_source + delta
-                    z_source = z_source + self._make_pair_init_bias(
-                        pair_features,
-                        dtype=z_source.dtype,
-                    )
-                    attn_bias_source = self._make_attention_bias(
-                        pair_features,
-                        dtype=z_source.dtype,
-                    )
-                    local_source_rows = slice(
-                        local_row_start - source_row_start,
-                        local_row_end - source_row_start,
-                    )
-                    local_target_rows = slice(
-                        local_row_start - row_start,
-                        local_row_end - row_start,
-                    )
-                    local_source_cols = slice(col_start, valid_col_end)
-                    z_local[
-                        ...,
-                        local_target_rows,
-                        :valid_cols,
-                        :,
-                    ].copy_(
-                        z_source[
+
+                    def _write_source_chunk():
+                        if local_row_start >= local_row_end:
+                            return
+                        z_work = z_source
+                        delta = self._pair_project_by_role(
+                            z=z_work,
+                            role=role,
+                            pair_features=pair_features,
+                            row_index=source_row_index,
+                        )
+                        if delta is not None:
+                            z_work = z_work + delta
+                        z_work = z_work + self._make_pair_init_bias(
+                            pair_features,
+                            dtype=z_work.dtype,
+                        )
+                        attn_bias_source = self._make_attention_bias(
+                            pair_features,
+                            dtype=z_work.dtype,
+                        )
+                        local_source_rows = slice(
+                            local_row_start - source_row_start,
+                            local_row_end - source_row_start,
+                        )
+                        local_target_rows = slice(
+                            local_row_start - row_start,
+                            local_row_end - row_start,
+                        )
+                        local_source_cols = slice(col_start, valid_col_end)
+                        z_local[
                             ...,
-                            local_source_rows,
-                            local_source_cols,
+                            local_target_rows,
+                            :valid_cols,
                             :,
-                        ]
-                    )
-                    attn_bias_local[
-                        ...,
-                        local_target_rows,
-                        :valid_cols,
-                    ].copy_(
-                        self._reshape_pair_term_for_target(
-                            attn_bias_source[
+                        ].copy_(
+                            z_work[
+                                ...,
                                 local_source_rows,
                                 local_source_cols,
-                            ],
-                            attn_bias_local[..., local_target_rows, :valid_cols],
+                                :,
+                            ]
                         )
+                        attn_bias_local[
+                            ...,
+                            local_target_rows,
+                            :valid_cols,
+                        ].copy_(
+                            self._reshape_pair_term_for_target(
+                                attn_bias_source[
+                                    local_source_rows,
+                                    local_source_cols,
+                                ],
+                                attn_bias_local[..., local_target_rows, :valid_cols],
+                            )
+                        )
+
+                    run_group_rank_action_synchronized(
+                        _write_source_chunk,
+                        group=mesh.group_2d,
+                        description="Fold-CP structural source-chunk completion",
+                    )
+                    # The loop-local completion closure and synchronization
+                    # result both own the current chunk tensors.  Release them
+                    # before preparing the next source chunk so two dense
+                    # structural pair chunks cannot overlap at allocation peak.
+                    del (
+                        _write_source_chunk,
+                        source_prepared,
+                        source_row_index,
+                        pair_features,
+                        z_source,
                     )
             else:
                 pair_row_chunk = min(self.pair_chunk_size or 256, valid_rows)
                 for row_offset in range(0, valid_rows, pair_row_chunk):
                     row_chunk_end = min(row_offset + pair_row_chunk, valid_rows)
-                    row_index = torch.arange(
-                        row_start + row_offset,
-                        row_start + row_chunk_end,
-                        device=parent.device,
-                    )
-                    pair_features = self._build_structural_pair_features_for_tile(
-                        context=context,
-                        row_index=row_index,
-                        col_index=col_index,
-                    )
-                    if z_res_spec is None:
-                        z_valid = self._gather_parent_pair_tile(
-                            z=z_res,
-                            parent=parent,
+
+                    def _prepare_pair_tile():
+                        row_index = torch.arange(
+                            row_start + row_offset,
+                            row_start + row_chunk_end,
+                            device=parent.device,
+                        )
+                        pair_features = self._build_structural_pair_features_for_tile(
+                            context=context,
                             row_index=row_index,
                             col_index=col_index,
                         )
-                    else:
+                        z_valid = None
+                        if z_res_spec is None:
+                            z_valid = self._gather_parent_pair_tile(
+                                z=z_res,
+                                parent=parent,
+                                row_index=row_index,
+                                col_index=col_index,
+                            )
+                        return row_index, pair_features, z_valid
+
+                    tile_prepared = run_group_rank_action_synchronized(
+                        _prepare_pair_tile,
+                        group=mesh.group_2d,
+                        description="Fold-CP structural pair-tile preparation",
+                    )
+                    if tile_prepared is None:  # pragma: no cover
+                        raise RuntimeError(
+                            "Fold-CP structural pair tile was not prepared."
+                        )
+                    row_index, pair_features, z_valid = tile_prepared
+                    if z_valid is None:
                         z_valid = self._gather_parent_pair_tile_from_foldcp_local(
                             z=z_res,
                             z_spec=z_res_spec,
@@ -1020,60 +1168,86 @@ class StructuralTokenExpander(nn.Module):
                             col_index=col_index,
                             mesh=mesh,
                         )
-                    target_z = z_local[..., row_offset:row_chunk_end, :valid_cols, :]
-                    if target_z.is_contiguous() and not torch.is_grad_enabled():
-                        target_z.copy_(z_valid)
-                        del z_valid
-                        z_work = target_z
-                        writeback_z_work = False
-                    else:
-                        z_work = z_valid
-                        writeback_z_work = True
-                    if torch.is_grad_enabled():
-                        delta = self._pair_project_by_role(
-                            z=z_work,
-                            role=role,
+
+                    def _write_pair_tile():
+                        target_z = z_local[
+                            ..., row_offset:row_chunk_end, :valid_cols, :
+                        ]
+                        if target_z.is_contiguous() and not torch.is_grad_enabled():
+                            target_z.copy_(z_valid)
+                            z_work = target_z
+                            writeback_z_work = False
+                        else:
+                            z_work = z_valid
+                            writeback_z_work = True
+                        if torch.is_grad_enabled():
+                            delta = self._pair_project_by_role(
+                                z=z_work,
+                                role=role,
+                                pair_features=pair_features,
+                                row_index=row_index,
+                                col_index=col_index,
+                            )
+                            if delta is not None:
+                                z_work = z_work + delta
+                            z_work = z_work + self._make_pair_init_bias(
+                                pair_features,
+                                dtype=z_work.dtype,
+                            )
+                        else:
+                            z_work = self._add_pair_project_by_role_inplace(
+                                z=z_work,
+                                role=role,
+                                pair_features=pair_features,
+                                row_index=row_index,
+                                col_index=col_index,
+                                flat_chunk_size=min(
+                                    65536,
+                                    pair_features["role_pair_type"].numel(),
+                                ),
+                            )
+                            z_work = self._add_pair_init_bias_chunked_inplace(
+                                z_work,
+                                pair_features,
+                                dtype=z_work.dtype,
+                                row_chunk_size=min(
+                                    64,
+                                    row_chunk_end - row_offset,
+                                ),
+                            )
+                        if writeback_z_work:
+                            target_z.copy_(z_work)
+                        self._write_attention_bias_inplace(
+                            attn_bias_local[..., row_offset:row_chunk_end, :valid_cols],
                             pair_features=pair_features,
-                            row_index=row_index,
-                            col_index=col_index,
-                        )
-                        if delta is not None:
-                            z_work = z_work + delta
-                        z_work = z_work + self._make_pair_init_bias(
-                            pair_features,
                             dtype=z_work.dtype,
                         )
-                    else:
-                        z_work = self._add_pair_project_by_role_inplace(
-                            z=z_work,
-                            role=role,
-                            pair_features=pair_features,
-                            row_index=row_index,
-                            col_index=col_index,
-                            flat_chunk_size=min(
-                                65536,
-                                pair_features["role_pair_type"].numel(),
-                            ),
-                        )
-                        z_work = self._add_pair_init_bias_chunked_inplace(
-                            z_work,
-                            pair_features,
-                            dtype=z_work.dtype,
-                            row_chunk_size=min(64, row_chunk_end - row_offset),
-                        )
-                    if writeback_z_work:
-                        target_z.copy_(z_work)
-                    self._write_attention_bias_inplace(
-                        attn_bias_local[..., row_offset:row_chunk_end, :valid_cols],
-                        pair_features=pair_features,
-                        dtype=z_work.dtype,
+
+                    run_group_rank_action_synchronized(
+                        _write_pair_tile,
+                        group=mesh.group_2d,
+                        description="Fold-CP structural pair-tile completion",
+                    )
+                    del (
+                        _write_pair_tile,
+                        tile_prepared,
+                        row_index,
+                        pair_features,
+                        z_valid,
                     )
 
-        return (
-            s_inputs_struct,
-            s_struct,
-            z_local.contiguous(),
-            {"structural_pair_attn_bias": attn_bias_local.contiguous()},
-            {"structural_pair_attn_bias": bias_spec},
-            z_spec,
+        finalized = run_group_rank_action_synchronized(
+            lambda: (
+                s_inputs_struct,
+                s_struct,
+                z_local.contiguous(),
+                {"structural_pair_attn_bias": attn_bias_local.contiguous()},
+                {"structural_pair_attn_bias": bias_spec},
+                z_spec,
+            ),
+            group=mesh.group_2d,
+            description="Fold-CP structural expander finalization",
         )
+        if finalized is None:  # pragma: no cover
+            raise RuntimeError("Fold-CP structural expander was not finalized.")
+        return finalized

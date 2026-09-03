@@ -1,5 +1,6 @@
 # OpenDDE Tutorial
 
+
 A short walkthrough using files in [`examples/`](../examples). For install and
 runtime data setup, see [inference_instructions.md](./inference_instructions.md)
 or [docker_installation.md](./docker_installation.md).
@@ -20,19 +21,21 @@ $OPENDDE_ROOT_DIR/checkpoint/opendde.pt
 $OPENDDE_ROOT_DIR/common/
 ```
 
-The released general-purpose checkpoint is
-[`opendde.pt`](https://huggingface.co/aurekaresearch/OpenDDE/resolve/main/opendde.pt).
-For antibody-antigen (ABAG) complexes, use the ABAG-optimized
-[`opendde_abag.pt`](https://huggingface.co/aurekaresearch/OpenDDE/resolve/main/opendde_abag.pt).
-Place them under `$OPENDDE_ROOT_DIR/checkpoint/`, preserving the filenames. Pass
+Released checkpoints keep the filenames `opendde.pt` and `opendde_abag.pt`.
+Their download links and digests live in
+[supported_models.md](./supported_models.md). Place them under
+`$OPENDDE_ROOT_DIR/checkpoint/`, preserving those filenames. Pass
 `opendde_abag.pt` directly with `--load_checkpoint_path` for ABAG runs.
 
 ```bash
-mkdir -p "$OPENDDE_ROOT_DIR/checkpoint"
-curl -L \
-  -o "$OPENDDE_ROOT_DIR/checkpoint/opendde.pt" \
-  https://huggingface.co/aurekaresearch/OpenDDE/resolve/main/opendde.pt
+bash scripts/download_opendde_data.sh \
+  --root "$OPENDDE_ROOT_DIR" \
+  --skip-search-database
 ```
+
+The helper checks the released checkpoint's byte size and SHA-256 against the
+bundled manifest before installation and prepares the required `common/`
+runtime files in the same command.
 
 Template/RNA-MSA preprocessing also needs `hmmer`; template inference may need
 `kalign`.
@@ -117,11 +120,13 @@ For an input without MSA/template paths:
 opendde prep -i examples/example_without_msa.json -o ./output
 ```
 
-This writes an updated JSON next to the input. Predict from that updated JSON:
+This writes the updated JSON under
+`./output/.opendde_preprocessed/<input-hash>/example_without_msa-final-updated.json`
+and logs its path. Predict from that updated JSON:
 
 ```bash
 opendde pred \
-  -i examples/example_without_msa-final-updated.json \
+  -i ./output/.opendde_preprocessed/<input-hash>/example_without_msa-final-updated.json \
   -o ./output \
   -n opendde_v1 \
   --use_msa true \

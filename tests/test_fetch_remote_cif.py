@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Aureka AI Research
 """Tests for TemplateHitProcessor._fetch_or_read_cif with remote fetching."""
 
 import os

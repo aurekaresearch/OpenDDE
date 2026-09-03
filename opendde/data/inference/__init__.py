@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Aureka AI Research
 from .infer_dataloader import get_inference_dataloader
 from .json_maker import cif_to_input_json, merge_covalent_bonds
 from .json_parser import (

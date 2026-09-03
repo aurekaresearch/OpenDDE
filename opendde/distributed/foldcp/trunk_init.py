@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Aureka AI Research
 """Fold-CP local construction for trunk pair initialization."""
 
 from __future__ import annotations
@@ -13,7 +15,7 @@ from opendde.distributed.foldcp.pair_sharding import (
     make_pair_shard_spec,
 )
 from opendde.distributed.foldcp.launch import (
-    foldcp_linear_with_source_launch_shape,
+    foldcp_pair_row_slab_linear_with_source_grid_launch,
     foldcp_pair_row_slab_linear_with_source_launch_policy,
 )
 
@@ -86,8 +88,6 @@ def _materialize_relp_local(
     return _slice_tensor_pair_to_local(relp_feature, spec)
 
 
-
-
 def apply_trunk_z_cycle_local(
     *,
     z_init_local: torch.Tensor,
@@ -98,20 +98,19 @@ def apply_trunk_z_cycle_local(
 ) -> torch.Tensor:
     """Apply the trunk recycling z update on a local pair tile."""
 
-    row_dim, col_dim = z_spec.pair_dims
-    source_pair_rows = (
-        int(z_spec.original_shape[row_dim])
-        * int(z_spec.original_shape[col_dim])
-    )
-    for dim, size in enumerate(z_spec.original_shape):
-        if dim not in {row_dim % len(z_spec.original_shape), col_dim % len(z_spec.original_shape), len(z_spec.original_shape) - 1}:
-            source_pair_rows *= int(size)
-    z_cycle_update = foldcp_linear_with_source_launch_shape(
+    row_start, _, col_start, _, valid_rows, valid_cols = _valid_ranges(z_spec)
+    original_n = int(z_spec.original_shape[z_spec.pair_dims[0]])
+    z_cycle_update = foldcp_pair_row_slab_linear_with_source_grid_launch(
         linear_z_cycle,
         layernorm_z_cycle(z_local),
-        source_rows=source_pair_rows,
+        original_n=original_n,
+        row_start=row_start,
+        col_start=col_start,
+        valid_rows=valid_rows,
+        valid_cols=valid_cols,
     )
     return z_init_local + z_cycle_update
+
 
 def build_trunk_z_init_local(
     *,
@@ -146,7 +145,12 @@ def build_trunk_z_init_local(
         )
         z_local[..., :valid_rows, :valid_cols, :] = z_valid
 
-    relp_shape = (*s_init.shape[:-2], n_token, n_token, relative_position_encoding.linear_no_bias.in_features)
+    relp_shape = (
+        *s_init.shape[:-2],
+        n_token,
+        n_token,
+        relative_position_encoding.linear_no_bias.in_features,
+    )
     relp_spec = make_pair_shard_spec(relp_shape, mesh, pair_dims=(-3, -2))
     relp_local = _materialize_relp_local(relp_feature, relp_spec, s_init)
     relp_update = foldcp_pair_row_slab_linear_with_source_launch_policy(

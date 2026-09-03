@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Aureka AI Research
 """Model registry for released inference checkpoints.
 
 # Currently, only the following inference model is supported. It uses the

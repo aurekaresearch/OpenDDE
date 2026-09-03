@@ -1,7 +1,11 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Aureka AI Research
 # Copyright 2021 AlQuraishi Laboratory
 
+import contextlib
 import math
 import os
+import sys
 from functools import partial
 from typing import Callable, List, Optional, Tuple, Union
 
@@ -16,13 +20,14 @@ from opendde.model.utils import (
     is_fp16_enabled,
     permute_final_dims,
 )
+from opendde.utils.torch_utils import disabled_autocast
 
-fastln_is_installed = os.getenv("LAYERNORM_TYPE", "torch") == "fast_layernorm"
-if fastln_is_installed:
+_use_fast_layer_norm = os.getenv("LAYERNORM_TYPE", "torch") == "fast_layernorm"
+if _use_fast_layer_norm:
     try:
         from opendde.model.layer_norm.layer_norm import FusedLayerNorm
     except (ImportError, OSError, RuntimeError):
-        fastln_is_installed = False
+        _use_fast_layer_norm = False
 
 
 def _prod(nums: Union[List[int], Tuple[int, ...], torch.Size]) -> int:
@@ -89,6 +94,37 @@ def gating_init_(weights: torch.Tensor) -> None:
 
 def normal_init_(weights: torch.Tensor) -> None:
     torch.nn.init.kaiming_normal_(weights, nonlinearity="linear")
+
+
+@contextlib.contextmanager
+def skip_random_init():
+    """
+    Skips random weight initialization.
+
+    Skips the following initialization work:
+    * trunc_normal_init_ in opendde.model.triangular.layers
+    * trunc_normal_init_ in opendde.model.modules.primitives
+    * reset_parameters in torch.nn.Linear which includes kaiminig_uniform_
+    """
+
+    def _noop_init(*_args, **_kwargs):
+        pass
+
+    from opendde.model.modules import primitives
+
+    originals = [
+        (sys.modules[__name__], "trunc_normal_init_"),
+        (primitives, "trunc_normal_init_"),
+        (torch.nn.Linear, "reset_parameters"),
+    ]
+    saved = [(obj, attr, getattr(obj, attr)) for obj, attr in originals]
+    try:
+        for obj, attr in originals:
+            setattr(obj, attr, _noop_init)
+        yield
+    finally:
+        for obj, attr, value in saved:
+            setattr(obj, attr, value)
 
 
 class OpenfoldLinear(nn.Linear):
@@ -167,7 +203,7 @@ class OpenfoldLinear(nn.Linear):
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         d = input.dtype
         if self.precision is not None:
-            with torch.amp.autocast("cuda", enabled=False):
+            with disabled_autocast():
                 precision_input = input.to(dtype=self.precision)
                 precision_weight = self.weight.to(dtype=self.precision)
                 bias = (
@@ -182,7 +218,7 @@ class OpenfoldLinear(nn.Linear):
                 ).to(dtype=d)
 
         if d is torch.bfloat16:
-            with torch.amp.autocast("cuda", enabled=False):
+            with disabled_autocast():
                 bias = self.bias.to(dtype=d) if self.bias is not None else None
                 return nn.functional.linear(input, self.weight.to(dtype=d), bias)
 
@@ -216,7 +252,7 @@ class OpenFoldLayerNorm(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         d = x.dtype
         if d is torch.bfloat16:
-            with torch.amp.autocast("cuda", enabled=False):
+            with disabled_autocast():
                 out = nn.functional.layer_norm(
                     x,
                     self.c_in,
@@ -241,7 +277,7 @@ def LayerNorm(
     create_offset: bool = True,
     eps: float = 1e-5,
 ) -> nn.Module:
-    if fastln_is_installed:
+    if _use_fast_layer_norm:
         return FusedLayerNorm(
             c_in, create_scale=create_scale, create_offset=create_offset, eps=eps
         )
@@ -256,7 +292,7 @@ def softmax_no_cast(t: torch.Tensor, dim: int = -1) -> torch.Tensor:
     """
     d = t.dtype
     if d is torch.bfloat16:
-        with torch.amp.autocast("cuda", enabled=False):
+        with disabled_autocast():
             s = torch.nn.functional.softmax(t, dim=dim)
     else:
         s = torch.nn.functional.softmax(t, dim=dim)
@@ -410,19 +446,20 @@ class Attention(nn.Module):
         Returns
             [*, Q, C_q] attention update
         """
-        assert triangle_attention in ["torch", "cuequivariance"], (
-            "Invalid triangle_attention. Options: 'cuequivariance', 'torch'."
-        )
+        if triangle_attention not in {"torch", "cuequivariance"}:
+            raise ValueError(
+                "Invalid triangle_attention. Options: 'cuequivariance', 'torch'."
+            )
 
         if biases is None:
             biases = []
 
         use_cuequivariance = (
-            triangle_attention == "cuequivariance" and q_x.shape[-2] > 16
+            triangle_attention == "cuequivariance"
+            and q_x.is_cuda
+            and q_x.shape[-2] > 16
         )
-        q, k, v = self._prep_qkv(
-            q_x, kv_x, apply_scale=not use_cuequivariance
-        )
+        q, k, v = self._prep_qkv(q_x, kv_x, apply_scale=not use_cuequivariance)
 
         if use_cuequivariance:
             # Notes:
@@ -432,10 +469,6 @@ class Attention(nn.Module):
             #     (3) Triangle attention kernel supports: all hidden_dim<=32 and divisible by 4 for tf32/fp32,
             #         and for all hidden_dim<=128 and divisible by 8 for bf16/fp16. In the rare instance that
             #         the kernel does not support an input config, fallback to torch is enabled instead of erroring out.
-            #     (4) Blackwell-optimized kernels (for compute capabilities 10.0 and 10.3) provide superior performance
-            #         especially for long sequences and higher head dimensions. These kernels require the sequence length
-            #         N to be a multiple of 8 for the forward pass; pad the sequence if necessary.
-            #         Currently, this feature is supported only for cu13 builds.
             scale = 1.0 / math.sqrt(self.c_hidden)
             o = cuequivariance_triangular_attn(
                 q, k, v, biases[1].float(), (biases[0] == 0).bool(), scale
@@ -590,7 +623,7 @@ class OuterProductMean(nn.Module):
         inplace_safe: bool = False,
     ) -> torch.Tensor:
         if is_fp16_enabled():
-            with torch.amp.autocast("cuda", enabled=False):
+            with disabled_autocast():
                 return self._forward(m.float(), mask, chunk_size, inplace_safe)
         else:
             return self._forward(m, mask, chunk_size, inplace_safe)

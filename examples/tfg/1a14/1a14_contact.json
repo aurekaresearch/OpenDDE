@@ -1,0 +1,99 @@
+[
+  {
+    "name": "1a14_contact",
+    "modelSeeds": [
+      101
+    ],
+    "sequences": [
+      {
+        "proteinChain": {
+          "count": 1,
+          "id": [
+            "H"
+          ],
+          "sequence": "QVQLQQSGAELVKPGASVRMSCKASGYTFTNYNMYWVKQSPGQGLEWIGIFYPGNGDTSYNQKFKDKATLTADKSSNTAYMQLSSLTSEDSAVYYCARSGGSYRYDGGFDYWGQGTTVTV",
+          "pairedMsaPath": "examples/tfg/1a14/msa/H/pairing.a3m",
+          "unpairedMsaPath": "examples/tfg/1a14/msa/H/non_pairing.a3m"
+        }
+      },
+      {
+        "proteinChain": {
+          "count": 1,
+          "id": [
+            "L"
+          ],
+          "sequence": "DIELTQTTSSLSASLGDRVTISCRASQDISNYLNWYQQNPDGTVKLLIYYTSNLHSEVPSRFSGSGSGTDYSLTISNLEQEDIATYFCQQDFTLPFTFGGGTAA",
+          "pairedMsaPath": "examples/tfg/1a14/msa/L/pairing.a3m",
+          "unpairedMsaPath": "examples/tfg/1a14/msa/L/non_pairing.a3m"
+        }
+      },
+      {
+        "proteinChain": {
+          "count": 1,
+          "id": [
+            "N"
+          ],
+          "sequence": "RDFNNLTKGLCTINSWHIYGKDNAVRIGEDSDVLVTREPYVSCDPDECRFYALSQGTTIRGKHSNGTIHDRSQYRALISWPLSSPPTVYNSRVECIGWSSTSCHDGKTRMSICISGPNNNASAVIWYNRRPVTEINTWARNILRTQESECVCHNGVCPVVFTDGSATGPAETRIYYFKEGKILKWEPLAGTAKHIEECSCYGERAEITCTCRDNWQGSNRPVIRIDPVAMTHTSQYICSPVLTDNPRPNDPTVGKCNDPYPGNNNNGVKGFSYLDGVNTWLGRTISIASRSGYEMLKVPNALTDDKSKPTQGQTIVLNTDWSGYSGSFMDYWAEGECYRACFYVELIRGRPKEDKVWWTSNSIVSMCSSTEFLGQWDWPDGAKIEYFL",
+          "pairedMsaPath": "examples/tfg/1a14/msa/N/pairing.a3m",
+          "unpairedMsaPath": "examples/tfg/1a14/msa/N/non_pairing.a3m"
+        }
+      }
+    ],
+    "constraint": {
+      "contact": [
+        {
+          "entity1": "3",
+          "copy1": 1,
+          "position1": "248",
+          "atom1": "CA",
+          "entity2": "2",
+          "copy2": 1,
+          "position2": "93",
+          "atom2": "CA",
+          "min_distance": 3.5,
+          "max_distance": 8.0
+        },
+        {
+          "entity1": "3",
+          "copy1": 1,
+          "position1": "249",
+          "atom1": "CA",
+          "entity2": "2",
+          "copy2": 1,
+          "position2": "92",
+          "atom2": "CA",
+          "min_distance": 3.5,
+          "max_distance": 8.0
+        },
+        {
+          "entity1": "3",
+          "copy1": 1,
+          "position1": "319",
+          "atom1": "CA",
+          "entity2": "1",
+          "copy2": 1,
+          "position2": "55",
+          "atom2": "CA",
+          "min_distance": 3.5,
+          "max_distance": 8.0
+        },
+        {
+          "entity1": "3",
+          "copy1": 1,
+          "position1": "251",
+          "atom1": "CA",
+          "entity2": "2",
+          "copy2": 1,
+          "position2": "30",
+          "atom2": "CA",
+          "min_distance": 3.5,
+          "max_distance": 8.0
+        }
+      ],
+      "movable_chains": [
+        "H",
+        "L"
+      ]
+    }
+  }
+]

@@ -1,0 +1,83 @@
+[
+  {
+    "covalent_bonds": [
+      {
+        "atom1": "ND2",
+        "atom2": "C1",
+        "entity1": 1,
+        "entity2": 3,
+        "position1": 24,
+        "position2": 1
+      }
+    ],
+    "modelSeeds": [
+      101
+    ],
+    "name": "9lh2_pocket",
+    "sequences": [
+      {
+        "proteinChain": {
+          "count": 2,
+          "id": [
+            "A",
+            "B"
+          ],
+          "sequence": "VQPTESIVRFPNITNLCPFGEVFNATRFASVYAWNRKRISNCVADYSVLYNSASFSTFKCYGVSPTKLNDLCFTNVYADSFVIRGDEVRQIAPGQTGKIADYNYKLPDDFTGCVIAWNSNNLDSKVGGNYNYRYRLFRKSNLKPFERDISTEIYQAGSKPCNGVEGFNCYFPLQSYGFQPTNGVGYQPYRVVVLSFELLHAPATVCGPKKSTNLVKNK",
+          "unpairedMsaPath": "examples/tfg/9lh2/msa/A/non_pairing.a3m"
+        }
+      },
+      {
+        "proteinChain": {
+          "count": 2,
+          "id": [
+            "C",
+            "D"
+          ],
+          "sequence": "QVQLVESGGGLVQPGGSLRLSCAASGFTFNRYAMSWVRQAPGKGREWVSGIYSDGSETYYTESVKGRFTISRDNAKNMLYLQMNSLKPEDTALYYCAKDHHAHEDHFNSGFDRKYDYWGQGTQVTVSSHHHHHH",
+          "unpairedMsaPath": "examples/tfg/9lh2/msa/C/non_pairing.a3m"
+        }
+      },
+      {
+        "ligand": {
+          "count": 2,
+          "ligand": "CCD_NAG"
+        }
+      }
+    ],
+    "constraint": {
+      "movable_chains": [
+        "C"
+      ],
+      "epitope": {
+        "residues": [
+          {
+            "entity": "1",
+            "copy": 1,
+            "position": "147",
+            "residue": "R"
+          },
+          {
+            "entity": "1",
+            "copy": 1,
+            "position": "36",
+            "residue": "R"
+          },
+          {
+            "entity": "1",
+            "copy": 1,
+            "position": "77",
+            "residue": "Y"
+          },
+          {
+            "entity": "1",
+            "copy": 1,
+            "position": "38",
+            "residue": "R"
+          }
+        ],
+        "paratope": "all",
+        "min_fraction": 0.5
+      }
+    }
+  }
+]

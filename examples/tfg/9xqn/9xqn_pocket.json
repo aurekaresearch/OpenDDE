@@ -1,0 +1,76 @@
+[
+  {
+    "modelSeeds": [
+      101
+    ],
+    "name": "9xqn_pocket",
+    "sequences": [
+      {
+        "proteinChain": {
+          "count": 1,
+          "id": [
+            "A"
+          ],
+          "sequence": "ASGRQTVDEALKDAQTSQEGNSTSLQEGLQDLIHTATLVTCTFLLAVIFCLGSYGNFIVFLSFFDPAFRKFRTNFDFMILNLSFCDLFICGVTAPMFTFVLFFSSASSIPDAFCFTFHLTSSGFIIMSLKTVAVIALHRLRMVLGKQPNRTASFPCTVLLTLLLWATSFTLATLATLKTSKSHLCLPMSSLIAGKGKAILSLYVVDFTFCVAVVSVSYIMIAQTLRKNAERARSTLADLEDNWETLNDNLKVIEKADNAAQVKDALTKMRAAALDAQKASGSGSPEMKDFRHGFDILVGQIDDALKLANEGKVKEAQAAAEQLKTTRNAYIQKYLERARSTLAKDSKAVVTCVIIVLSVLVCCLPLGISLVQVVLSSNGSFILYQFELFGFTLIFFKSGLNPFIYSRNSAGLRRKVLWCLQS",
+          "unpairedMsaPath": "examples/tfg/9xqn/msa/A/non_pairing.a3m"
+        }
+      },
+      {
+        "proteinChain": {
+          "count": 1,
+          "id": [
+            "B"
+          ],
+          "sequence": "SDIQMTQSPSSLSASVGDRVTITCRASQSVSSAVAWYQQKPGKAPKLLIYSASSLYSGVPSRFSGSRSGTDFTLTISSLQPEDFATYYCQQYLYYSLVTFGQGTKVE",
+          "unpairedMsaPath": "examples/tfg/9xqn/msa/B/non_pairing.a3m"
+        }
+      },
+      {
+        "proteinChain": {
+          "count": 1,
+          "id": [
+            "C"
+          ],
+          "sequence": "VQLVESGGGLVQPGGSLRLSCAASGFNVVVFSIHWVRQAPGKGLEWVAYISSSSGSTSYADSVKGRFTISADTSKNTAYLQMNSLRAEDTAVYYCARWGYWPGEPWWKAFDYWGQGTLVTV",
+          "unpairedMsaPath": "examples/tfg/9xqn/msa/C/non_pairing.a3m"
+        }
+      }
+    ],
+    "constraint": {
+      "movable_chains": [
+        "B",
+        "C"
+      ],
+      "epitope": {
+        "residues": [
+          {
+            "entity": "1",
+            "copy": 1,
+            "position": "275",
+            "residue": "D"
+          },
+          {
+            "entity": "1",
+            "copy": 1,
+            "position": "270",
+            "residue": "R"
+          },
+          {
+            "entity": "1",
+            "copy": 1,
+            "position": "295",
+            "residue": "D"
+          },
+          {
+            "entity": "1",
+            "copy": 1,
+            "position": "274",
+            "residue": "L"
+          }
+        ],
+        "paratope": "all",
+        "min_fraction": 0.5
+      }
+    }
+  }
+]

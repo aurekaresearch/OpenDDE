@@ -1,0 +1,82 @@
+[
+  {
+    "modelSeeds": [
+      101
+    ],
+    "name": "9sat_pocket",
+    "sequences": [
+      {
+        "proteinChain": {
+          "count": 1,
+          "id": [
+            "A"
+          ],
+          "sequence": "QVQLVQSGPEVKKPGASVKVSCKASGYTFTSYSINWVRQAPGQGLEWMGWISTYNGNTNYAQRLQGRVTMTTDTSTGTAHMELRSLRSDDTAIYYCAREEPLYCSGGSCYEFQHWGQGTLVTVSSASTKGPSVFPLAPSSKSTSGGTAALGCLVKDYFPEPVTVSWNSGALTSGVHTFPAVLQSSGLYSLSSVVTVPSSSLGTQTYICNVNHKPSNTKVDKKVEP",
+          "unpairedMsaPath": "examples/tfg/9sat/msa/A/non_pairing.a3m"
+        }
+      },
+      {
+        "proteinChain": {
+          "count": 1,
+          "id": [
+            "B"
+          ],
+          "sequence": "EIVLTQSPARLSLSPGERATLSCRASQSVSSDLAWYQQKPGQAPRLLIYDASHRATGIPARFSGSGSGTDFTLTISSLEPEDFAVYYCQQRINWPPIFTFGPGTKVDIKRTVAAPSVFIFPPSDEQLKSGTASVVCLLNNFYPREAKVQWKVDNALQSGNSQESVTEQDSKDSTYSLSSTLTLSKADYEKHKVYACEVTHQGLSSPVTKSFNRGEC",
+          "unpairedMsaPath": "examples/tfg/9sat/msa/B/non_pairing.a3m"
+        }
+      },
+      {
+        "proteinChain": {
+          "count": 1,
+          "id": [
+            "C"
+          ],
+          "sequence": "RVQPTESIVRFPNITNLCPFGEVFNATRFASVYAWNRKRISNCVADYSVLYNSASFSTFKCYGVSPTKLNDLCFTNVYADSFVIRGDEVRQIAPGQTGKIADYNYKLPDDFTGCVIAWNSNNLDSKVGGNYNYLYRLFRKSNLKPFERDISTEIYQAGSTPCNGVEGFNCYFPLQSYGFQPTNGVGYQPYRVVVLSFELLHAPATVCGPKKSTNLVKNKCVNFGGRLEVLFQGPGSAWSHPQFEKGGGSGGGGSGGSAWSHPQFEK",
+          "unpairedMsaPath": "examples/tfg/9sat/msa/C/non_pairing.a3m"
+        }
+      },
+      {
+        "ligand": {
+          "count": 3,
+          "ligand": "CCD_ZN"
+        }
+      }
+    ],
+    "constraint": {
+      "movable_chains": [
+        "A",
+        "B"
+      ],
+      "epitope": {
+        "residues": [
+          {
+            "entity": "3",
+            "copy": 1,
+            "position": "148",
+            "residue": "R"
+          },
+          {
+            "entity": "3",
+            "copy": 1,
+            "position": "39",
+            "residue": "R"
+          },
+          {
+            "entity": "3",
+            "copy": 1,
+            "position": "152",
+            "residue": "T"
+          },
+          {
+            "entity": "3",
+            "copy": 1,
+            "position": "36",
+            "residue": "N"
+          }
+        ],
+        "paratope": "all",
+        "min_fraction": 0.5
+      }
+    }
+  }
+]

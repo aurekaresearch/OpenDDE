@@ -1,0 +1,96 @@
+[
+  {
+    "modelSeeds": [
+      101
+    ],
+    "name": "9xqn_contact",
+    "sequences": [
+      {
+        "proteinChain": {
+          "count": 1,
+          "id": [
+            "A"
+          ],
+          "sequence": "ASGRQTVDEALKDAQTSQEGNSTSLQEGLQDLIHTATLVTCTFLLAVIFCLGSYGNFIVFLSFFDPAFRKFRTNFDFMILNLSFCDLFICGVTAPMFTFVLFFSSASSIPDAFCFTFHLTSSGFIIMSLKTVAVIALHRLRMVLGKQPNRTASFPCTVLLTLLLWATSFTLATLATLKTSKSHLCLPMSSLIAGKGKAILSLYVVDFTFCVAVVSVSYIMIAQTLRKNAERARSTLADLEDNWETLNDNLKVIEKADNAAQVKDALTKMRAAALDAQKASGSGSPEMKDFRHGFDILVGQIDDALKLANEGKVKEAQAAAEQLKTTRNAYIQKYLERARSTLAKDSKAVVTCVIIVLSVLVCCLPLGISLVQVVLSSNGSFILYQFELFGFTLIFFKSGLNPFIYSRNSAGLRRKVLWCLQS",
+          "unpairedMsaPath": "examples/tfg/9xqn/msa/A/non_pairing.a3m"
+        }
+      },
+      {
+        "proteinChain": {
+          "count": 1,
+          "id": [
+            "B"
+          ],
+          "sequence": "SDIQMTQSPSSLSASVGDRVTITCRASQSVSSAVAWYQQKPGKAPKLLIYSASSLYSGVPSRFSGSRSGTDFTLTISSLQPEDFATYYCQQYLYYSLVTFGQGTKVE",
+          "unpairedMsaPath": "examples/tfg/9xqn/msa/B/non_pairing.a3m"
+        }
+      },
+      {
+        "proteinChain": {
+          "count": 1,
+          "id": [
+            "C"
+          ],
+          "sequence": "VQLVESGGGLVQPGGSLRLSCAASGFNVVVFSIHWVRQAPGKGLEWVAYISSSSGSTSYADSVKGRFTISADTSKNTAYLQMNSLRAEDTAVYYCARWGYWPGEPWWKAFDYWGQGTLVTV",
+          "unpairedMsaPath": "examples/tfg/9xqn/msa/C/non_pairing.a3m"
+        }
+      }
+    ],
+    "constraint": {
+      "contact": [
+        {
+          "entity1": "1",
+          "copy1": 1,
+          "position1": "271",
+          "atom1": "CA",
+          "entity2": "2",
+          "copy2": 1,
+          "position2": "31",
+          "atom2": "CA",
+          "min_distance": 3.5,
+          "max_distance": 8.0
+        },
+        {
+          "entity1": "1",
+          "copy1": 1,
+          "position1": "299",
+          "atom1": "CA",
+          "entity2": "3",
+          "copy2": 1,
+          "position2": "101",
+          "atom2": "CA",
+          "min_distance": 3.5,
+          "max_distance": 8.0
+        },
+        {
+          "entity1": "1",
+          "copy1": 1,
+          "position1": "309",
+          "atom1": "CA",
+          "entity2": "3",
+          "copy2": 1,
+          "position2": "58",
+          "atom2": "CA",
+          "min_distance": 3.5,
+          "max_distance": 8.0
+        },
+        {
+          "entity1": "1",
+          "copy1": 1,
+          "position1": "306",
+          "atom1": "CA",
+          "entity2": "3",
+          "copy2": 1,
+          "position2": "56",
+          "atom2": "CA",
+          "min_distance": 3.5,
+          "max_distance": 8.0
+        }
+      ],
+      "movable_chains": [
+        "B",
+        "C"
+      ]
+    }
+  }
+]

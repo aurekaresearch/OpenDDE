@@ -1,0 +1,46 @@
+[
+  {
+    "modelSeeds": [
+      101
+    ],
+    "name": "9sat_unconstrained",
+    "sequences": [
+      {
+        "proteinChain": {
+          "count": 1,
+          "id": [
+            "A"
+          ],
+          "sequence": "QVQLVQSGPEVKKPGASVKVSCKASGYTFTSYSINWVRQAPGQGLEWMGWISTYNGNTNYAQRLQGRVTMTTDTSTGTAHMELRSLRSDDTAIYYCAREEPLYCSGGSCYEFQHWGQGTLVTVSSASTKGPSVFPLAPSSKSTSGGTAALGCLVKDYFPEPVTVSWNSGALTSGVHTFPAVLQSSGLYSLSSVVTVPSSSLGTQTYICNVNHKPSNTKVDKKVEP",
+          "unpairedMsaPath": "examples/tfg/9sat/msa/A/non_pairing.a3m"
+        }
+      },
+      {
+        "proteinChain": {
+          "count": 1,
+          "id": [
+            "B"
+          ],
+          "sequence": "EIVLTQSPARLSLSPGERATLSCRASQSVSSDLAWYQQKPGQAPRLLIYDASHRATGIPARFSGSGSGTDFTLTISSLEPEDFAVYYCQQRINWPPIFTFGPGTKVDIKRTVAAPSVFIFPPSDEQLKSGTASVVCLLNNFYPREAKVQWKVDNALQSGNSQESVTEQDSKDSTYSLSSTLTLSKADYEKHKVYACEVTHQGLSSPVTKSFNRGEC",
+          "unpairedMsaPath": "examples/tfg/9sat/msa/B/non_pairing.a3m"
+        }
+      },
+      {
+        "proteinChain": {
+          "count": 1,
+          "id": [
+            "C"
+          ],
+          "sequence": "RVQPTESIVRFPNITNLCPFGEVFNATRFASVYAWNRKRISNCVADYSVLYNSASFSTFKCYGVSPTKLNDLCFTNVYADSFVIRGDEVRQIAPGQTGKIADYNYKLPDDFTGCVIAWNSNNLDSKVGGNYNYLYRLFRKSNLKPFERDISTEIYQAGSTPCNGVEGFNCYFPLQSYGFQPTNGVGYQPYRVVVLSFELLHAPATVCGPKKSTNLVKNKCVNFGGRLEVLFQGPGSAWSHPQFEKGGGSGGGGSGGSAWSHPQFEK",
+          "unpairedMsaPath": "examples/tfg/9sat/msa/C/non_pairing.a3m"
+        }
+      },
+      {
+        "ligand": {
+          "count": 3,
+          "ligand": "CCD_ZN"
+        }
+      }
+    ]
+  }
+]

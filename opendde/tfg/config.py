@@ -155,6 +155,11 @@ _REQUIRED_FEATURES: dict[str, set[str]] = {
         "ref_element",
     },
     "InterchainBondPotential": {"interchain_bond_index"},
+    "UserDistanceRestraintPotential": {
+        "user_distance_restraint_index",
+        "user_distance_restraint_lower_bound",
+        "user_distance_restraint_upper_bound",
+    },
     "VinaStericPotential": {
         "asym_id",
         "atom_to_token_idx",

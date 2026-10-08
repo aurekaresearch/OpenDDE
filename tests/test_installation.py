@@ -258,7 +258,7 @@ raise SystemExit(doctor_result.exit_code)
         dtype_type = dtype_options[0].type
         assert isinstance(dtype_type, click.Choice)
         self.assertEqual(set(dtype_type.choices), {"bf16", "fp32"})
-        self.assertEqual(dtype_options[0].default, "fp32")
+        self.assertEqual(dtype_options[0].default, "bf16")
 
         atom_confidence_options = [
             parameter

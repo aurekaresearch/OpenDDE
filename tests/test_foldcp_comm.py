@@ -2777,6 +2777,10 @@ def test_post_trunk_cleanup_failure_stops_before_structural_collectives():
 
     structural_calls = []
     fake_cuda_tensor = SimpleNamespace(is_cuda=True)
+
+    def trunk_output(**_kwargs):
+        return fake_cuda_tensor, fake_cuda_tensor, fake_cuda_tensor
+
     module = SimpleNamespace(
         configs=SimpleNamespace(
             infer_setting=SimpleNamespace(dynamic_chunk_size=False),
@@ -2785,11 +2789,8 @@ def test_post_trunk_cleanup_failure_stops_before_structural_collectives():
             lambda _n_token, chunk_size, dynamic_chunk_size: chunk_size
         ),
         _foldcp_stage_context=lambda *_args: nullcontext(),
-        get_pairformer_output=lambda **_kwargs: (
-            fake_cuda_tensor,
-            fake_cuda_tensor,
-            fake_cuda_tensor,
-        ),
+        get_pairformer_output=trunk_output,
+        _trunk_with_cache=trunk_output,
         _maybe_foldcp_mesh=lambda: SimpleNamespace(group_2d=object()),
         _run_foldcp_local_action_synchronized=lambda *_args, **_kwargs: (
             _ for _ in ()

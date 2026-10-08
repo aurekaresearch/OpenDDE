@@ -242,10 +242,3 @@ def update_template_info(
                 protein_chain["templatesPath"] = template_path
                 actual_updated = True
     return actual_updated
-
-
-if __name__ == "__main__":
-    run_template_search(
-        msa_for_template_search_dir="examples/5sak/1",
-        msa_for_template_search_name="pairing,non_pairing",
-    )

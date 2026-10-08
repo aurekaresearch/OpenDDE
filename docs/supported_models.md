@@ -13,7 +13,7 @@ Exact parameter count: `655,791,538`, rounded to `656 M`.
 Use it with:
 
 ```bash
-opendde pred -i examples/input.json -o ./output -n opendde_v1
+opendde pred -i examples/cofold/input.json -o ./output -n opendde_v1
 ```
 
 Checkpoint path by default:
@@ -51,5 +51,7 @@ Recommended inference defaults:
 
 These are also the current `opendde pred` CLI defaults for `opendde_v1`.
 
-Legacy `constraint` fields are ignored by the inference-only build. Use
-`covalent_bonds` for supported covalent links.
+`constraint.contact`, `constraint.movable_chains` and `constraint.epitope` are
+supported via TFG (`--use_tfg_guidance true`); see
+[`infer_json_format.md`](infer_json_format.md). Use `covalent_bonds` for
+covalent links. Other `constraint` keys are rejected.

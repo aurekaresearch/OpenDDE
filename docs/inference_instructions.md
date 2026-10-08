@@ -111,7 +111,7 @@ cp /path/to/my_checkpoint.pt \
 bash scripts/download_opendde_data.sh --skip-model
 opendde pred \
   --load_checkpoint_path "$OPENDDE_ROOT_DIR/checkpoint/my_checkpoint.pt" \
-  -i examples/input.json \
+  -i examples/cofold/input.json \
   -o ./output
 ```
 
@@ -187,21 +187,21 @@ Full schema: [infer_json_format.md](./infer_json_format.md).
 Convert a structure file to JSON:
 
 ```bash
-opendde json -i examples/7pzb.pdb -o ./output --altloc first
-opendde json -i examples/2lwu.cif -o ./output --altloc first --assembly_id 1
+opendde json -i examples/cofold/structures/7pzb.pdb -o ./output --altloc first
+opendde json -i examples/cofold/structures/2lwu.cif -o ./output --altloc first --assembly_id 1
 ```
 
 ## Preprocess optional features
 
 ```bash
 # Protein MSA
-opendde msa -i examples/input.json -o ./output
+opendde msa -i examples/cofold/input.json -o ./output
 
 # Protein MSA + template search
-opendde mt -i examples/input.json -o ./output
+opendde mt -i examples/cofold/input.json -o ./output
 
 # Protein MSA + template search + RNA MSA when RNA is present
-opendde prep -i examples/input.json -o ./output
+opendde prep -i examples/cofold/input.json -o ./output
 ```
 
 Notes:
@@ -221,14 +221,14 @@ Details: [msa_template_pipeline.md](./msa_template_pipeline.md).
 Standard run:
 
 ```bash
-opendde pred -i examples/input.json -o ./output -n opendde_v1
+opendde pred -i examples/cofold/input.json -o ./output -n opendde_v1
 ```
 
 Compatibility run with the standard step/cycle counts:
 
 ```bash
 opendde pred \
-  -i examples/input.json \
+  -i examples/cofold/input.json \
   -o ./output \
   -n opendde_v1 \
   --use_msa false \
@@ -239,15 +239,16 @@ opendde pred \
   --cycle 10
 ```
 
-Inference defaults to `--device auto`, `fp32`, and `auto` triangle kernels.
+Inference defaults to `--device auto`, `bf16` with TF32 off (`--dtype fp32` and
+`--enable_tf32 true` opt out), and `auto` triangle kernels.
 Device auto-selection uses NVIDIA CUDA when available, then the Apple Metal
 (MPS) backend on Apple Silicon, and otherwise CPU.
 cuEquivariance is selected only when its Linux CUDA packages import successfully;
 otherwise the model uses PyTorch triangle kernels. MPS always uses PyTorch
-triangle kernels and defaults to FP32. `--dtype bf16` also works there and
-follows the same dynamic policy as CUDA: the trunk uses BF16; by default,
-diffusion and the confidence head stay FP32 through 2560 tokens, confidence
-uses BF16 above 2560, and diffusion uses BF16 above 3840 to reduce memory.
+triangle kernels and follows the same BF16 default and dynamic policy as CUDA:
+the trunk uses BF16; by default, diffusion and the confidence head stay FP32
+through 2560 tokens, confidence uses BF16 above 2560, and diffusion uses BF16
+above 3840 to reduce memory.
 BF16 performance varies by Apple GPU and workload, so compare it with FP32 for
 your inputs. BF16 autocast needs macOS 14 or newer and is downgraded to FP32
 below that.
@@ -270,7 +271,7 @@ and expose exactly the GPUs you want to use. For example, four GPUs use:
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node 4 \
   -m runner.batch_inference pred \
-  -i examples/protein_200.json \
+  -i examples/cofold/protein_200.json \
   -o ./output_foldcp \
   -n opendde_v1 \
   --use_msa false \
@@ -307,23 +308,23 @@ For single-GPU inference, omit the Fold-CP flags or set
 Use prepared features:
 
 ```bash
-opendde pred -i examples/examples_with_template/example_9fm7.json \
+opendde pred -i examples/cofold/template/example_9fm7.json \
   -o ./output -n opendde_v1 \
   --use_msa true --use_template true
 
-opendde pred -i examples/examples_with_rna_msa/example_9gmw_2.json \
+opendde pred -i examples/cofold/rna_msa/example_9gmw_2.json \
   -o ./output -n opendde_v1 \
   --use_rna_msa true
 ```
 
 ## Optional TFG Guidance
 
-OpenDDE includes default-off Training-Free Guidance (TFG) for protein-ligand
-runs. TFG refines each sampled trajectory with geometry potentials while keeping
-the requested `--sample` count unchanged.
+OpenDDE includes default-off Training-Free Guidance (TFG). TFG refines each
+sampled trajectory with geometry potentials while keeping the requested
+`--sample` count unchanged.
 
 ```bash
-opendde pred -i examples/input.json -o ./output -n opendde_v1 \
+opendde pred -i examples/cofold/input.json -o ./output -n opendde_v1 \
   --use_tfg_guidance true
 ```
 
@@ -332,6 +333,13 @@ Outputs are written to:
 ```text
 <out_dir>/<job_name>/seed_<seed>/predictions/
 ```
+
+With `--use_tfg_guidance true`, the input JSON `constraint` field (`contact`,
+`movable_chains`, `epitope`) additionally steers the sampler towards partial
+knowledge of an antibody–antigen interface. See
+[TFG constraint guidance](./tfg_constraint_guidance.md), the `constraint` section
+of [infer_json_format.md](./infer_json_format.md) and
+[`examples/tfg`](../examples/tfg/README.md).
 
 ## Common flags
 

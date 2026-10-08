@@ -58,7 +58,7 @@ to multi-GPU Fold-CP only. Single-GPU inference may continue to use `auto` or
 
 ```bash
 LAYERNORM_TYPE=torch opendde pred \
-  -i examples/input.json \
+  -i examples/cofold/input.json \
   -o ./output \
   -n opendde_v1 \
   --use_msa false \

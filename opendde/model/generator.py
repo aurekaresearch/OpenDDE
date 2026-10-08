@@ -9,6 +9,14 @@ import torch.distributed as dist
 from opendde.distributed.foldcp.comm import run_group_rank_action_synchronized
 from opendde.model.utils import centre_random_augmentation
 from opendde.tfg import TFGEngine, parse_tfg_config
+from opendde.tfg import epitope_guidance
+from opendde.tfg.rigid_contact import (
+    contact_groups,
+    refine_rigid_contact,
+    search_rigid_contact,
+    intervention_schedule,
+    late_pass_enabled,
+)
 from opendde.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -149,11 +157,43 @@ def sample_diffusion(
         torch_generator.manual_seed(int(rollout_seed))
         numpy_rng = np.random.default_rng(int(rollout_seed))
     tfg_cfg = parse_tfg_config(guidance_configs)
+    rigid_mode = epitope_guidance.rigid_mode(input_feature_dict, tfg_cfg.enable)
+    if rigid_mode != "on" and epitope_guidance.active(input_feature_dict):
+        raise ValueError(
+            "constraint.epitope is applied only by rigid-body guidance; "
+            "do not set OPENDDE_RIGID_CONTACT to off or control, or remove constraint.epitope."
+        )
+    if rigid_mode != "off":
+        if not tfg_cfg.enable:
+            raise ValueError("Rigid-body guidance requires TFG to be enabled")
+        for term in tfg_cfg.terms:
+            if term.name == "UserDistanceRestraintPotential":
+                term.interval = 0
+                term.enable_projection = False
+        logger.info(
+            "RIGID_CONTACT protocol mode=%s; independent atom contact disabled",
+            rigid_mode,
+        )
     if tfg_cfg.enable:
         logger.info("Training-free guidance is enabled.")
         tfg = TFGEngine(tfg_cfg, device=device, dtype=dtype)
 
     num_diffusion_steps = len(noise_schedule) - 1
+    if (
+        rigid_mode == "on"
+        and not epitope_guidance.active(input_feature_dict)
+        and input_feature_dict["user_distance_restraint_index"].numel() == 0
+    ):
+        raise ValueError(
+            "OPENDDE_RIGID_CONTACT=on needs either contact pairs or an epitope request; there is nothing to apply."
+        )
+    if rigid_mode == "on" and foldcp_group is None:
+        # a request that cannot be applied fails here, not at the first guided step ~100 diffusion steps later
+        probe = torch.empty(1, input_feature_dict["atom_to_token_idx"].shape[-1], 3)
+        if epitope_guidance.active(input_feature_dict):
+            epitope_guidance.groups(probe, input_feature_dict)
+        else:
+            contact_groups(probe, input_feature_dict)
 
     def _run_sampler_action(action: Callable[[], Any], description: str) -> Any:
         if foldcp_group is None:
@@ -288,6 +328,48 @@ def sample_diffusion(
                     _complete_diffusion_step,
                     f"Fold-CP diffusion sampler step {step_i} completion",
                 )
+
+            coarse_steps, refine_steps = (
+                intervention_schedule(num_diffusion_steps)
+                if (
+                    rigid_mode == "on" and late_pass_enabled()
+                )  # OPENDDE_RIGID_LATE=off skips the late pass on the sampled state; the early pass on x0 is unaffected
+                else ((), ())
+            )
+
+            if rigid_mode == "on" and step_i in coarse_steps:
+                if epitope_guidance.active(input_feature_dict):
+                    x_l = _run_sampler_action(
+                        lambda: epitope_guidance.search_epitope(
+                            x_l, input_feature_dict
+                        ),
+                        f"Fold-CP coarse epitope guidance step {step_i}",
+                    )
+                else:
+                    x_l = _run_sampler_action(
+                        lambda: search_rigid_contact(x_l, input_feature_dict),
+                        f"Fold-CP coarse rigid contact step {step_i}",
+                    )
+
+            if rigid_mode == "on" and step_i in refine_steps:
+                if epitope_guidance.active(input_feature_dict):
+                    x_l = _run_sampler_action(
+                        lambda: epitope_guidance.refine_epitope(
+                            x_l,
+                            input_feature_dict,
+                            iterations=120 if step_i == num_diffusion_steps - 1 else 40,
+                        ),
+                        f"Fold-CP epitope guidance step {step_i}",
+                    )
+                else:
+                    x_l = _run_sampler_action(
+                        lambda: refine_rigid_contact(
+                            x_l,
+                            input_feature_dict,
+                            iterations=120 if step_i == num_diffusion_steps - 1 else 40,
+                        ),
+                        f"Fold-CP rigid contact step {step_i}",
+                    )
 
         return x_l
 

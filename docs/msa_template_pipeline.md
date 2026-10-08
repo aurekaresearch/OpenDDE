@@ -35,13 +35,13 @@ RNA:
 
 ```bash
 # Protein MSA only
-opendde msa -i examples/input.json -o ./output
+opendde msa -i examples/cofold/input.json -o ./output
 
 # Protein MSA + template search
-opendde mt -i examples/input.json -o ./output
+opendde mt -i examples/cofold/input.json -o ./output
 
 # Protein MSA + template search + RNA MSA when RNA is present
-opendde prep -i examples/input.json -o ./output
+opendde prep -i examples/cofold/input.json -o ./output
 ```
 
 Generated JSON files are written under `<out_dir>/.opendde_preprocessed/<input-hash>/` rather than next to the
@@ -77,7 +77,7 @@ $OPENDDE_ROOT_DIR/search_database/pdb_seqres_2022_09_28.fasta
 Run with explicit tools/database if needed:
 
 ```bash
-opendde mt -i examples/input.json -o ./output \
+opendde mt -i examples/cofold/input.json -o ./output \
   --hmmsearch_binary_path /path/to/hmmsearch \
   --hmmbuild_binary_path /path/to/hmmbuild \
   --seqres_database_path /path/to/pdb_seqres_2022_09_28.fasta

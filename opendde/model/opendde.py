@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Aureka AI Research
 import copy
+import json
 import os
 import sys
 import time
@@ -214,6 +215,29 @@ def update_input_feature_dict(input_feature_dict: dict[str, Any]) -> dict[str, A
         input_feature_dict["v_lm"] = v_lm
         input_feature_dict["pad_info"] = pad_info
         return input_feature_dict
+
+
+_TFG_ONLY_FEATURES = frozenset(
+    {
+        "pairwise_distance_index",
+        "pairwise_distance_is_bond",
+        "pairwise_distance_is_angle",
+        "pairwise_distance_upper_bound",
+        "pairwise_distance_lower_bound",
+        "interchain_bond_index",
+        "symmetric_chain_index",
+        "stereo_bond_index",
+        "stereo_bond_orientation",
+        "chiral_index",
+        "chiral_orientation",
+        "planar_improper_index",
+        "planar_improper_is_carbonyl",
+        "linear_triple_bond_index",
+        "experimental_torsion_index",
+        "experimental_torsion_force_constant",
+        "experimental_torsion_sign",
+    }
+)  # read only by the guidance terms (checked: no use in opendde/model), so they must not make the trunk cache key differ between guided and unguided inputs
 
 
 class OpenDDE(nn.Module):
@@ -1835,6 +1859,137 @@ class OpenDDE(nn.Module):
             return None
         return bounded_chunk
 
+    def _trunk_with_cache(self, input_feature_dict, N_cycle, inplace_safe, chunk_size):
+        """get_pairformer_output with an optional on-disk cache of its result (OPENDDE_TRUNK_CACHE=<dir>, OPENDDE_TRUNK_CACHE_MODE=r|w|rw).
+
+        The trunk does not read any guidance feature (user_*), so the cache key is the hash of every other input feature plus N_cycle,
+        taken BEFORE the trunk runs. The trunk also adds a few entries to the feature dict (d_lm, v_lm, pad_info, ...); they are stored and restored too."""
+        cache_dir = os.environ.get("OPENDDE_TRUNK_CACHE")
+        # Several model seeds run the trunk once each under different random state, so they must not share one cached result.
+        if (
+            not cache_dir
+            or getattr(self, "N_model_seed", 1) > 1
+            or self._maybe_foldcp_mesh() is not None
+        ):
+            return self.get_pairformer_output(
+                input_feature_dict=input_feature_dict,
+                N_cycle=N_cycle,
+                inplace_safe=inplace_safe,
+                chunk_size=chunk_size,
+            )
+        import hashlib
+
+        mode = os.environ.get("OPENDDE_TRUNK_CACHE_MODE", "rw")
+        if mode not in ("r", "w", "rw"):
+            raise ValueError("OPENDDE_TRUNK_CACHE_MODE must be r, w or rw")
+        h = hashlib.sha256()
+        h.update(("cycle=%d;" % N_cycle).encode())
+        for k in sorted(input_feature_dict.keys()):
+            v = input_feature_dict[k]
+            if (
+                k.startswith("user_")
+                or k in _TFG_ONLY_FEATURES
+                or not torch.is_tensor(v)
+            ):
+                continue
+            h.update(k.encode())
+            h.update(str(tuple(v.shape)).encode())
+            h.update(str(v.dtype).encode())
+            h.update(
+                v.detach()
+                .cpu()
+                .contiguous()
+                .reshape(-1)
+                .view(torch.uint8)
+                .numpy()
+                .tobytes()
+                if v.numel()
+                else b""
+            )
+        key = h.hexdigest()[:32]
+        if os.environ.get("OPENDDE_TRUNK_CACHE_DEBUG") == "1":
+            dbg = {}
+            for k in sorted(input_feature_dict.keys()):
+                v = input_feature_dict[k]
+                if torch.is_tensor(v):
+                    dbg[k] = (
+                        hashlib.sha256(
+                            v.detach()
+                            .cpu()
+                            .contiguous()
+                            .reshape(-1)
+                            .view(torch.uint8)
+                            .numpy()
+                            .tobytes()
+                        ).hexdigest()[:8]
+                        if v.numel()
+                        else "empty"
+                    )
+                else:
+                    dbg[k] = "nontensor:" + type(v).__name__
+            logger.info("TRUNK_CACHE_DEBUG key=%s %s", key, json.dumps(dbg))
+            if os.environ.get("OPENDDE_TRUNK_ONLY") == "1":
+                raise RuntimeError("TRUNK_ONLY: stopped after the cache key")
+        path = os.path.join(cache_dir, key + ".pt")
+        dev = input_feature_dict["residue_index"].device
+
+        def _to(x, device):
+            if torch.is_tensor(x):
+                return x.to(device)
+            if isinstance(x, dict):
+                return {a: _to(b, device) for a, b in x.items()}
+            if isinstance(x, (list, tuple)):
+                return type(x)(_to(b, device) for b in x)
+            return x
+
+        if "r" in mode and os.path.exists(path):
+            t0 = time.time()
+            try:
+                blob = torch.load(path, map_location="cpu", weights_only=False)
+                s_inputs, s, z = _to(blob["out"], dev)
+                restored = {k: _to(v, dev) for k, v in blob["new_keys"].items()}
+            except (
+                Exception
+            ) as exc:  # a damaged or incompatible file must not stop the run
+                logger.warning(
+                    "TRUNK_CACHE unreadable key=%s (%r); recomputing", key, exc
+                )
+            else:
+                input_feature_dict.update(restored)
+                logger.info("TRUNK_CACHE hit key=%s load=%.2fs", key, time.time() - t0)
+                return s_inputs, s, z
+        keys_before = set(input_feature_dict.keys())
+        out = self.get_pairformer_output(
+            input_feature_dict=input_feature_dict,
+            N_cycle=N_cycle,
+            inplace_safe=inplace_safe,
+            chunk_size=chunk_size,
+        )
+        if "w" in mode:
+            t0 = time.time()
+            tmp = path + ".tmp%d" % os.getpid()
+            try:
+                os.makedirs(cache_dir, exist_ok=True)
+                new_keys = {
+                    k: _to(input_feature_dict[k], "cpu")
+                    for k in input_feature_dict
+                    if k not in keys_before
+                }
+                torch.save({"out": _to(tuple(out), "cpu"), "new_keys": new_keys}, tmp)
+                os.replace(tmp, path)
+            except Exception as exc:  # the trunk result is already in hand: a full disk must not discard it
+                logger.warning("TRUNK_CACHE not saved key=%s (%r)", key, exc)
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            else:
+                logger.info(
+                    "TRUNK_CACHE saved key=%s new_keys=%s save=%.2fs",
+                    key,
+                    sorted(new_keys),
+                    time.time() - t0,
+                )
+        return out
+
     def _main_inference_loop(
         self,
         input_feature_dict: dict[str, Any],
@@ -1866,7 +2021,7 @@ class OpenDDE(nn.Module):
         pred_dict = {}
         time_tracker = {}
         with self._foldcp_stage_context("opendde_pairformer_trunk", N_token):
-            s_inputs, s, z = self.get_pairformer_output(
+            s_inputs, s, z = self._trunk_with_cache(
                 input_feature_dict=input_feature_dict,
                 N_cycle=N_cycle,
                 inplace_safe=inplace_safe,

@@ -33,11 +33,16 @@ Internally we compute values and Jacobians for basic geometric primitives
 """
 
 import math
+import os
 from typing import Any, Optional
 
 import torch
 
 from opendde.data.constants import rdkit_vdws
+from opendde.tfg.rigid_contact import triton_available
+from opendde.utils.logger import get_logger
+
+logger = get_logger(__name__)
 
 CLASS_REGISTRY: dict[str, type] = {}
 
@@ -590,6 +595,70 @@ class InterchainBondPotential(Potential):
             return _sum_energy(e)
         grad_atom = _aggregate_atom_gradients(coords, idx, grad_value, dE)
         return _sum_energy(e), grad_atom
+
+
+@register
+class UserDistanceRestraintPotential(Potential):
+    """User-specified pairwise distance flat-bottom restraints (e.g. Ab–Ag epitope contacts).
+
+    Expected `feats`:
+        - `user_distance_restraint_index`: `[2, M]` atom-pair indices.
+        - `user_distance_restraint_lower_bound`: `[M]` lower bounds in Å.
+        - `user_distance_restraint_upper_bound`: `[M]` upper bounds in Å.
+
+    Unlike `PairwiseDistancePotential`, this term does **not** apply VDW clamping
+    or bond/angle/clash state machines — bounds are used as given.
+    """
+
+    def __init__(self, default_params: Optional[dict[str, Any]] = None):
+        defaults: dict[str, Any] = {}
+        if default_params is not None:
+            defaults.update(default_params)
+        super().__init__(defaults)
+
+    def _eval(self, coords, feats, params, need_grad: bool):
+        """Compute energy (and optionally gradients) for user distance restraints."""
+        idx = feats["user_distance_restraint_index"]
+        if idx.numel() == 0:
+            return (
+                _zeros_energy_and_grad(coords) if need_grad else _zeros_energy(coords)
+            )
+
+        lower = feats["user_distance_restraint_lower_bound"].to(
+            device=coords.device, dtype=coords.dtype
+        )
+        upper = feats["user_distance_restraint_upper_bound"].to(
+            device=coords.device, dtype=coords.dtype
+        )
+        value, grad_value = _distance_value_and_grad(coords, idx, need_grad)
+
+        k = torch.ones_like(value)
+        e, dE = _flat_bottom_parabolic(value, k, lower, upper)
+        if not need_grad:
+            return _sum_energy(e)
+        grad_atom = _aggregate_atom_gradients(coords, idx, grad_value, dE)
+        return _sum_energy(e), grad_atom
+
+    def _project(self, coords, feats, params):
+        """Project violating pairs back into their [lower, upper] interval."""
+        idx = feats["user_distance_restraint_index"]
+        if idx.numel() == 0:
+            return torch.zeros_like(coords)
+
+        lower = feats["user_distance_restraint_lower_bound"].to(
+            device=coords.device, dtype=coords.dtype
+        )
+        upper = feats["user_distance_restraint_upper_bound"].to(
+            device=coords.device, dtype=coords.dtype
+        )
+        value, grad_value = _distance_value_and_grad(coords, idx, True)
+        mask_lb = value < lower
+        mask_ub = value > upper
+        mask = mask_lb | mask_ub
+        if mask.sum() == 0:
+            return torch.zeros_like(coords)
+        v = value - torch.where(mask_lb, lower, upper)
+        return _solve_constraint_projection(coords, idx, v, grad_value, mask)
 
 
 @register
@@ -1300,7 +1369,96 @@ class VinaStericPotential(Potential):
         out = (sel_idx, r_eq)
         return _cache_and_return(out)
 
+    # ---- accelerated path (OPENDDE_VINA_FAST=auto|off|on|check) -------------------------------------------------------------------
+    def _fast_object(self, feats, device):
+        """vina_steric_kernel.PairPotential for this sample (static groups / radii / allowed pairs), cached like the candidate list; None if unsupported."""
+        key = self._cache_key_from_feats(feats)
+        if (
+            getattr(self, "_fast_key", None) == key
+            and getattr(self, "_fast_val", None) is not None
+        ):
+            return self._fast_val
+        from opendde.tfg import vina_steric_kernel as steric_kernel
+
+        if not steric_kernel.norm_order_matches():
+            raise RuntimeError(
+                "torch.linalg.norm order differs from the one the fast pair kernel reproduces; dense path"
+            )
+        c_map = feats["asym_id"][..., feats["atom_to_token_idx"]]
+        group = c_map.to(device=device, dtype=torch.long)
+        n_groups = int(group.max().item()) + 1
+        if n_groups > 31:
+            raise ValueError("more than 31 chains: fast pair potential unsupported")
+        r = _get_vdw_radii_128(device)[feats["ref_element"].argmax(dim=-1)].to(
+            torch.float32
+        )
+        allowed = ~torch.eye(n_groups, dtype=torch.bool, device=device)
+        b_idx = feats.get("interchain_bond_index")
+        if b_idx is not None and b_idx.numel() > 0:
+            ca, cb = group[b_idx[0]], group[b_idx[1]]
+            allowed[ca, cb] = False
+            allowed[cb, ca] = False
+        obj = steric_kernel.PairPotential(group, r, allowed, buffer=0.225)
+        self._fast_key, self._fast_val = key, obj
+        return obj
+
+    def _eval_fast(self, coords, feats, params, need_grad: bool):
+        buf = float(params["buffer"])
+        if abs(buf - 0.225) > 1e-12:
+            raise ValueError("fast pair potential is built for buffer 0.225")
+        device = coords.device
+        obj = self._fast_object(feats, device)
+        batch_shape = coords.shape[:-2]
+        n_atom = int(coords.shape[-2])
+        b = math.prod(batch_shape) if len(batch_shape) > 0 else 1
+        X = coords.reshape(b, n_atom, 3).to(torch.float32).contiguous()
+        E, G = obj.energy_and_grad(X)
+        E = E.to(coords.dtype)
+        if len(batch_shape) == 0:
+            E = E[0]
+        else:
+            E = E.reshape(*batch_shape)
+        if not need_grad:
+            return E
+        return E, G.to(coords.dtype).reshape(*coords.shape)
+
     def _eval(self, coords, feats, params, need_grad: bool):
+        mode = os.environ.get("OPENDDE_VINA_FAST", "auto")
+        if mode not in ("auto", "off", "on", "check"):
+            raise ValueError("OPENDDE_VINA_FAST must be auto, off, on or check")
+        if mode != "off" and coords.is_cuda and (mode != "auto" or triton_available()):
+            try:
+                fast = self._eval_fast(coords, feats, params, need_grad)
+            except Exception as exc:  # the dense path below is always available
+                if not getattr(self, "_fast_warned", False):
+                    logger.warning(
+                        "VINA_FAST unavailable (%s: %s); dense path",
+                        type(exc).__name__,
+                        exc,
+                    )
+                    self._fast_warned = True
+                fast = None
+            if fast is not None and mode in ("auto", "on"):
+                return fast
+            if fast is not None and mode == "check":
+                ref = self._eval_dense(coords, feats, params, need_grad)
+                e_f, e_r = (fast[0], ref[0]) if need_grad else (fast, ref)
+                rel_e = float(
+                    (
+                        (e_f.float() - e_r.float()).abs()
+                        / e_r.float().abs().clamp_min(1e-12)
+                    ).max()
+                )
+                msg = "VINA_FAST parity energy_rel=%.2e" % rel_e
+                if need_grad:
+                    dg = float((fast[1].float() - ref[1].float()).abs().max())
+                    sc = float(ref[1].float().abs().max())
+                    msg += " grad_maxabs=%.2e grad_scale=%.2e" % (dg, sc)
+                logger.info(msg)
+                return ref
+        return self._eval_dense(coords, feats, params, need_grad)
+
+    def _eval_dense(self, coords, feats, params, need_grad: bool):
         """Compute Vina-style steric energy (and optionally gradients)."""
         idx, eq = self._get_collision_candidates(feats)
         if idx.numel() == 0:

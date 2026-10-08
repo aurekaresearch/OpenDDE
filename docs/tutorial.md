@@ -1,7 +1,7 @@
 # OpenDDE Tutorial
 
 
-A short walkthrough using files in [`examples/`](../examples). For install and
+A short walkthrough using files in [`examples/cofold/`](../examples/cofold). For install and
 runtime data setup, see [inference_instructions.md](./inference_instructions.md)
 or [docker_installation.md](./docker_installation.md).
 
@@ -43,12 +43,12 @@ Template/RNA-MSA preprocessing also needs `hmmer`; template inference may need
 ## 2. Compatibility prediction
 
 This disables external features and keeps the standard step/cycle counts.
-Inference defaults to `fp32` and `auto` triangle kernels (PyTorch on CPU), so no
+Inference defaults to `bf16` (TF32 off) and `auto` triangle kernels (PyTorch on CPU), so no
 extra dtype or kernel flags are needed:
 
 ```bash
 opendde pred \
-  -i examples/input.json \
+  -i examples/cofold/input.json \
   -o ./output \
   -n opendde_v1 \
   --use_msa false \
@@ -94,17 +94,17 @@ Entity keys include `proteinChain`, `dnaSequence`, `rnaSequence`, `ligand`, and
 Convert a PDB/CIF instead of writing JSON by hand:
 
 ```bash
-opendde json -i examples/7pzb.pdb -o ./output --altloc first
+opendde json -i examples/cofold/structures/7pzb.pdb -o ./output --altloc first
 ```
 
 ## 4. Use precomputed MSA/template features
 
-[`examples/examples_with_template/example_9fm7.json`](../examples/examples_with_template/example_9fm7.json)
+[`examples/cofold/template/example_9fm7.json`](../examples/cofold/template/example_9fm7.json)
 already contains `pairedMsaPath`, `unpairedMsaPath`, and `templatesPath`:
 
 ```bash
 opendde pred \
-  -i examples/examples_with_template/example_9fm7.json \
+  -i examples/cofold/template/example_9fm7.json \
   -o ./output \
   -n opendde_v1 \
   --use_msa true \
@@ -117,7 +117,7 @@ opendde pred \
 For an input without MSA/template paths:
 
 ```bash
-opendde prep -i examples/example_without_msa.json -o ./output
+opendde prep -i examples/cofold/example_without_msa.json -o ./output
 ```
 
 This writes the updated JSON under
@@ -139,12 +139,12 @@ For protein MSA only, use `opendde msa`. For protein MSA + template only, use
 
 ## 6. RNA MSA example
 
-[`examples/examples_with_rna_msa/example_9gmw_2.json`](../examples/examples_with_rna_msa/example_9gmw_2.json)
+[`examples/cofold/rna_msa/example_9gmw_2.json`](../examples/cofold/rna_msa/example_9gmw_2.json)
 contains a precomputed RNA MSA:
 
 ```bash
 opendde pred \
-  -i examples/examples_with_rna_msa/example_9gmw_2.json \
+  -i examples/cofold/rna_msa/example_9gmw_2.json \
   -o ./output \
   -n opendde_v1 \
   --use_rna_msa true

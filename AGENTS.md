@@ -21,7 +21,7 @@ This file applies to the whole repository unless a deeper `AGENTS.md` overrides 
 - `runner/`: Click CLI and inference runner (`opendde = runner.cli:opendde_cli`).
 - `tests/`: pytest/unittest suite; `tests/smoke/` is heavier and often GPU/environment dependent.
 - `docs/`: user docs. Prefer these for behavior details: inference, Docker, kernels, JSON input, supported models, MSA/template pipeline.
-- `examples/`: small example inputs and structures.
+- `examples/`: small example inputs, split into `cofold/` (co-folding, MSA, template, RNA MSA) and `tfg/` (constraint-guided inference).
 
 ## Environment and commands
 

@@ -78,10 +78,10 @@ diffusion steps.
 | `OPENDDE_RIGID_X0_EVERY` | `3` | integer ≥ 1 | The early pass runs every this many steps. |
 | `OPENDDE_RIGID_X0_LAST` | `189` | step number | Last step of the early pass (steps 100, 103, ..., 187 with the defaults). |
 | `OPENDDE_RIGID_LATE` | `on` | `on`, `off` | `off` turns the late pass off. |
-| `OPENDDE_RIGID_START` | `190` | step number | First step of the late pass on the sampled state; the coarse search runs here and at the last step. Scaled down for runs with fewer than 191 steps; an explicit value must lie inside the run. |
-| `OPENDDE_RIGID_EVERY` | `2` | integer ≥ 1 | The late pass refines every this many steps from `OPENDDE_RIGID_START`, and at the last step. |
+| `OPENDDE_RIGID_START` | `190` | step number | First step of the late pass on the sampled state; the coarse search runs here and at the last step. For runs with fewer than 191 steps it is the last step; an explicit value must lie inside the run. |
+| `OPENDDE_RIGID_EVERY` | `2` | integer ≥ 1 | The late pass refines at every step from `OPENDDE_RIGID_START` that is a multiple of this number, and at the last step. |
 | `OPENDDE_RIGID_CORE` | `auto` | `auto`, `on`, `off`, `check` | Fast Triton kernels of the guidance. `auto` uses them when a CUDA device and Triton are available and the dense implementation otherwise, without a warning; `on` warns when it cannot; `off` always uses the dense implementation; `check` runs both and logs the difference. |
-| `OPENDDE_VINA_FAST` | `auto` | `auto`, `on`, `off`, `check` | Fast kernel for the steric term of the TFG engine; same values as above. |
+| `OPENDDE_VINA_FAST` | `auto` | `auto`, `on`, `off`, `check` | Fast kernel for the steric term of the TFG engine. `auto` and `on` use it on a CUDA device and fall back to the dense implementation otherwise; `off` and `check` as above. |
 
 The defaults written out, which is the same as setting nothing:
 
@@ -110,8 +110,8 @@ each pass.
 | Flag | Why |
 | --- | --- |
 | `--use_tfg_guidance true` | the constraint is applied only in the TFG sampler |
-| `--enable_tf32 false` | the contact kernels need exact fp32 matrix products; with TF32 on, they are skipped and the slow dense implementation runs |
-| `--dtype bf16` | the evaluated setting (`fp32` also works) |
+| `--enable_tf32 false` | the default; the accelerated core needs exact fp32 matrix products, and with TF32 on it is skipped and the slow dense implementation runs |
+| `--dtype bf16` | the default and the evaluated setting (`fp32` also works) |
 | `--sample 5 --seeds 101,102,103` | several candidates per input; keep the one that satisfies the constraint best |
 
 The guided run is the same inference with a few extra steps per denoising
@@ -232,7 +232,7 @@ export OPENDDE_TRUNK_CACHE=$OUT/trunk_cache   # first run writes it, later runs 
 
 Inputs that differ only in their `constraint` (and the unconstrained run) share
 one cache entry. The cache holds Python pickles: use a directory you trust. It is
-ignored under Fold-CP.
+ignored under Fold-CP and with several model seeds.
 
 ## Without Triton, on CPU or MPS
 

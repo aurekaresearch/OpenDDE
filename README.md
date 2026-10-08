@@ -1,6 +1,5 @@
 # OpenDDE-Preview
 
-
 ![OpenDDE banner](https://raw.githubusercontent.com/aurekaresearch/OpenDDE/main/assets/OpenDDE.png)
 
 ![Status](https://img.shields.io/badge/status-preview-orange)
@@ -19,6 +18,10 @@ OpenDDE is an open-source, all-atom biomolecular foundation model that turns co-
 ![results](https://raw.githubusercontent.com/aurekaresearch/OpenDDE/main/assets/results.png)
 
 ## News
+
+- **2026-10-09: We release OpenDDE v1.2.0 with constraint-guided (conditional) inference! Read the [technical report](https://github.com/aurekaresearch/OpenDDE/blob/main/assets/OpenDDE_Conditional_Inference.pdf).**
+    - Steer the sampler with partial knowledge of an antibody–antigen interface (contacts, movable chains, epitope) via `--use_tfg_guidance true`, without changing the weights. See [docs/tfg_constraint_guidance.md](docs/tfg_constraint_guidance.md)
+    - Ready-to-run examples are available in [examples/tfg](examples/tfg), and the new antibody–antigen panel lists are in [benchmarks/OpenBench2026](benchmarks/OpenBench2026)
 
 - **2026-07-03: We release OpenDDE-preview (co-folding)! Read the [technical report](https://arxiv.org/abs/2607.03787) and visit the [website](https://aurekaresearch.github.io/OpenDDE-Website).**
     - Model weights can be downloaded from Hugging Face: [opendde.pt](https://huggingface.co/aurekaresearch/OpenDDE/resolve/eddd563ce96571f784012edd8f045181c8f8627d/opendde.pt) | [opendde_abag.pt](https://huggingface.co/aurekaresearch/OpenDDE/resolve/eddd563ce96571f784012edd8f045181c8f8627d/opendde_abag.pt)
@@ -139,8 +142,8 @@ bash scripts/download_opendde_data.sh --skip-search-database
 
 Released checkpoints:
 
-| Checkpoint        | Use case                              | Download                                                                                      |
-| ----------------- | ------------------------------------- | --------------------------------------------------------------------------------------------- |
+| Checkpoint        | Use case                              | Download                                                                                                                          |
+| ----------------- | ------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
 | `opendde.pt`      | General-purpose checkpoint.           | [opendde.pt](https://huggingface.co/aurekaresearch/OpenDDE/resolve/eddd563ce96571f784012edd8f045181c8f8627d/opendde.pt)           |
 | `opendde_abag.pt` | Checkpoint tuned on antibody-antigen. | [opendde_abag.pt](https://huggingface.co/aurekaresearch/OpenDDE/resolve/eddd563ce96571f784012edd8f045181c8f8627d/opendde_abag.pt) |
 
@@ -194,7 +197,7 @@ opendde pred \
   --cycle 10
 ```
 
-Defaults are applied automatically: inference runs in `fp32`, triangle kernels
+Defaults are applied automatically: inference runs in `bf16` with TF32 off, triangle kernels
 use `auto` dispatch, and seeds come from the job's `modelSeeds` unless `--seeds`
 is provided. On CPU this example may be slow, but it avoids GPU-only kernels and
 large search databases.
@@ -229,7 +232,7 @@ that one process runs on each GPU. For example, four GPUs use:
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node 4 \
   -m runner.batch_inference pred \
-  -i examples/protein_200.json \
+  -i examples/cofold/protein_200.json \
   -o ./output_foldcp \
   -n opendde_v1 \
   --use_msa false \
@@ -283,6 +286,7 @@ checkpoint files such as `opendde_abag.pt`.
 - [Inference instructions](https://github.com/aurekaresearch/OpenDDE/blob/main/docs/inference_instructions.md)
 - [Docker installation](https://github.com/aurekaresearch/OpenDDE/blob/main/docs/docker_installation.md)
 - [Input JSON format](https://github.com/aurekaresearch/OpenDDE/blob/main/docs/infer_json_format.md)
+- [TFG constraint guidance](https://github.com/aurekaresearch/OpenDDE/blob/main/docs/tfg_constraint_guidance.md)
 - [MSA/template/RNA-MSA pipeline](https://github.com/aurekaresearch/OpenDDE/blob/main/docs/msa_template_pipeline.md)
 - [Kernel options](https://github.com/aurekaresearch/OpenDDE/blob/main/docs/kernels.md)
 - [Fold-CP reproduction guide](https://github.com/aurekaresearch/OpenDDE/blob/main/docs/foldcp_e2e_baseline.md)

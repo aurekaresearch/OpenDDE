@@ -258,3 +258,14 @@ def test_foldcp_tfg_completion_failure_stops_before_next_denoiser(monkeypatch):
         for description in descriptions
     )
     assert len(denoise_calls) == 1
+
+
+def test_epitope_request_needs_rigid_body_guidance(monkeypatch):
+    kwargs = _inputs()
+    kwargs["input_feature_dict"]["user_epitope_atom_index"] = torch.zeros(
+        1, 1, dtype=torch.long
+    )
+    for mode in ("off", "control"):
+        monkeypatch.setenv("OPENDDE_RIGID_CONTACT", mode)
+        with pytest.raises(ValueError, match="do not set OPENDDE_RIGID_CONTACT"):
+            sample_diffusion(N_sample=1, guidance_configs=_tfg_cfg(), **kwargs)

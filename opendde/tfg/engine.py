@@ -507,6 +507,10 @@ class TFGEngine:
                 x0_ref = x0_ref + self._project(
                     x0_ref, input_feature_dict, t=t, step_i=step_i
                 )
+                # rigid guidance on the clean estimate (scheduled by OPENDDE_RIGID_X0_*; a no-op unless enabled)
+                from opendde.tfg import epitope_guidance as _epi
+
+                x0_ref = _epi.guide_x0(x0_ref, input_feature_dict, step_i)
 
                 # 4) refinement directly on x0
                 for inner in range(self.cfg.inner_steps):

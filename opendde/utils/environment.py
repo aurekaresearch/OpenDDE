@@ -382,8 +382,8 @@ def _runtime_recommendation(
         )
     if selected_device is not None and selected_device.type == "mps":
         return (
-            "Apple Metal (MPS) inference is available. OpenDDE defaults to FP32 "
-            "and torch triangle kernels; BF16 is opt-in, and the cuEquivariance "
+            "Apple Metal (MPS) inference is available. OpenDDE defaults to BF16 "
+            "(FP32 before macOS 14) and torch triangle kernels; the cuEquivariance "
             "extra is CUDA-only."
         )
     if selected_device is not None and selected_device.type == "cuda":

@@ -368,7 +368,7 @@ def get_default_runner(
     n_cycle: int = 10,
     n_step: int = 200,
     n_sample: int = 5,
-    dtype: InferenceDtype = "fp32",
+    dtype: InferenceDtype = "bf16",
     model_name: str = DEFAULT_MODEL_NAME,
     load_checkpoint_path: str = "",
     use_msa: bool = True,
@@ -376,7 +376,7 @@ def get_default_runner(
     triatt_kernel="auto",
     enable_cache=True,
     enable_fusion=True,
-    enable_tf32=True,
+    enable_tf32=False,
     deterministic: bool = False,
     use_template: bool = False,
     use_rna_msa: bool = False,
@@ -400,7 +400,7 @@ def get_default_runner(
         n_cycle (int): Number of Pairformer cycles.
         n_step (int): Number of diffusion steps.
         n_sample (int): Number of samples.
-        dtype (str): Inference data type. Defaults to 'fp32'.
+        dtype (str): Inference data type. Defaults to 'bf16'.
         device (str): Device selection: auto, cpu, cuda, or mps.
         model_name (str): Name of the model checkpoint.
         load_checkpoint_path (str): Explicit checkpoint path. If unset, uses the released checkpoint filename for model_name.
@@ -529,14 +529,14 @@ def inference_jsons(
     n_cycle: int = 10,
     n_step: int = 200,
     n_sample: int = 5,
-    dtype: InferenceDtype = "fp32",
+    dtype: InferenceDtype = "bf16",
     model_name: str = DEFAULT_MODEL_NAME,
     load_checkpoint_path: str = "",
     trimul_kernel: str = "auto",
     triatt_kernel: str = "auto",
     enable_cache: bool = True,
     enable_fusion: bool = True,
-    enable_tf32: bool = True,
+    enable_tf32: bool = False,
     deterministic: bool = False,
     use_template: bool = False,
     use_rna_msa: bool = False,
@@ -709,8 +709,8 @@ def inference_jsons(
     "-d",
     "--dtype",
     type=click.Choice(INFERENCE_DTYPE_CHOICES, case_sensitive=False),
-    default="fp32",
-    help="Inference dtype. Defaults to fp32; pass bf16 to opt in.",
+    default="bf16",
+    help="Inference dtype. Defaults to bf16; pass fp32 for full precision.",
 )
 @click.option(
     "--device",
@@ -772,8 +772,8 @@ def inference_jsons(
 @click.option(
     "--enable_tf32",
     type=bool,
-    default=True,
-    help="Enable TF32 for FP32 matrix multiplications.",
+    default=False,
+    help="Enable TF32 for FP32 matrix multiplications (off by default; the guidance kernels need it off).",
 )
 @click.option(
     "--deterministic",

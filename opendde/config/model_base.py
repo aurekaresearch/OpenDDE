@@ -32,9 +32,9 @@ model_configs: dict[str, Any] = {
     "triangle_attention": "auto",
     "enable_diffusion_shared_vars_cache": False,
     "enable_efficient_fusion": False,
-    "enable_tf32": True,
-    # Inference defaults to fp32; bf16 is opt-in via --dtype.
-    "dtype": "fp32",
+    "enable_tf32": False,
+    # Inference defaults to bf16; fp32 is available via --dtype fp32.
+    "dtype": "bf16",
     "skip_amp": {
         "sample_diffusion": True,
         "confidence_head": False,
@@ -92,6 +92,11 @@ model_configs: dict[str, Any] = {
                     "interval": 1,
                     "weight": 0.15,
                     "buffer": 2.0,
+                },
+                "UserDistanceRestraintPotential": {
+                    "interval": 1,
+                    "weight": 0.5,
+                    "enable_projection": True,
                 },
                 "PairwiseDistancePotential": {
                     "interval": 1,

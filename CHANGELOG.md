@@ -6,6 +6,68 @@ User-facing changes to OpenDDE are documented here.
 
 No changes yet.
 
+## [1.2.0] - 2026-10-09
+
+### Added
+
+- Added constraint-guided inference. With `--use_tfg_guidance true`, the input
+  JSON `constraint` field steers the sampler towards partial knowledge of an
+  antibody–antigen interface, without changing the weights or the trunk:
+    - `constraint.contact`: residue-pair distance windows (default 3.5–8 Å);
+    - `constraint.movable_chains`: the antibody chains that move as one rigid body;
+    - `constraint.epitope`: antigen residues that the movable chains must bind
+      (`paratope`, default `"all"`; `min_fraction`, default 0.5).
+
+    The movable chains are moved as one rigid body until the request is met. A
+    sample that already meets it is never moved, and a move that creates a severe
+    atomic overlap is refused. The evaluated schedule (an early pass at steps
+    100–187 and a late pass at steps 190–199) is the default, and
+    `OPENDDE_RIGID_CONTACT=off` keeps the atom-level restraint for contacts. See
+    `docs/tfg_constraint_guidance.md` and `docs/infer_json_format.md`.
+
+- Added fused Triton kernels for the guidance (`OPENDDE_RIGID_CORE`,
+  `OPENDDE_VINA_FAST`). They are used when a CUDA device and Triton are
+  available and TF32 is off (the default); otherwise the dense torch
+  implementation runs instead, without a warning.
+- Added an optional on-disk cache of the Pairformer trunk output
+  (`OPENDDE_TRUNK_CACHE`), keyed by every non-guidance input feature, so inputs
+  that differ only in their `constraint` reuse one trunk.
+  `OPENDDE_TRUNK_CACHE_MODE` selects `r`, `w` or `rw` (default). The cache is
+  ignored under Fold-CP and with several model seeds, a file that cannot be read
+  or written is skipped with a warning, and its files are Python pickles: use a
+  directory you trust.
+- Added `examples/tfg`: four antibody–antigen complexes (Fab, Fv and VHH), each with
+  unconstrained, contact and pocket inputs and the MSAs they need, and a script
+  that checks which predicted samples satisfy a constraint.
+- Added `benchmarks/OpenBench2026` with the target and interface lists of the
+  antibody–antigen panel.
+
+### Changed
+
+- Inference now defaults to `--dtype bf16` and `--enable_tf32 false`; earlier
+  versions defaulted to `fp32` with TF32 on. Pass `--dtype fp32 --enable_tf32 true`
+  for the previous behaviour. Predictions can differ numerically at the new
+  precision. On Apple MPS, BF16 needs macOS 14 or newer and is downgraded to FP32
+  below that.
+- The input JSON `constraint` field is no longer ignored. Earlier versions
+  logged a warning and ignored the whole field; it now accepts only `contact`,
+  `movable_chains` and `epitope`, and any other key (including a misspelled one),
+  a `constraint` that is not an object, a `contact` that is not a list, or a
+  non-numeric or negative contact distance raises an error.
+- Moved the co-folding examples into `examples/cofold` (`input.json`, `protein_200.json`,
+  `example.json`, `example_without_msa.json`, `template/`, `rna_msa/`, `msa/`,
+  `structures/`) and removed unused example files. Update paths such as
+  `examples/input.json` to `examples/cofold/input.json`.
+
+### Compatibility
+
+- Model checkpoints and output formats are unchanged; the default precision is
+  the one change that can alter predictions. Inputs without a
+  `constraint` field are not affected. Inputs that carry a `constraint` field
+  with other keys, which earlier versions ignored, must remove those keys.
+- The guidance has been validated on a single GPU with the default
+  200 diffusion steps.
+
 ## [1.1.1] - 2026-09-02
 
 ### Added
@@ -162,7 +224,8 @@ For installation and upgrade commands, see the
 
 - Initial PyPI bootstrap release of the `opendde` package name.
 
-[Unreleased]: https://github.com/aurekaresearch/OpenDDE/compare/v1.1.1...HEAD
+[Unreleased]: https://github.com/aurekaresearch/OpenDDE/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/aurekaresearch/OpenDDE/releases/tag/v1.2.0
 [1.1.1]: https://github.com/aurekaresearch/OpenDDE/releases/tag/v1.1.1
 [1.1.0]: https://github.com/aurekaresearch/OpenDDE/releases/tag/v1.1.0
 [1.0.3]: https://github.com/aurekaresearch/OpenDDE/releases/tag/v1.0.3

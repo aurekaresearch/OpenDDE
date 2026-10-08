@@ -21,7 +21,7 @@ inference_configs: dict[str, Any] = {
     "load_checkpoint_dir": os.path.join(OPENDDE_ROOT_DIR, "checkpoint"),
     "num_workers": 0,
     "use_msa": True,
-    "enable_tf32": True,
+    "enable_tf32": False,
     "enable_efficient_fusion": True,
     "enable_diffusion_shared_vars_cache": True,
     "msa_pair_as_unpair": True,

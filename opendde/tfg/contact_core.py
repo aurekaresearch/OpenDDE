@@ -20,6 +20,7 @@ import time
 import torch
 
 from opendde.data.constants import rdkit_vdws
+from opendde.tfg import robust
 from opendde.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -90,15 +91,21 @@ def _skew(w):
     return skew
 
 
-def _candidate_frames(coords, tab, rc):
+def _candidate_frames(coords, tab, rc, subset=None):
     """Kabsch fit, normals, the 1500 (R, t) transforms (candidate p = (normal * 12 + turn) * 5 + radius, the dense loop order) and
-    the exact placement function place(p) built with the dense path's own operations."""
+    the exact placement function place(p) built with the dense path's own operations.
+
+    `subset` (OPENDDE_RIGID_INIT=subsets): indices of the restraint pairs that define the Kabsch fit, the stand-off centre and the
+    outward direction; None (stock) uses every pair. Whether the entry pose already satisfies the request always looks at every pair."""
     dev = coords.device
     S = coords.shape[0]
     fixed = coords[:, tab["fixed_ids"]].float()
     moving = coords[:, tab["moving_ids"]].float()
     source = coords[:, tab["mov_atoms"]].float()
     target = coords[:, tab["fix_atoms"]].float()
+    entry_source, entry_target = source, target  # satisfaction uses every pair
+    if subset is not None:
+        source, target = source[:, subset], target[:, subset]
     sc = source.mean(1, keepdim=True)
     tc = target.mean(1, keepdim=True)
     u, _, vh = torch.linalg.svd(torch.bmm((source - sc).transpose(1, 2), target - tc))
@@ -134,7 +141,7 @@ def _candidate_frames(coords, tab, rc):
     shift = tc[:, None] + radius[None, None, :, None] * normals[:, :, None, :]
     t = (shift[:, :, None] - offset[:, :, :, None]).reshape(S, 1500, 3).contiguous()
     lower, upper = tab["lower"], tab["upper"]
-    entry_distance = torch.linalg.vector_norm(source - target, dim=-1)
+    entry_distance = torch.linalg.vector_norm(entry_source - entry_target, dim=-1)
     satisfied = (
         (entry_distance >= lower - 1e-6) & (entry_distance <= upper + 1e-6)
     ).all(-1)
@@ -189,7 +196,9 @@ def refine_core(coords, feats, iterations, rc):
     tab = _tables(coords, feats, rc)
     fixed = coords[:, tab["fixed_ids"]].float()
     moving = coords[:, tab["moving_ids"]].float()
-    term = rigid_core.PairTerm(fixed, tab["ma"], tab["fb"], tab["lower"], tab["upper"])
+    term = robust.make_pair_term(
+        fixed, tab["ma"], tab["fb"], tab["lower"], tab["upper"]
+    )
     new, accepted, info = rigid_core.refine(
         moving,
         tab["ra"],
@@ -216,38 +225,51 @@ def refine_core(coords, feats, iterations, rc):
 
 @torch.no_grad()
 def search_core(coords, feats, rc):
-    """rigid_core.search with the contact term: same candidates, order and selection rule as the dense search."""
+    """rigid_core.search with the contact term: same candidates, order and selection rule as the dense search.
+
+    With OPENDDE_RIGID_INIT=subsets the search is repeated for the Kabsch initialisation of every leave-one-out subset of the pairs, each
+    time starting from the best pose found so far, so a pose is replaced only by a lower-energy one."""
     from opendde.tfg import rigid_core
 
     tab = _tables(coords, feats, rc)
-    fr_ = _candidate_frames(coords, tab, rc)
-    term = rigid_core.PairTerm(
-        fr_["fixed"], tab["ma"], tab["fb"], tab["lower"], tab["upper"]
-    )
-    out = rigid_core.search(
-        fr_["moving"],
-        tab["ra"],
-        fr_["fixed"],
-        tab["rb"],
-        term,
-        fr_["R"],
-        fr_["t"],
-        fr_["place"],
-        fr_["satisfied"],
-    )
-    chosen = _place_winners(fr_, out["best"])
-    result = coords.clone()
-    result[:, tab["moving_ids"]] = chosen.to(coords.dtype)
-    logger.info(
-        "RIGID_CONTACT core coarse search satisfied=%s candidates=1500 feasible=%s improving=%s winner=%s final_energy=%s shortlist=%s reeval=%d",
-        fr_["satisfied"].tolist(),
-        out["n_feasible"].tolist(),
-        out["n_improving"].tolist(),
-        out["best"].tolist(),
-        out["best_energy"].tolist(),
-        out["stats"]["shortlist"],
-        out["stats"]["reeval"],
-    )
+    n_pairs = int(tab["ma"].numel())
+    subsets = [None]
+    if robust.init_subsets_enabled() and n_pairs >= 3:
+        subsets += [
+            torch.tensor([j for j in range(n_pairs) if j != drop], device=coords.device)
+            for drop in range(n_pairs)
+        ]
+    result = coords
+    for subset in subsets:
+        fr_ = _candidate_frames(result, tab, rc, subset)
+        term = robust.make_pair_term(
+            fr_["fixed"], tab["ma"], tab["fb"], tab["lower"], tab["upper"]
+        )
+        out = rigid_core.search(
+            fr_["moving"],
+            tab["ra"],
+            fr_["fixed"],
+            tab["rb"],
+            term,
+            fr_["R"],
+            fr_["t"],
+            fr_["place"],
+            fr_["satisfied"],
+        )
+        chosen = _place_winners(fr_, out["best"])
+        result = result.clone()
+        result[:, tab["moving_ids"]] = chosen.to(coords.dtype)
+        logger.info(
+            "RIGID_CONTACT core coarse search satisfied=%s candidates=1500 feasible=%s improving=%s winner=%s final_energy=%s shortlist=%s reeval=%d%s",
+            fr_["satisfied"].tolist(),
+            out["n_feasible"].tolist(),
+            out["n_improving"].tolist(),
+            out["best"].tolist(),
+            out["best_energy"].tolist(),
+            out["stats"]["shortlist"],
+            out["stats"]["reeval"],
+            "" if subset is None else f" subset={subset.tolist()}",
+        )
     return result
 
 
@@ -269,12 +291,21 @@ def _parity(tag, kind, out, ref, coords, t_a, t_b):
 
 def run(kind, coords, feats, rc, dense, **kw):
     """Dispatch one call. ``dense`` is the dense implementation, called as dense(coords, feats, **kw).
-    OPENDDE_RIGID_CORE (auto/on/check) selects the accelerated core; the dense implementation is its fallback and its comparison."""
+    OPENDDE_RIGID_CORE (auto/on/check) selects the accelerated core; the dense implementation is its fallback and its comparison.
+    A requested robust switch (OPENDDE_RIGID_PENALTY, OPENDDE_RIGID_INIT) never runs on the dense implementation, neither as a fallback nor
+    with OPENDDE_RIGID_CORE=off: it raises."""
     core = rc.rigid_core_mode()  # not rigid_core.mode(): importing rigid_core needs Triton, which a CPU-only install does not have
+    index = feats.get("user_distance_restraint_index")
+    n_pairs = int(index.shape[1]) if index is not None and index.dim() == 2 else 0
+    variant = n_pairs > 0 and robust.variant_requested()
     if core == "off":
+        if variant:
+            robust.refuse_dense("contact " + kind)
         return dense(coords, feats, **kw)
     reason = supported(coords, rc)
     if reason is not None:
+        if variant:
+            robust.refuse_dense("contact " + kind)
         note_unsupported(core, kind, reason)
         return dense(coords, feats, **kw)
     fast = search_core if kind == "search" else refine_core
@@ -289,6 +320,8 @@ def run(kind, coords, feats, rc, dense, **kw):
         torch.cuda.synchronize()
         t_fast = time.time() - t0
     except Exception as exc:  # noqa: BLE001
+        if variant:
+            raise
         logger.warning("RIGID_CONTACT core %s failed (%r); dense fallback", kind, exc)
         return dense(coords, feats, **kw)
     if core in ("auto", "on"):

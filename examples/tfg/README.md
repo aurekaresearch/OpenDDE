@@ -206,7 +206,9 @@ sequence, which catches position typos.
 
 - **Contact constraints are strict.** Every pair has the same weight, so a
   wrong pair can pull the antibody away from the true interface. Give only pairs
-  you trust, and check the result with `check_constraints.py`.
+  you trust, and check the result with `check_constraints.py`. An opt-in robust
+  objective lessens the damage of a wrong pair, see
+  [Experimental: robust contact objective](../../docs/tfg_constraint_guidance.md#experimental-robust-contact-objective).
 - **Pocket constraints tolerate some error** when `min_fraction` is below 1:
   only the closest `K` residues are enforced, so a few wrong residues need not be
   touched. With `min_fraction: 1.0` every residue must be touched and one wrong

@@ -4,7 +4,15 @@ User-facing changes to OpenDDE are documented here.
 
 ## [Unreleased]
 
-No changes yet.
+### Added
+
+- Opt-in robust objective for `constraint.contact`: `OPENDDE_RIGID_PENALTY=welsch:<L>`
+  (a Welsch loss, so a pair that cannot be met stops pulling) and
+  `OPENDDE_RIGID_INIT=subsets` (leave-one-out starts of the coarse search).
+  With neither set, behaviour is unchanged. A requested switch runs on the
+  accelerated core only and raises instead of falling back to the stock
+  objective, also with `OPENDDE_RIGID_CORE=off`. See
+  `docs/tfg_constraint_guidance.md`.
 
 ## [1.2.0] - 2026-10-09
 

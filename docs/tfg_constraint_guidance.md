@@ -83,6 +83,65 @@ warning. The accelerated core also needs TF32 matmul off, which is the default
 (`--enable_tf32 false`); with TF32 on it is skipped and the dense implementation
 runs. The first skip of a run is logged once.
 
+## Experimental: robust contact objective
+
+With the stock objective, one wrong pair can pull the antibody away from the
+interface that the other pairs agree on: every pair adds the square of its
+violation, so a pair pulls harder the further it is from its window, and the
+coarse search starts from a fit to all pairs. Two opt-in switches change this
+for `constraint.contact`. They change the objective and the starting poses of
+the coarse search, not the clash potential, the pose-search kernels or the
+acceptance rule. With neither set the stock objective above runs unchanged.
+
+| Variable | Values (default first) | What it changes |
+| --- | --- | --- |
+| `OPENDDE_RIGID_PENALTY` | `quad`, `welsch:<L>` | Penalty on how far a pair is outside its window (Å): the square (stock), or a Welsch loss (Rosetta `TOPOUT`) that is quadratic near zero and saturates at `L`². Its force returns to zero for large violations, so a pair that cannot be met stops pulling. `welsch` alone means `L` = 4. |
+| `OPENDDE_RIGID_INIT` | `all`, `subsets` | Coarse search: also start from the Kabsch fit of every leave-one-out subset of the pairs (three pairs or more), each time from the best pose so far. A pose is only replaced by one of lower energy, and one wrong pair does not spoil every start. |
+
+Use them together, for example
+`OPENDDE_RIGID_PENALTY=welsch:4 OPENDDE_RIGID_INIT=subsets`: in a screening on
+stored predictions each switch alone gained little and the pair gained much
+more.
+
+Both run on the accelerated core only. With a switch set, a run on CPU, without
+Triton, with TF32 on or with `OPENDDE_RIGID_CORE=off` stops with an error
+instead of silently running the stock objective. The switches do not apply to
+`constraint.epitope`: such a request uses the stock objective and logs a
+warning once.
+
+### What was measured
+
+Full sampler (OpenDDE 1.2.0, TFG on, one seed, five samples per target) on 24
+failed and 12 solved antibody–antigen targets of a protein-only benchmark. The
+four pairs are the four closest CDR–antigen Cα pairs, as in the OpenDDE report;
+a wrong pair puts its antigen residue at least 12 Å from the epitope. "No
+constraint" is the same run without the `constraint` field.
+
+| | no constraint | stock | `welsch:4` + `subsets` |
+| --- | --- | --- | --- |
+| Failed targets, mean DockQ, four pairs right | 0.054 | 0.303 | 0.343 |
+| Failed targets, mean DockQ, one of four wrong | 0.054 | 0.056 | 0.233 |
+| Failed targets with a correct top-1 (of 24), four pairs right | 2 | 12 | 14 |
+| Failed targets with a correct top-1 (of 24), one of four wrong | 2 | 0 | 7 |
+| Solved targets that lose their correct top-1 (of 12), one of four wrong | – | 5 | 0 |
+| Solved targets that lose their correct top-1 (of 12), two of four wrong | – | 7 | 1 |
+
+With one wrong pair the mean DockQ is +0.177 above the stock objective (95%
+interval +0.114 to +0.244, over targets). A run took about 112 s per target and
+five samples on an RTX PRO 6000 Blackwell, against 108–110 s with the stock
+objective and 105 s without a constraint; the solver call itself is several
+times slower (about 0.5 s against 0.1 s for five samples on a laptop GPU).
+
+Not established:
+
+- With all four pairs right the objectives are not distinguishable in top-1
+  success (+0.083, interval −0.083 to +0.250, 24 targets). A non-inferiority
+  margin of ±0.02 as in the report needs many more targets.
+- Two wrong pairs of four were run on solved targets only: the switches limit
+  the damage there, but rescue of failed targets was not measured.
+- Only wrong pairs at least 12 Å from the epitope, only four-pair requests and
+  no pairs from an experiment.
+
 ## Other switches
 
 - `OPENDDE_TRUNK_CACHE=<dir>` with `OPENDDE_TRUNK_CACHE_MODE=r|w|rw` (default

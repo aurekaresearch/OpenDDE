@@ -25,7 +25,7 @@ import os
 import torch
 
 from opendde.data.constants import rdkit_vdws
-from opendde.tfg import contact_core, rigid_contact as rc
+from opendde.tfg import contact_core, robust, rigid_contact as rc
 from opendde.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -741,6 +741,7 @@ def guide_x0(x0, feats, step_i):
 def _core_dispatch(kind, core_fn, dense_fn, coords, *args):
     import time
 
+    robust.note_contact_only("epitope")  # the robust contact switches do not apply here
     core = rc.rigid_core_mode()  # not rigid_core.mode(): importing rigid_core needs Triton, which a CPU-only install does not have
     if core == "off":
         return dense_fn(coords, *args)

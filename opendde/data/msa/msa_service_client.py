@@ -352,6 +352,30 @@ def _write_query_leading_a3m(
         handle.write(text)
 
 
+def _tag_paired_a3m_rows(a3m_text: Optional[str]) -> Optional[str]:
+    """Give each server-paired hit a shared, non-taxonomic row identifier.
+
+    The paired service output is already aligned by row across query chains, but
+    its UniRef headers may not include taxonomy. Downstream species pairing needs
+    a stable key, so retain the original description and key each hit by its
+    one-based row position. The query row is left unchanged.
+    """
+    if not a3m_text:
+        return a3m_text
+
+    tagged_lines = []
+    row_index = 0
+    for line in a3m_text.splitlines():
+        if line.startswith(">"):
+            if row_index:
+                line = f">OpenDDEPairedRow:{row_index} {line[1:]}"
+            row_index += 1
+        tagged_lines.append(line)
+
+    text = "\n".join(tagged_lines)
+    return text + ("\n" if a3m_text.endswith("\n") else "")
+
+
 def search_and_build_msa(
     seqs: Sequence[str],
     msa_res_dir: str,
@@ -407,5 +431,9 @@ def search_and_build_msa(
         _write_query_leading_a3m(
             os.path.join(seq_dir, "non_pairing.a3m"), unpaired[idx], seq
         )
-        _write_query_leading_a3m(os.path.join(seq_dir, "pairing.a3m"), paired[idx], seq)
+        _write_query_leading_a3m(
+            os.path.join(seq_dir, "pairing.a3m"),
+            _tag_paired_a3m_rows(paired[idx]),
+            seq,
+        )
     return seq_dirs

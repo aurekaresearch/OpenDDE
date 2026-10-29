@@ -12,6 +12,11 @@ from opendde.data.msa.msa_service_client import (
     gather_a3m_lines,
     search_and_build_msa,
 )
+from opendde.data.msa.msa_utils import (
+    MSAPairingEngine,
+    PROTEIN_CHAIN,
+    RawMsa,
+)
 
 
 def test_gather_a3m_lines_splits_by_numeric_header(tmp_path):
@@ -98,6 +103,57 @@ def test_write_query_leading_a3m_falls_back_on_query_mismatch(tmp_path):
     _write_query_leading_a3m(str(output), ">101\nWRONG\n>hit\nWRONG\n", "ACDE")
 
     assert output.read_text() == ">query\nACDE\n"
+
+
+def test_search_and_build_msa_preserves_server_paired_rows(tmp_path, monkeypatch):
+    """Synthetic paired hits without taxonomy headers must still pair by row."""
+    seqs = ["ACDE", "FGHI"]
+    paired_results = [
+        ">101\nACDE\n>UniRef100_hitA\tmeta\nA-DE\n>UniRef100_hitB\tmeta\nAC-E\n",
+        ">102\nFGHI\n>UniRef100_hitC\tmeta\nF-HI\n>UniRef100_hitD\tmeta\nFG-I\n",
+    ]
+
+    def fake_run(query_seqs, prefix, use_env=True, use_pairing=False, **kwargs):
+        if use_pairing:
+            return paired_results
+        return [f">{101 + i}\n{seq}\n" for i, seq in enumerate(query_seqs)]
+
+    monkeypatch.setattr(client, "run_mmseqs2", fake_run)
+    dirs = search_and_build_msa(seqs, str(tmp_path))
+
+    features = []
+    for chain_id, seq, directory in zip(["A", "B"], seqs, dirs):
+        raw = RawMsa.from_a3m(
+            seq,
+            PROTEIN_CHAIN,
+            (tmp_path / directory / "pairing.a3m").read_text(),
+            dedup=False,
+        ).featurize()
+        assert raw["msa_species_identifiers"].tolist() == [
+            "",
+            "opendde-paired-row:1",
+            "opendde-paired-row:2",
+        ]
+        features.append(
+            {
+                "chain_id": chain_id,
+                "msa_species_identifiers_all_seq": raw["msa_species_identifiers"],
+                "msa_all_seq": raw["msa"],
+                "deletion_matrix_all_seq": raw["deletion_matrix"],
+            }
+        )
+
+    paired = MSAPairingEngine.pair_chains_by_species(
+        features, max_paired=10, active_chains={"A", "B"}, max_per_species=1
+    )
+
+    assert [chain["num_alignments_all_seq"].item() for chain in paired] == [3, 3]
+
+
+def test_synthetic_paired_row_ids_do_not_collide_with_taxonomy_ids():
+    assert MSAPairingEngine.get_species_ids(
+        ["OpenDDEPairedRow:1 UniRef100_hitA\\tmeta", "UniRef100_hit_1/"]
+    ) == ["opendde-paired-row:1", "1"]
 
 
 def test_safe_extract_tar_rejects_path_traversal(tmp_path):

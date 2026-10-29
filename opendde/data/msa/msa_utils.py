@@ -31,6 +31,7 @@ _UNIPROT_REGEX = re.compile(
     r"(?:tr|sp)\|[A-Z0-9]{6,10}(?:_\d+)?\|(?:[A-Z0-9]{1,10}_)(?P<SpeciesId>[A-Z0-9]{1,5})"
 )
 _UNIREF_REGEX = re.compile(r"^UniRef100_[^_]+_([^_/]+)")
+_OPENDDE_PAIRED_ROW_REGEX = re.compile(r"^OpenDDEPairedRow:(?P<RowId>\d+)(?:\s|$)")
 
 MSA_GAP_IDX = STD_RESIDUES_WITH_GAP["-"]
 NUM_SEQ_NUM_RES_MSA_FEATURES = ("msa", "msa_mask", "deletion_matrix")
@@ -261,6 +262,11 @@ class MSAPairingEngine:
         ids = []
         for d in descriptions:
             d = d.strip()
+            paired_row = _OPENDDE_PAIRED_ROW_REGEX.match(d)
+            if paired_row:
+                ids.append(f"opendde-paired-row:{paired_row.group('RowId')}")
+                continue
+
             m = _UNIPROT_REGEX.match(d) or _UNIREF_REGEX.match(d)
             if m:
                 ids.append(
